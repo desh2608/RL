@@ -1,0 +1,340 @@
+# ---------------------------------------------------------------------------
+# NeMo Gym service config for the HF399 pass-rate profile (scripts/profile_passrate/).
+#
+# One file, 18 server entries (2 model wrappers + 8 resources servers + 8 agents), so that
+# `gym env status` must report "18 servers found (18 healthy ...)" before rollouts start.
+#
+# Provenance of each block:
+#  * policy_model / simulator_model: responses_api_models/vllm_model/configs/vllm_model.yaml
+#    (the stock-vLLM form the eval workspace used against a DP8 `vllm serve`) plus the training
+#    chat_template_kwargs from runs/train-v1-20260928T023000Z/gym-configs/000-gym-services-light-rules-only-code-math.yaml.
+#    `return_token_id_information` / `request_prompt_and_generation_token_ids` are FALSE here on
+#    purpose: those two are NeMo-RL HTTP-server extensions (frozen recipe sets them true) and a
+#    stock `vllm serve` does not implement them.
+#  * single_step / toolcall_schema / search_pivot servers + agents: copied verbatim from the frozen
+#    v8 recipe above (word_count_similarity_threshold 0.3 / 0.1 / 0.1), datasets dropped.
+#  * instruction_following, structured_outputs: frozen v8 recipe, datasets dropped.
+#  * multichallenge: Gym upstream resources_servers/multichallenge/configs/multichallenge_nrl.yaml
+#    (judge_model_server = policy_model) with judge max_output_tokens raised 512 -> 8192 because
+#    the policy judges with thinking enabled (VERIFY judge behaviour on first run).
+#  * workplace_assistant: Gym upstream resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+#    (simple_agent max_steps 6; the eval workspace used 10).
+#  * conversational_tool_use_simulation + conversational_tool_use_agent: Gym upstream
+#    resources_servers/conversational_tool_use_simulation/configs/conversational_tool_use_simulation.yaml,
+#    byte-equivalent to the blocks in config/gym-services-v1.yaml; simulator_model written out in full
+#    instead of the upstream `_copy: policy_model` directive.
+#
+# Interpolated keys are supplied on the CLI by launch_profile.sh:
+#   --model <served-model-name> -> policy_model_name, --model-url '["http://127.0.0.1:PORT/v1"]' -> policy_base_url,
+#   --model-api-key dummy -> policy_api_key.
+# ---------------------------------------------------------------------------
+
+policy_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      return_token_id_information: false
+      request_prompt_and_generation_token_ids: false
+      uses_reasoning_parser: true
+      uses_interleaved_reasoning: true
+      chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
+      extra_body: null
+      default_headers: {}
+      num_workers: 16
+
+simulator_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      return_token_id_information: false
+      request_prompt_and_generation_token_ids: false
+      uses_reasoning_parser: true
+      uses_interleaved_reasoning: true
+      chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
+      extra_body: null
+      default_headers: {}
+      num_workers: 16
+
+# --- single-step tool routes (frozen v8 recipe) -----------------------------------------------
+single_step_tool_use_with_argument_comparison_resources_server:
+  resources_servers:
+    single_step_tool_use_with_argument_comparison:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: "Conversational tool-use RL from expert trajectories; behavior cloning per step across auth, lookup, and servicing domains."
+      tool_call_comparator_config:
+        word_count_similarity_threshold: 0.1
+
+single_step_tool_use_with_argument_comparison_agent:
+  responses_api_agents:
+    tool_simulation_agent:
+      entrypoint: app.py
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: single_step_tool_use_with_argument_comparison_resources_server
+
+toolcall_schema_single_step_tool_use_with_argument_comparison_resources_server:
+  resources_servers:
+    single_step_tool_use_with_argument_comparison:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: "General function-calling RL dataset using expert trajectories; behavior cloning to match expert tool calls per step."
+      tool_call_comparator_config:
+        word_count_similarity_threshold: 0.1
+
+toolcall_schema_single_step_tool_use_with_argument_comparison_agent:
+  responses_api_agents:
+    tool_simulation_agent:
+      entrypoint: app.py
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: toolcall_schema_single_step_tool_use_with_argument_comparison_resources_server
+
+search_pivot_single_step_tool_use_with_argument_comparison_resources_server:
+  resources_servers:
+    single_step_tool_use_with_argument_comparison:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: "The model must output the next correct call in a given trajectory involving search tools."
+      value: "Improve agentic search capability."
+      tool_call_comparator_config:
+        word_count_similarity_threshold: 0.3
+
+search_pivot_single_step_tool_use_with_argument_comparison_agent:
+  responses_api_agents:
+    tool_simulation_agent:
+      entrypoint: app.py
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: search_pivot_single_step_tool_use_with_argument_comparison_resources_server
+
+
+droid_pivot_single_step_tool_use_with_argument_comparison_resources_server:
+  resources_servers:
+    single_step_tool_use_with_argument_comparison:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: "Droid agent pivot dataset; behavior cloning per step from successful Droid rollouts."
+      tool_call_comparator_config:
+        word_count_similarity_threshold: 0.0
+
+droid_pivot_single_step_tool_use_with_argument_comparison_agent:
+  responses_api_agents:
+    tool_simulation_agent:
+      entrypoint: app.py
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: droid_pivot_single_step_tool_use_with_argument_comparison_resources_server
+
+# --- instruction following / structured outputs (frozen v8 recipe) ----------------------------
+instruction_following:
+  resources_servers:
+    instruction_following:
+      entrypoint: app.py
+      domain: instruction_following
+      verified: false
+      description: "Instruction following datasets targeting IFEval and IFBench style instruction following capabilities"
+      value: "Improve IFEval and IFBench"
+
+instruction_following_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 1
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: instruction_following
+
+structured_outputs:
+  resources_servers:
+    structured_outputs:
+      entrypoint: app.py
+      domain: instruction_following
+      verified: false
+      description: "Check if responses follow tool-call structured output schemas. Created 20260424."
+      value: "Improve schema adherence when structured output is expressed through tool calls"
+
+structured_outputs_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 1
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: structured_outputs
+
+# --- multichallenge (upstream multichallenge_nrl.yaml; judge = the policy itself) -------------
+multichallenge:
+  resources_servers:
+    multichallenge:
+      entrypoint: app.py
+      judge_model_server:
+        type: responses_api_models
+        name: policy_model
+      judge_responses_create_params:
+        input: []
+        max_output_tokens: 8192
+        temperature: 1.0
+        top_p: 1.0
+      aggregation_mode: mean
+      parallel_evaluation: true
+      judge_system_message: >-
+        You are a precise evaluator. Assess responses objectively based on the given criteria.
+        Analyze the response carefully against the evaluation question.
+      judge_prompt_template: |-
+        You are evaluating whether a model's response meets a specific criterion.
+
+        CONVERSATION CONTEXT:
+        {context}
+
+        MODEL'S FINAL RESPONSE:
+        {response}
+
+        EVALUATION QUESTION:
+        {question}
+
+        EXPECTED ANSWER: {pass_criteria}
+
+        Does the model's response satisfy the criterion described in the evaluation question?
+        Think step by step, then respond with exactly [[YES]] or [[NO]] on the last line.
+      yes_label: "[[YES]]"
+      no_label: "[[NO]]"
+      domain: knowledge
+      description: Targets inference memory, instruction retention, version editing, and self-coherence.
+      value: Improve complex multi-turn conversational capability
+      verified: false
+
+multichallenge_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 1
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: multichallenge
+
+# --- workplace assistant (upstream workplace_assistant.yaml) ----------------------------------
+workplace_assistant:
+  resources_servers:
+    workplace_assistant:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: Workplace assistant multi-step tool-using environment
+      value: Improve multi-step tool use capability
+
+workplace_assistant_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 6
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: workplace_assistant
+
+# --- conversational tool use (upstream conversational_tool_use_simulation.yaml) ---------------
+conversational_tool_use_simulation:
+  resources_servers:
+    conversational_tool_use_simulation:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: Conversational tool-use simulation environment.
+      simulator_model_server:
+        type: responses_api_models
+        name: simulator_model
+      user_model_server:
+        type: responses_api_models
+        name: simulator_model
+      tool_simulator_model_server:
+        type: responses_api_models
+        name: simulator_model
+      judge_model_server:
+        type: responses_api_models
+        name: simulator_model
+      user_responses_create_params:
+        input: []
+        temperature: 1.0
+        top_p: 1.0
+        max_output_tokens: 8192
+        parallel_tool_calls: false
+      tool_simulator_responses_create_params:
+        input: []
+        temperature: 1.0
+        top_p: 1.0
+        max_output_tokens: 8192
+        parallel_tool_calls: false
+      judge_responses_create_params:
+        input: []
+        temperature: 1.0
+        top_p: 1.0
+        max_output_tokens: 8192
+        parallel_tool_calls: false
+      generation_attempts: 3
+      judge_provider_attempts: 3
+      judge_provider_retry_initial_backoff_seconds: 0.5
+      judge_provider_retry_max_backoff_seconds: 8.0
+      enable_llm_judge: true
+      enable_termination: true
+      verification_type: message
+      enforce_transfer_ground_truth: true
+
+conversational_tool_use_agent:
+  responses_api_agents:
+    conversational_tool_use/simulation:
+      entrypoint: app.py
+      datasets: []
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      resources_server:
+        type: resources_servers
+        name: conversational_tool_use_simulation
+      max_agent_steps: 50
+      seed_first_user_message: true

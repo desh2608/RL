@@ -1,0 +1,922 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from unittest.mock import MagicMock
+
+from app import MCQAResourcesServer, MCQAResourcesServerConfig, MCQAVerifyRequest
+
+from nemo_gym.openai_utils import NeMoGymResponse
+from nemo_gym.server_utils import ServerClient
+
+
+class TestApp:
+    def test_sanity(self) -> None:
+        config = MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name="")
+        MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+    async def test_verify_correct(self) -> None:
+        # Build a NeMoGymResponse with a valid OpenAI Responses shape and the assistant message including letter C
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "The answer is C.",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [
+                    {
+                        "role": "user",
+                        "content": "Q?\nA: optA\nB: optB\nC: optC\nD: optD",
+                    },
+                ],
+                "parallel_tool_calls": False,
+                "temperature": 0,
+            },
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}, {"C": "optC"}, {"D": "optD"}],
+            expected_answer="C",
+            grading_mode="strict_single_letter_boxed",
+        )
+
+        # strict requires boxed; plain C should fail
+        result = await server.verify(verify_request)
+        assert result.reward == 0.0
+
+        # Now send boxed C (strict)
+        response_boxed = NeMoGymResponse(
+            id="resp_test2",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test2",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "Final: \\boxed{ [C] }",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request_boxed = verify_request.model_copy(update={"response": response_boxed})
+        result2 = await server.verify(verify_request_boxed)
+        assert result2.reward == 1.0
+
+        # Lenient: allow matching option text within boxed content
+        response_boxed_text = NeMoGymResponse(
+            id="resp_test3",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test3",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "Final: \\boxed{ optC }",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request_lenient = verify_request.model_copy(
+            update={"response": response_boxed_text, "grading_mode": "lenient_boxed"}
+        )
+        result3 = await server.verify(verify_request_lenient)
+        assert result3.reward == 1.0
+
+        # Lenient answer colon: letter
+        response_answer_colon = NeMoGymResponse(
+            id="resp_test4",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test4",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "Answer: c",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+        verify_request_answer_colon = verify_request.model_copy(
+            update={
+                "response": response_answer_colon,
+                "grading_mode": "lenient_answer_colon",
+            }
+        )
+        result4 = await server.verify(verify_request_answer_colon)
+        assert result4.reward == 1.0
+
+        # Lenient answer colon: exact option text
+        response_answer_colon_text = NeMoGymResponse(
+            id="resp_test5",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test5",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "Answer: optC",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+        verify_request_answer_colon_text = verify_request.model_copy(
+            update={
+                "response": response_answer_colon_text,
+                "grading_mode": "lenient_answer_colon",
+            }
+        )
+        result5 = await server.verify(verify_request_answer_colon_text)
+        assert result5.reward == 1.0
+
+    async def test_template_metadata_basic(self) -> None:
+        """Test basic template_metadata with custom regex"""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        # Test custom regex: "Option Selected: X"
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "Option Selected: B", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [{"role": "user", "content": "Question?\nA: optA\nB: optB"}],
+                "parallel_tool_calls": False,
+                "temperature": 0,
+            },
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            grading_mode="strict_single_letter_boxed",  # Will be overridden by template_metadata
+            template_metadata={"output_regex": r"Option Selected:\s*([A-Za-z])"},
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_case_insensitive(self) -> None:
+        """Test that template_metadata regex is case-insensitive"""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        # Model outputs lowercase 'b', should match uppercase 'B'
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "ANSWER IS b", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [{"role": "user", "content": "Question?\nA: optA\nB: optB"}],
+            },
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            template_metadata={"output_regex": r"ANSWER IS\s*([A-Za-z])"},
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_regex_list(self) -> None:
+        """Test that template_metadata can try a list of regexes in order."""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "Antwort: B", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={"input": [{"role": "user", "content": "Question?"}]},
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            template_metadata={"output_regex": [r"Answer\s*:\s*([A-Za-z])", r"Antwort\s*:\s*([A-Za-z])"]},
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_multilingual_letter_normalization(self) -> None:
+        """Test MMMLU-style localized answer letters normalize to A-D."""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "الإجابة: ب", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={"input": [{"role": "user", "content": "Question?"}]},
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            template_metadata={"output_regex": [r"الإجابة:\s*([أ-د])"]},
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_rightmost_match(self) -> None:
+        """Test that rightmost (last) match is used when multiple matches exist"""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        # Model mentions A first, then concludes with B
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [
+                        {
+                            "annotations": [],
+                            "text": "Maybe Answer: A? Let me reconsider. Final Answer: B",
+                            "type": "output_text",
+                        }
+                    ],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [{"role": "user", "content": "Question?\nA: optA\nB: optB"}],
+            },
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            template_metadata={"output_regex": r"Answer:\s*([A-Za-z])"},
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_priority_over_grading_mode(self) -> None:
+        """Test that template_metadata takes priority over grading_mode"""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        # Model outputs "Final Choice: B" (not boxed format)
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "Final Choice: B", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [{"role": "user", "content": "Question?\nA: optA\nB: optB"}],
+            },
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            grading_mode="strict_single_letter_boxed",  # Would fail without boxed
+            template_metadata={"output_regex": r"Final Choice:\s*([A-Za-z])"},  # Should use this instead
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0  # Should succeed via template_metadata
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_invalid_regex(self) -> None:
+        """Test that invalid regex patterns are handled gracefully"""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "\\boxed{B}", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [{"role": "user", "content": "Question?\nA: optA\nB: optB"}],
+            },
+            response=response,
+            options=[{"A": "optA"}, {"B": "optB"}],
+            expected_answer="B",
+            grading_mode="strict_single_letter_boxed",  # Should fallback to this
+            template_metadata={"output_regex": r"(["},  # Invalid regex
+        )
+
+        # Should fallback to grading_mode and succeed
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+    async def test_template_metadata_without_options(self) -> None:
+        """Test template_metadata works even with incomplete options metadata"""
+        server = MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "Selected: B", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+        verify_request = MCQAVerifyRequest(
+            responses_create_params={
+                "input": [{"role": "user", "content": "Question?"}],
+            },
+            response=response,
+            options=[],  # Empty options
+            expected_answer="B",
+            template_metadata={"output_regex": r"Selected:\s*([A-Za-z])"},
+        )
+
+        result = await server.verify(verify_request)
+        assert result.reward == 1.0
+        assert result.extracted_answer == "B"
+
+
+def _make_verify_request(
+    text: str,
+    expected: str = "B",
+    grading_mode: str = "strict_single_letter_boxed",
+    option_letters: str = "ABCD",
+):
+    """Helper to build a MCQAVerifyRequest with proper schema."""
+    response = NeMoGymResponse(
+        id="resp_test",
+        created_at=0.0,
+        model="dummy",
+        object="response",
+        output=[
+            {
+                "id": "msg_test",
+                "content": [{"annotations": [], "text": text, "type": "output_text"}],
+                "role": "assistant",
+                "status": "completed",
+                "type": "message",
+            }
+        ],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+    )
+    return MCQAVerifyRequest(
+        responses_create_params={"input": [{"role": "user", "content": "Q?"}]},
+        response=response,
+        options=[{letter: f"opt{letter}"} for letter in option_letters],
+        expected_answer=expected,
+        grading_mode=grading_mode,
+    )
+
+
+class TestGradingModeConfig:
+    """Test that MCQAResourcesServerConfig.grading_mode overrides per-row grading_mode."""
+
+    async def test_config_grading_mode_overrides_row(self) -> None:
+        config = MCQAResourcesServerConfig(
+            host="127.0.0.1",
+            port=12345,
+            entrypoint="app.py",
+            name="mcqa",
+            grading_mode="lenient_answer_colon",
+        )
+        server = MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+        body = _make_verify_request(
+            text="I think the answer is B.\n\nAnswer: B",
+            expected="B",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_no_config_grading_mode_uses_row_default(self) -> None:
+        config = MCQAResourcesServerConfig(
+            host="127.0.0.1",
+            port=12345,
+            entrypoint="app.py",
+            name="mcqa",
+        )
+        server = MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+        body = _make_verify_request(
+            text="I think the answer is B.\n\nAnswer: B",
+            expected="B",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+
+class TestGradingModeAnswerColonMD:
+    """Test lenient_answer_colon_md grading mode (markdown-aware Answer: extraction)."""
+
+    def _make_server(self, grading_mode="lenient_answer_colon_md"):
+        config = MCQAResourcesServerConfig(
+            host="127.0.0.1",
+            port=12345,
+            entrypoint="app.py",
+            name="mcqa",
+            grading_mode=grading_mode,
+        )
+        return MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+    async def test_plain_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="The answer is B.\n\nAnswer: B", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_markdown_bold_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="Reasoning here.\n\n**Answer: C**", expected="C")
+        result = await server.verify(body)
+        assert result.extracted_answer == "C"
+        assert result.reward == 1.0
+
+    async def test_markdown_bold_no_match_old_regex(self) -> None:
+        """Verify that lenient_answer_colon does NOT extract **Answer: C** (old behavior preserved)."""
+        server = self._make_server(grading_mode="lenient_answer_colon")
+        body = _make_verify_request(text="**Answer: C**", expected="C")
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+    async def test_markdown_underscore_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="__Answer__: A", expected="A")
+        result = await server.verify(body)
+        assert result.extracted_answer == "A"
+        assert result.reward == 1.0
+
+    async def test_leading_letter_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="Answer: B because C is not valid", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_repeated_letter_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="Answer: B/B", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_wrapped_answers(self) -> None:
+        server = self._make_server()
+        cases = [
+            ("Answer: $D$", "D", "ABCD"),
+            ("Answer: (D)", "D", "ABCD"),
+            (r"\boxed{\text{Answer: G}}", "G", "ABCDEFGHIJ"),
+        ]
+        for text, expected, option_letters in cases:
+            body = _make_verify_request(text=text, expected=expected, option_letters=option_letters)
+            result = await server.verify(body)
+            assert result.extracted_answer == expected, text
+            assert result.reward == 1.0, text
+
+    async def test_unextractable_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="Answer: unknown", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+    async def test_disallowed_answer(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="Answer: G", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+    async def test_ambiguous_answer_lists(self) -> None:
+        server = self._make_server()
+        cases = [
+            ("Answer: A/B/C", "A", "ABCD"),
+            ("Answer: B/I", "B", "ABCDEFGHIJ"),
+            ("**Answer: D/H**", "D", "ABCDEFGHIJ"),
+            ("Answer: A or B", "A", "ABCD"),
+            ("Answer: A and B", "A", "ABCD"),
+            ("Answer: A, B", "A", "ABCD"),
+        ]
+        for text, expected, option_letters in cases:
+            body = _make_verify_request(text=text, expected=expected, option_letters=option_letters)
+            result = await server.verify(body)
+            assert result.extracted_answer is None, text
+            assert result.reward == 0.0, text
+
+    async def test_rightmost_answer_match(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="Answer: A\nAnswer: B", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_invalid_rightmost_answer_fallback(self) -> None:
+        server = self._make_server()
+        for invalid_payload in ["unknown", "G", "A/B/C"]:
+            body = _make_verify_request(text=f"Answer: B\nAnswer: {invalid_payload}", expected="B")
+            result = await server.verify(body)
+            assert result.extracted_answer == "B", invalid_payload
+            assert result.reward == 1.0, invalid_payload
+
+    async def test_no_answer_pattern(self) -> None:
+        server = self._make_server()
+        body = _make_verify_request(text="I think it might be B but I'm not sure", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+
+class TestComputeMetrics:
+    async def test_mcqa_server_returns_pass_majority_metrics(self) -> None:
+        """MCQA server overrides compute_metrics to compute pass@k and majority@k."""
+        from nemo_gym.base_resources_server import AggregateMetricsRequest
+        from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+
+        config = MCQAResourcesServerConfig(host="127.0.0.1", port=12345, entrypoint="app.py", name="mcqa")
+        server = MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+        responses = [
+            {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0, "extracted_answer": "A"},
+            {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 1, "reward": 1.0, "extracted_answer": "A"},
+            {TASK_INDEX_KEY_NAME: 1, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 0.0, "extracted_answer": "B"},
+            {TASK_INDEX_KEY_NAME: 1, ROLLOUT_INDEX_KEY_NAME: 1, "reward": 1.0, "extracted_answer": "C"},
+        ]
+        body = AggregateMetricsRequest(verify_responses=responses)
+        result = await server.aggregate_metrics(body)
+
+        assert "pass@2/accuracy" in result.agent_metrics
+        assert "pass@1[avg-of-2]/accuracy" in result.agent_metrics
+        assert "majority@2/accuracy" in result.agent_metrics
+        assert result.key_metrics == {
+            "pass@1/accuracy": result.agent_metrics["pass@1/accuracy"],
+            "pass@1[avg-of-2]/accuracy": result.agent_metrics["pass@1[avg-of-2]/accuracy"],
+            "pass@1[avg-of-2]/no_answer": result.agent_metrics["pass@1[avg-of-2]/no_answer"],
+            "majority@2/accuracy": result.agent_metrics["majority@2/accuracy"],
+            "pass@2/no_answer": result.agent_metrics["pass@2/no_answer"],
+            "mean/reward": result.agent_metrics["mean/reward"],
+        }
+
+
+def _make_verify_request_with_options(
+    text: str,
+    options: list[dict[str, str]],
+    expected: str,
+    grading_mode: str = "strict_single_letter_boxed",
+):
+    """Like _make_verify_request but with caller-supplied options (e.g. letters beyond A-D)."""
+    response = NeMoGymResponse(
+        id="resp_test",
+        created_at=0.0,
+        model="dummy",
+        object="response",
+        output=[
+            {
+                "id": "msg_test",
+                "content": [{"annotations": [], "text": text, "type": "output_text"}],
+                "role": "assistant",
+                "status": "completed",
+                "type": "message",
+            }
+        ],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+    )
+    return MCQAVerifyRequest(
+        responses_create_params={"input": [{"role": "user", "content": "Q?"}]},
+        response=response,
+        options=options,
+        expected_answer=expected,
+        grading_mode=grading_mode,
+    )
+
+
+class TestStrictBoxedLatexExtraction:
+    """strict_single_letter_boxed must read the answer letter even when it is wrapped in
+    \\text{} or followed by option text. These are the real rollout formats that used to be
+    scored as no_answer.
+    """
+
+    def _make_server(self, grading_mode="strict_single_letter_boxed"):
+        config = MCQAResourcesServerConfig(
+            host="127.0.0.1",
+            port=12345,
+            entrypoint="app.py",
+            name="mcqa",
+            grading_mode=grading_mode,
+        )
+        return MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+    # Options spanning A-J so we can exercise letters E and I from the real rollouts.
+    OPTIONS = [{chr(ord("A") + i): f"option {chr(ord('A') + i)} text"} for i in range(10)]
+
+    async def test_text_wrapped_bare_letter(self) -> None:
+        """\\boxed{\\text{E}} -> E (LaTeX \\text{} wrapper around a bare letter)."""
+        server = self._make_server()
+        body = _make_verify_request_with_options(r"\boxed{\text{E}}", self.OPTIONS, expected="E")
+        result = await server.verify(body)
+        assert result.extracted_answer == "E"
+        assert result.reward == 1.0
+
+    async def test_text_wrapped_letter_with_option_text(self) -> None:
+        """\\boxed{\\text{I: ...}} -> I (letter + option text, both inside the \\text wrapper)."""
+        server = self._make_server()
+        text = r"\boxed{\text{I: NGS can detect both coding and non-coding regions of the genome.}}"
+        body = _make_verify_request_with_options(text, self.OPTIONS, expected="I")
+        result = await server.verify(body)
+        assert result.extracted_answer == "I"
+        assert result.reward == 1.0
+
+    async def test_leading_letter_colon_then_wrapped_text(self) -> None:
+        """\\boxed{E: \\text{...}} -> E (letter outside, trailing colon + wrapped option text)."""
+        server = self._make_server()
+        text = r"\[ \boxed{E: \text{A polygenic risk score can provide a probability.}} \]"
+        body = _make_verify_request_with_options(text, self.OPTIONS, expected="E")
+        result = await server.verify(body)
+        assert result.extracted_answer == "E"
+        assert result.reward == 1.0
+
+    async def test_plain_boxed_letter_unchanged(self) -> None:
+        """\\boxed{B} -> B (existing behavior must be preserved)."""
+        server = self._make_server()
+        body = _make_verify_request(text=r"\boxed{B}", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_bracketed_letter_unchanged(self) -> None:
+        """\\boxed{ [C] } -> C (existing non-letter padding must still parse)."""
+        server = self._make_server()
+        body = _make_verify_request(text=r"Final: \boxed{ [C] }", expected="C")
+        result = await server.verify(body)
+        assert result.extracted_answer == "C"
+        assert result.reward == 1.0
+
+    async def test_bare_option_text_not_matched_in_strict(self) -> None:
+        """Guard: bare option text with no leading letter label must NOT match in strict mode.
+
+        A sentence-initial capital ("A polygenic ...") must not be mistaken for answer A.
+        Option-text matching is the job of lenient_boxed, not strict.
+        """
+        server = self._make_server()
+        text = r"\boxed{A polygenic risk score can provide a probability.}"
+        body = _make_verify_request_with_options(text, self.OPTIONS, expected="A")
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+    async def test_lenient_boxed_handles_text_wrapper(self) -> None:
+        """lenient_boxed inherits the strict improvement: \\boxed{\\text{E}} -> E."""
+        server = self._make_server(grading_mode="lenient_boxed")
+        body = _make_verify_request_with_options(
+            r"\boxed{\text{E}}", self.OPTIONS, expected="E", grading_mode="lenient_boxed"
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "E"
+        assert result.reward == 1.0
+
+    async def test_unbalanced_box_is_no_answer(self) -> None:
+        """A \\boxed{ with no matching closing brace yields no_answer, not a crash."""
+        server = self._make_server()
+        body = _make_verify_request(text=r"\boxed{B", expected="B")
+        result = await server.verify(body)
+        assert result.extracted_answer is None
+        assert result.reward == 0.0
+
+    async def test_last_box_wins_over_thinking_box(self) -> None:
+        """Two letter boxes: the LAST \\boxed{} is the final answer, not the first.
+
+        A chain-of-thought rollout may box a discarded candidate before the real
+        answer; strict mode must read the final box (E), not the earlier one (C).
+        """
+        server = self._make_server()
+        text = r"Candidate is \boxed{C}, but on reflection the answer is \boxed{E}"
+        body = _make_verify_request_with_options(text, self.OPTIONS, expected="E")
+        result = await server.verify(body)
+        assert result.extracted_answer == "E"
+        assert result.reward == 1.0
+
+    async def test_non_letter_thinking_box_does_not_shadow_answer(self) -> None:
+        """A non-letter intermediate box must not block extraction of a later answer box.
+
+        Regression guard: reading only the first box would parse \\text{some idea},
+        find no letter, and return no_answer despite the real \\boxed{E} that follows.
+        """
+        server = self._make_server()
+        text = r"Thinking: \boxed{\text{some idea}}. Final answer: \boxed{E}"
+        body = _make_verify_request_with_options(text, self.OPTIONS, expected="E")
+        result = await server.verify(body)
+        assert result.extracted_answer == "E"
+        assert result.reward == 1.0

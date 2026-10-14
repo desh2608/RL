@@ -1,0 +1,200 @@
+# Router Replay
+
+Router Replay, or R3, records MoE router choices made during rollout generation
+and replays those choices in Megatron forward passes. This keeps each generated
+token's expert assignment consistent across rollout, logprob, and training
+stages. Without replay, two valid router implementations can choose different
+experts for the same token, which introduces train-vs-rollout logprob mismatch
+that is unrelated to the policy update.
+
+Router Replay is disabled by default. It is not needed for dense models. In
+the current NeMo RL integration, Router Replay is wired and tested for
+Megatron MoE policy training with vLLM rollout generation. Other
+inference/generation backends are not wired into this path and have not been
+tested with Router Replay.
+
+## Configuration
+
+Set `policy.router_replay.enabled=true` in the training config:
+
+```yaml
+policy:
+  router_replay:
+    enabled: true
+```
+
+`policy.router_replay.transport` selects how route data reaches the policy:
+
+- `inline` (the default) carries dense routed-expert indices in the rollout
+  batch. When `data_plane.enabled=true`, this is the existing TransferQueue
+  implementation; there is no separate TQ selector.
+- `ray` carries only an opaque tag through Gym and the RL replay buffer. A
+  source-local actor on the generation node owns a Ray reference to each full
+  routed-expert array. Policy workers retrieve that immutable whole object
+  directly for unsliced single-turn samples. For sliced multi-turn samples,
+  the source actor returns only the logical ranges selected by the policy
+  microbatch, preventing cumulative prompts from making reads quadratic in the
+  number of turns. This path currently requires async GRPO,
+  `env.should_use_nemo_gym=true`, vLLM's async engine, and
+  `data_plane.enabled=false`. It also requires
+  `checkpointing.load_replay_buffer=false`: replay-buffer checkpoints contain
+  only tags, not the Ray-owned route arrays. On a frontier-aligned resume,
+  buffered rollouts are regenerated rather than restoring stale references.
+
+For example, the Ray-reference path is selected with:
+
+```yaml
+data_plane: null
+checkpointing:
+  load_replay_buffer: false
+policy:
+  router_replay:
+    enabled: true
+    transport: ray
+```
+
+Leave `transport` unset (or set it to `inline`) when using TransferQueue. Ray
+reference tags in TransferQueue are not implemented yet and are rejected during
+configuration validation.
+
+### Ray-reference identity and retries
+
+Within each source store/instance, a route object is addressed by:
+
+```text
+(target_weight_version, task_index, rollout_index, attempt_index, request_id)
+```
+
+The async RL collector stamps `_ng_attempt_index=0` on the initial submission
+and increments it on each batch retry. Gym forwards this field alongside
+`_ng_task_index`, `_ng_rollout_index`, and `_ng_target_weight_version` through
+`responses_create_params.metadata.extra_body` to the RL vLLM endpoint. The
+endpoint records it as `attempt_index` in the returned reference. `request_id`
+still distinguishes multiple model calls/turns within an attempt.
+
+References retain the `nemo_rl.routed_experts_ref.v1` schema. When reading older
+reference data, an absent `attempt_index` is interpreted as 0; explicit invalid
+values (including null) are still rejected. This compatibility fallback is not
+applied to live replay requests or new store inserts, which require an explicit
+nonnegative integer attempt index. Deploy the RL and Gym changes together so
+live requests carry the field. Auxiliary model calls with no rollout identity
+remain exempt from replay capture.
+
+The fallback only supplies missing reference metadata; it does not restore
+Ray-owned route arrays. The `checkpointing.load_replay_buffer=false` requirement
+described above is unchanged.
+
+Retries cannot overwrite an earlier attempt's route object, even if they reuse
+the same request ID. Duplicate inserts within the same full key are rejected.
+Logical slices retain the attempt identity, and target-version garbage
+collection retires all attempts for the consumed versions.
+
+When Router Replay is enabled, NeMo RL configures vLLM rollout generation to
+return routed expert indices by setting `enable_return_routed_experts=True` in
+the vLLM kwargs. The generation payload is then carried through the normal
+rollout and policy data path as the `routed_experts` field.
+
+For models that also train MoE-based MTP heads, Router Replay skips MTP
+routers by default. This keeps MTP routers on their native routing decisions
+while replaying vLLM routes only in the decoder layers. Set
+`NRL_ROUTER_REPLAY_EXCLUDE_MTP=0` only when intentionally debugging the legacy
+behavior that replays MTP routers too.
+
+An example recipe is available at:
+
+```text
+examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
+```
+
+The native async TransferQueue path uses the SingleController entrypoint with:
+
+```text
+examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
+```
+
+## Validation
+
+Router Replay validation covers two end-to-end questions:
+
+1. whether rollout routes are carried through TransferQueue, packing, context
+   parallel slicing, and Megatron replay without changing token identity;
+2. whether matched R3-on runs reduce train-vs-rollout mismatch relative to
+   matched R3-off controls.
+
+### Validation and Trace Debugging
+
+Router Replay can emit JSONL traces for a small number of training steps. This
+is intended for correctness debugging, not long training runs.
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `NRL_ROUTER_REPLAY_EXCLUDE_MTP` | `1` | Skip routers under MCore MTP layers. Set to `0` to include MTP routers in replay. |
+| `NRL_ROUTER_REPLAY_VALIDATE` | `0` | Validate replay tensors before Megatron installs them, rejecting partially missing routes, duplicate top-k expert IDs, and out-of-range expert IDs. |
+| `NRL_R3_TRACE` | `0` | Master switch for R3 JSONL trace emission. |
+| `NRL_R3_TRACE_STEPS` | `1` | Number of training steps to trace. |
+| `NRL_R3_TRACE_SAMPLES` | `2` | Number of samples with full tensor previews. |
+| `NRL_R3_TRACE_DIR` | `logs/r3_trace` | Trace output directory. |
+| `NRL_R3_TRACE_MICROBATCHES` | `2` | Number of microbatches to trace per stage. |
+| `NRL_R3_TRACE_VERIFY_FORWARD` | `0` | Verifies replayed top-k indices against the installed replay tensor during forward. |
+
+Example:
+
+```bash
+export NRL_R3_TRACE=1
+export NRL_R3_TRACE_VERIFY_FORWARD=1
+export NRL_R3_TRACE_STEPS=1
+export NRL_R3_TRACE_SAMPLES=1
+export NRL_R3_TRACE_MICROBATCHES=1
+export NRL_R3_TRACE_DIR=/path/to/run/r3_trace
+```
+
+After the run, validate the emitted trace:
+
+```bash
+python tools/check_r3_trace.py /path/to/run/r3_trace \
+  --require-forward-verify \
+  --require-cp-identity
+```
+
+The checker verifies that:
+
+- rollout payload samples include both `input_ids` and `routed_experts`;
+- TransferQueue fetches match the rollout payload;
+- context-parallel slicing preserves token identity for routed experts;
+- Router Replay assignments are installed for prev-logprob and train stages;
+- forward verification reports that replayed routes match the installed tensor.
+
+### Effectiveness Check
+
+1. Run matched R3-off controls to check that the PR does not regress existing
+   packed-sequence and context-parallel Megatron training paths.
+2. Run matched R3-on/R3-off pairs to measure whether Router Replay reduces
+   train-vs-rollout mismatch under the intended rollout settings.
+
+The main metrics to inspect are:
+
+- `train/token_mult_prob_error`
+- `train/js_divergence_error`
+
+Validation report: <https://api.wandb.ai/links/nvidia-nemo-fw-public/lxoovk60>
+
+## Other Notes
+
+### Fallback for Missing Routes
+
+In rare cases, vLLM can return fewer routed-expert entries than expected for a
+sample. NeMo RL represents each missing token route with an all-`-1` sentinel.
+Megatron then uses its normal router only for those missing token routes, while
+all returned vLLM routes are still replayed exactly.
+
+The fallback is intentionally route-local: it does not disable Router Replay for
+the whole batch or sample.
+
+When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warning
+to the run log naming the affected sample count and missing token-route count.
+Fallback should normally be absent or rare; frequent warnings mean a meaningful
+share of token routes used Megatron's normal router instead of replay.
+
+The generation backend also computes
+`r3/routed_experts_fallback_token_route_fraction`, but no training loop currently
+forwards it to the metric logger, so do not rely on it in dashboards or gates.

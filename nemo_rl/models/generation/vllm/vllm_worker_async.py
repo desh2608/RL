@@ -1,0 +1,2084 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import copy
+import gc
+import importlib.util
+import logging
+import os
+import threading
+import time
+import uuid
+import warnings
+from typing import Any, AsyncGenerator, Optional, cast
+
+import ray
+import torch
+import uvicorn
+from fastapi import FastAPI
+from pydantic import Field
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationOutputSpec,
+    verify_right_padding,
+)
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmAsyncCheckpointEngineRpcMixin,
+)
+from nemo_rl.models.generation.vllm.utils import (
+    attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
+    format_prompt_for_vllm_generation,
+    model_dump_chat_response_with_dynamic_message_fields,
+    pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
+)
+from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.vllm.node_engine import (
+    node_engine_dp_size, _collective_rpc_all_node_engines, sampled_token_logprobs,
+)
+from nemo_rl.models.generation.openai_server_utils import (
+    replace_prefix_tokens,
+)
+from nemo_rl.utils.routed_experts_ref import (
+    ROUTED_EXPERTS_REF_TRANSPORT,
+    RoutedExpertsStoreWriter,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+# NeMo Gym's vllm_model proxy recovers from a prompt that overflows the context
+# window by turning the failure into an empty completion with
+# finish_reason="length" instead of failing the rollout. That handler keys on
+# HTTP 400 *and* this marker appearing in the response body (see
+# responses_api_models/vllm_model/app.py). Both halves of that contract are
+# asserted in tests/unit/models/generation/test_vllm_context_length_overflow.py;
+# do not reword without updating the proxy.
+CONTEXT_LENGTH_ERROR_MARKER = "context length"
+
+
+def context_length_overflow_message(prompt_len: int, max_model_len: int) -> str:
+    """Message for a prompt that leaves no room for output tokens."""
+    return (
+        f"Prompt length ({prompt_len}) fills or exceeds the model's maximum "
+        f"{CONTEXT_LENGTH_ERROR_MARKER} ({max_model_len}). "
+        f"No room for output tokens."
+    )
+
+
+def is_context_length_error(exc: BaseException) -> bool:
+    """Whether ``exc`` reports a prompt that exceeds the model's context window.
+
+    vLLM signals this several ways: VLLMValidationError from tokenization, and
+    a plain ValueError from the online renderer or from the max-token clamp.
+    Only the message is reliable across those paths.
+    """
+    return CONTEXT_LENGTH_ERROR_MARKER in str(exc)
+
+
+def _resolved_module_source(module_name: str) -> str:
+    """Return both the import origin and resolved path for startup diagnostics."""
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        return "<not found>"
+    return f"{spec.origin} -> {os.path.realpath(spec.origin)}"
+
+
+class VllmAsyncGenerationWorkerImpl(
+    VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
+):
+    def __init__(
+        self,
+        config,
+        bundle_indices=None,
+        fraction_of_gpus: float = 1.0,
+        seed=None,
+        extra_env_vars: Optional[list[str]] = None,
+        defer_model_load: bool = False,
+    ):
+        """Initialize an async vLLM worker.
+
+        When defer_model_load=True, only stores config and reserves a port for
+        the HTTP server (if expose_http_server is enabled). Call load_model()
+        later to perform the heavy model loading. This enables overlapping vLLM
+        model loading with NeMo Gym init.
+
+        Args:
+            config: Configuration dictionary for the policy
+            bundle_indices: List of local bundle indices within a node for parallelism.
+            fraction_of_gpus: Fraction of GPUs to use for this worker
+            seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess.
+            defer_model_load: If True, skip model loading and only reserve port
+        """
+        # Deferred-loading state. Always initialized so every instance has a
+        # consistent set of attributes regardless of init path.
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
+        self._deferred_bundle_indices = None
+        self._deferred_seed = None
+
+        # Defaults for HTTP server state; overwritten by _create_engine()
+        # when the worker is a model owner and the model is actually loaded.
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+        self._routed_experts_store_writer = None
+        self._routed_experts_store_writer_lock = threading.Lock()
+
+        LOGGER.info(
+            "vLLM runtime sources: package=%s; routed_experts_capturer=%s; "
+            "gpu_model_runner=%s",
+            _resolved_module_source("vllm"),
+            _resolved_module_source(
+                "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
+            ),
+            _resolved_module_source("vllm.v1.worker.gpu_model_runner"),
+        )
+
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            extra_env_vars,
+            defer_model_load,
+        )
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _return_routed_experts_enabled(self) -> bool:
+        engine_args = getattr(self, "llm_async_engine_args", None)
+        if bool(getattr(engine_args, "enable_return_routed_experts", False)):
+            return True
+        return bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
+
+    def _routed_experts_ref_enabled(self) -> bool:
+        return (
+            self.cfg.get("vllm_cfg", {}).get("_routed_experts_transport")
+            == ROUTED_EXPERTS_REF_TRANSPORT
+        )
+
+    def _get_routed_experts_store_writer(self) -> RoutedExpertsStoreWriter:
+        writer = self._routed_experts_store_writer
+        if writer is not None:
+            return writer
+        with self._routed_experts_store_writer_lock:
+            writer = self._routed_experts_store_writer
+            if writer is None:
+                run_instance_id = self.cfg.get("vllm_cfg", {}).get(
+                    "_routed_experts_store_run_instance_id"
+                )
+                if not isinstance(run_instance_id, str) or not run_instance_id:
+                    raise RuntimeError(
+                        "router_replay.transport=ray is missing the vLLM "
+                        "store run instance id"
+                    )
+                writer = RoutedExpertsStoreWriter(run_instance_id)
+                self._routed_experts_store_writer = writer
+        return writer
+
+    def _reserve_port(self) -> None:
+        """Bind and listen on a TCP socket to reserve a free port from the OS.
+
+        The socket is held open in LISTENING state and later passed directly to
+        uvicorn via the ``sockets=`` parameter in ``server.serve()``. The socket
+        is never closed and re-opened, so there is zero gap where another process
+        could steal the port.
+        """
+        import socket
+
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
+        self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved_socket.bind(("", 0))
+        self._reserved_socket.listen(128)
+        self._reserved_socket.setblocking(False)
+        self._reserved_port = self._reserved_socket.getsockname()[1]
+        self._reserved_node_ip = _get_node_ip_local()
+        print(
+            f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
+            f"for vLLM HTTP server"
+        )
+
+    def load_model(self) -> None:
+        """Load the vLLM model and create the engine.
+
+        Called after a deferred init to perform the heavy model loading.
+        """
+        if not self.is_model_owner:
+            return
+        self._load_model(self._deferred_bundle_indices, self._deferred_seed)
+
+    def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        from vllm.config import CompilationConfig
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+        # Workaround: convert compilation_config dict to CompilationConfig object
+        # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
+        if llm_kwargs.get("compilation_config", None):
+            compilation_config = dict(llm_kwargs["compilation_config"])
+            # use_inductor was removed in vLLM v0.12+ (https://github.com/vllm-project/vllm/pull/29323)
+            # and replaced by the `backend` field: use_inductor=True -> backend="" (inductor),
+            # use_inductor=False -> backend="eager".
+            if "use_inductor" in compilation_config:
+                use_inductor = compilation_config.pop("use_inductor")
+                if "backend" not in compilation_config:
+                    compilation_config["backend"] = "" if use_inductor else "eager"
+                warnings.warn(
+                    "compilation_config.use_inductor is deprecated in vLLM v0.12+. "
+                    "Use compilation_config.backend instead: "
+                    "use_inductor=True -> backend='inductor', "
+                    "use_inductor=False -> backend='eager'.",
+                    DeprecationWarning,
+                    stacklevel=1,
+                )
+            llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+
+        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+        self.stat_loggers = (
+            [PrometheusStatLogger]
+            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+            else []
+        )
+        self.llm = AsyncLLM.from_engine_args(
+            self.llm_async_engine_args, stat_loggers=self.stat_loggers
+        )
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            # Must run after AsyncLLM.from_engine_args and before
+            # _setup_vllm_server spawns the uvicorn thread.
+            self._install_engine_input_socket_lock()
+            self.server_thread, self.base_url, self.http_server = (
+                self._setup_vllm_server()
+            )
+
+        # vLLM Metrics Logger
+        # Metrics logger only enabled for per-actor, model-owner only
+        self._vllm_metrics_lock = threading.Lock()
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self._start_vllm_metrics_logger()
+
+    def _install_engine_input_socket_lock(self) -> None:
+        """Serialise sends on AsyncMPClient.input_socket across OS threads
+        to prevent race conditions that block the vLLM engine (e.g. during
+        in flight weight updates in async grpo).
+        """
+        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
+
+        lock = threading.Lock()
+        original_send_multipart = shadow_sock.send_multipart
+
+        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                return original_send_multipart(*args, **kwargs)
+
+        # Replace the bound method on this socket instance only; other zmq
+        # sockets in the process are unaffected.
+        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
+
+    def _start_vllm_metrics_logger(self) -> None:
+        """Start a background thread that periodically collects vLLM logger metrics.
+
+        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Runs only on the model-owner actor.
+        """
+        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+
+        assert self.cfg["vllm_cfg"].get("async_engine", False), (
+            "vLLM metrics logger is only supported with async engine enabled"
+        )
+        # Run only on the model-owner actor
+        if not getattr(self, "is_model_owner", False):
+            return
+
+        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
+            "vllm_metrics_logger_interval must be set in vllm_cfg if enable_vllm_metrics_logger is True"
+        )
+        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
+        assert interval_s > 0, (
+            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
+        )
+
+        # Lazy import inside thread target to avoid import overhead if disabled
+        stop_event = threading.Event()
+        self._vllm_metrics_logger_stop_event = stop_event
+
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+        self.kv_cache_usage_perc: list[float] = []
+        self.generation_tokens: list[int] = []
+
+        def _logger_loop():
+            # Delay a little to let engine settle
+            time.sleep(min(2.0, interval_s))
+            while True:
+                try:
+                    for m in get_metrics_snapshot():
+                        with self._vllm_metrics_lock:
+                            if isinstance(m, Gauge):
+                                # Log the vllm inflight batch sizes
+                                if m.name == "vllm:num_requests_running":
+                                    self.inflight_batch_sizes.append(int(m.value))
+                                # Log the vllm pending number of requests in the queue
+                                elif m.name == "vllm:num_requests_waiting":
+                                    self.num_pending_samples.append(int(m.value))
+                                # Log the vllm kv cache usage
+                                elif m.name == "vllm:kv_cache_usage_perc":
+                                    self.kv_cache_usage_perc.append(float(m.value))
+                            elif isinstance(m, Counter):
+                                if m.name == "vllm:generation_tokens":
+                                    self.generation_tokens.append(int(m.value))
+                except Exception:
+                    print(
+                        "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
+                        flush=True,
+                    )
+                    pass
+                time.sleep(interval_s)
+
+        t = threading.Thread(
+            target=_logger_loop, name="vllm-metrics-logger", daemon=True
+        )
+        t.start()
+        self._vllm_metrics_logger_thread = t
+        print(
+            "📋[vLLM Metric Logger] vLLM metrics logger thread started",
+            flush=True,
+        )
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            metric = {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
+                "generation_tokens": copy.deepcopy(self.generation_tokens),
+            }
+        return metric
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+
+        with self._vllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+            self.kv_cache_usage_perc = []
+            self.generation_tokens = []
+
+    async def post_init_async(self):
+        if self.llm is not None:
+            await self._collective_rpc("bind_numa", args=tuple())
+        self.vllm_device_ids = await self.report_device_id_async()
+        if self._mtp_load_from_disk:
+            await self._collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
+        if self._sparse_refit_receiver is not None:
+            hostnames = await self._collective_rpc("report_node_hostname", args=())
+            self._sparse_refit_receiver.set_worker_hostnames(hostnames)
+
+    async def get_reserved_url(self) -> Optional[str]:
+        """Return the URL from the reserved socket, available before model loading."""
+        if self._reserved_socket is not None:
+            return f"http://{self._reserved_node_ip}:{self._reserved_port}/v1"
+        return None
+
+    async def report_dp_openai_server_base_url(self) -> Optional[str]:
+        return self.base_url
+
+    # ruff: noqa
+    def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
+        from copy import deepcopy
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord
+        from typing import List, Optional, Union
+
+        from fastapi import Request
+        from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+            ChatCompletionResponse,
+        )
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.openai.models.protocol import BaseModelPath
+        from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.serve.tokenize.protocol import (
+            TokenizeChatRequest,
+            TokenizeCompletionRequest,
+            TokenizeResponse,
+        )
+        from vllm.entrypoints.serve.tokenize.serving import (
+            ServingTokenization,
+        )
+        from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.exceptions import VLLMValidationError
+        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+        from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
+
+        maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
+        if maybe_tool_parser_plugin:
+            ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+
+        maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
+            "reasoning_parser_plugin"
+        )
+        if maybe_reasoning_parser_plugin:
+            ReasoningParserManager.import_reasoning_parser(
+                maybe_reasoning_parser_plugin
+            )
+
+        engine_client = self.llm
+        model_config = self.llm_async_engine_args.create_model_config()
+        base_model_paths = [
+            BaseModelPath(
+                name=model_config.served_model_name, model_path=model_config.model
+            ),
+            BaseModelPath(name=model_config.model, model_path=model_config.model),
+        ]
+
+        openai_serving_models_kwargs = dict(
+            engine_client=engine_client,
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
+        openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
+
+        class NeMoRLOpenAIChatRequestMixin:
+            def model_post_init(self, context):
+                # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
+                if self.required_prefix_token_ids is None:
+                    for message in reversed(self.messages):
+                        if "prompt_token_ids" in message:
+                            self.required_prefix_token_ids = (
+                                message["prompt_token_ids"]
+                                + message["generation_token_ids"]
+                            )
+                            break
+
+                return super().model_post_init(context)
+
+        class NeMoRLOpenAIServingMixin:
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens.
+
+                Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
+                and max_tokens (deprecated but still supported by vLLM).
+                """
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list[int]
+            ) -> None:
+                """Clamp the request's max output tokens so that input + output <= max_model_len."""
+                remaining = self.model_config.max_model_len - len(prompt_token_ids)
+                if remaining <= 0:
+                    raise ValueError(
+                        context_length_overflow_message(
+                            len(prompt_token_ids), self.model_config.max_model_len
+                        )
+                    )
+                max_tokens = min(request_max_tokens, remaining)
+                self._set_max_tokens(request, max_tokens)
+
+            # vLLM 0.25 moved chat preprocessing to
+            # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
+            # folded into a single `parser`), so this override now applies via
+            # the renderer subclass.
+            async def preprocess_chat(
+                self,
+                request,
+                messages,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
+                tool_dicts=None,
+                parser=None,
+                *,
+                skip_mm_cache: bool = False,
+            ):
+                for message in messages:
+                    if message.get("tool_calls"):
+                        message["tool_calls"] = list(message["tool_calls"])
+
+                messages_for_replace_prefix_tokens = deepcopy(messages)
+
+                # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
+                # the actual value will be set through _clamp_max_tokens later.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
+                    )
+                    # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
+                    # So we don't need to set the request's max output tokens to 1 here.
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
+
+                try:
+                    res = await super().preprocess_chat(
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                except (ValueError, VLLMValidationError) as e:
+                    if "maximum context length" in str(e):
+                        import logging
+
+                        logging.getLogger(__name__).warning(
+                            "Prompt exceeds max_model_len: %s", e
+                        )
+                    raise
+
+                if (
+                    not hasattr(request, "required_prefix_token_ids")
+                    or request.required_prefix_token_ids is None
+                ):
+                    # Clamp the request's max output tokens so that input + output <= max_model_len.
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
+                    return res
+
+                last_assistant_message_idx = None
+                for i in reversed(range(len(messages_for_replace_prefix_tokens))):
+                    if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
+                        last_assistant_message_idx = i
+                        break
+
+                if last_assistant_message_idx is None:
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens
+                    )
+                else:
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens[
+                            : last_assistant_message_idx + 1
+                        ]
+                    )
+
+                modified_request = request.model_copy(
+                    update={"add_generation_prompt": False}
+                )
+
+                corresponding_res = await super().preprocess_chat(
+                    request=modified_request,
+                    messages=messages_to_last_assistant_message,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    parser=parser,
+                    skip_mm_cache=skip_mm_cache,
+                )
+                actual_corresponding_token_ids = corresponding_res[1][0][
+                    "prompt_token_ids"
+                ]
+
+                engine_prompt = res[1][0]
+
+                final_prompt_token_ids = replace_prefix_tokens(
+                    tokenizer=self.renderer.tokenizer,
+                    model_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
+                    template_token_ids=engine_prompt["prompt_token_ids"],
+                )
+
+                # Must precede the reassignment below: the remap reads the
+                # current value of prompt_token_ids as the template-coordinate
+                # sequence the placeholders were computed against. Reordering
+                # these two statements silently degrades to a no-op.
+                if mm_placeholders := engine_prompt.get("mm_placeholders"):
+                    engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                        final_token_ids=final_prompt_token_ids,
+                        mm_placeholders=mm_placeholders,
+                    )
+
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                # Clamp after prefix replacement since the prompt length may have changed.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
+
+                return res
+
+        ########################################
+        # /v1/chat/completions endpoint
+        ########################################
+
+        # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > ChatCompletionRequest
+        class NeMoRLChatCompletionRequest(
+            NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
+        ):
+            required_prefix_token_ids: Optional[List[int]] = None
+            nemo_gym_task_index: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_TASK_INDEX_KEY,
+            )
+            nemo_gym_rollout_index: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_ROLLOUT_INDEX_KEY,
+            )
+            nemo_gym_attempt_index: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_ATTEMPT_INDEX_KEY,
+                ge=0,
+                strict=True,
+            )
+            nemo_gym_target_weight_version: Optional[int] = Field(
+                default=None,
+                alias=NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+            )
+
+        # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
+        # OnlineRenderer.preprocess_chat, so the prefix-token override
+        # belongs on the renderer subclass.
+        worker_self = self
+
+        class NeMoRLOpenAIServingChatMixin:
+            async def chat_completion_full_generator(
+                self,
+                request,
+                result_generator,
+                *args,
+                **kwargs,
+            ):
+                return_as_token_id = (
+                    request.return_tokens_as_token_ids
+                    if request.return_tokens_as_token_ids is not None
+                    else self.return_tokens_as_token_ids
+                )
+                if (
+                    request.logprobs
+                    and return_as_token_id
+                    and request.top_logprobs is None
+                ):
+                    raise VLLMValidationError(
+                        "`top_logprobs` must be set when requesting token "
+                        "information from the NeMo-RL chat endpoint.",
+                        parameter="top_logprobs",
+                    )
+
+                final_res = None
+
+                async def capture_result_generator():
+                    nonlocal final_res
+                    async for res in result_generator:
+                        final_res = res
+                        yield res
+
+                response = await super().chat_completion_full_generator(
+                    request,
+                    capture_result_generator(),
+                    *args,
+                    **kwargs,
+                )
+                if (
+                    not isinstance(response, ChatCompletionResponse)
+                    or final_res is None
+                ):
+                    return response
+
+                if request.logprobs and return_as_token_id:
+                    response = attach_token_information_to_chat_response_choices(
+                        response,
+                        final_res,
+                    )
+
+                if worker_self._return_routed_experts_enabled():
+                    routed_experts_ref_factory = None
+                    routed_experts_dtype = worker_self.routed_experts_dtype
+                    if worker_self._routed_experts_ref_enabled():
+                        request_id = getattr(final_res, "request_id", None)
+                        task_index = request.nemo_gym_task_index
+                        rollout_index = request.nemo_gym_rollout_index
+                        attempt_index = request.nemo_gym_attempt_index
+                        target_weight_version = request.nemo_gym_target_weight_version
+                        # Gym can use the policy engine for auxiliary model calls
+                        # (for example, simulator or retrieval requests). Those
+                        # responses are not trainable and carry no rollout identity.
+                        if (
+                            task_index is None
+                            and rollout_index is None
+                            and attempt_index is None
+                            and target_weight_version is None
+                        ):
+                            return response
+                        missing_fields = [
+                            name
+                            for name, value in (
+                                ("request_id", request_id),
+                                (NEMO_GYM_TASK_INDEX_KEY, task_index),
+                                (NEMO_GYM_ROLLOUT_INDEX_KEY, rollout_index),
+                                (NEMO_GYM_ATTEMPT_INDEX_KEY, attempt_index),
+                                (
+                                    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+                                    target_weight_version,
+                                ),
+                            )
+                            if value is None
+                        ]
+                        if missing_fields:
+                            raise RuntimeError(
+                                "Ray-reference router replay requires request "
+                                "identity metadata; missing "
+                                f"{missing_fields}."
+                            )
+                        writer = worker_self._get_routed_experts_store_writer()
+
+                        def routed_experts_ref_factory(
+                            routed_experts: torch.Tensor,
+                        ) -> dict[str, Any]:
+                            return writer.put(
+                                routed_experts,
+                                request_id=str(request_id),
+                                task_index=int(task_index),
+                                rollout_index=int(rollout_index),
+                                attempt_index=int(attempt_index),
+                                target_weight_version=int(target_weight_version),
+                            )
+
+                        # Fixed-width signed storage keeps -1 available as the
+                        # missing-route sentinel and avoids a driver-side scan.
+                        routed_experts_dtype = torch.int16
+                    response = attach_routed_experts_to_chat_response_choices(
+                        response,
+                        final_res,
+                        device=torch.device("cpu"),
+                        logger=LOGGER,
+                        routed_experts_dtype=routed_experts_dtype,
+                        routed_experts_ref_factory=routed_experts_ref_factory,
+                    )
+
+                return response
+
+        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+            pass
+
+        class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
+            pass
+
+        serving_chat_default_kwargs = dict(
+            response_role="assistant",
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+            enable_auto_tools=True,
+        )
+        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
+            "http_server_serving_chat_kwargs", dict()
+        )
+        # The embedded server is constructed directly instead of through
+        # vLLM's CLI, where chat-template file paths are normally loaded.
+        # OnlineRenderer expects literal Jinja content; passing a path makes
+        # Transformers render the path itself and drops multimodal
+        # placeholders such as <image>.
+        configured_chat_template = serving_chat_kwargs.get("chat_template")
+        if configured_chat_template is not None:
+            serving_chat_kwargs["chat_template"] = load_chat_template(
+                configured_chat_template
+            )
+        # Recipes may name the parameter either way: ``default_chat_template_kwargs``
+        # is vLLM's own spelling, ``chat_template_kwargs`` is accepted for recipes
+        # written against the older name. Normalize onto the native key rather
+        # than popping it: OnlineRenderer, OpenAIServingChat and ServingTokenization
+        # each keep their *own* copy and read it independently -- the chat serving
+        # builds its reasoning parser from it, and the tokenize path passes its own
+        # into preprocess_chat -- so the renderer's copy does not reach either.
+        # vLLM's api_server hands the same value to all three for that reason.
+        #
+        # Popped separately, not `A or B`: short-circuiting on a truthy A would
+        # leave B in the bag and OpenAIServingChat(**kwargs) would reject it.
+        _legacy_chat_template_kwargs = serving_chat_kwargs.pop(
+            "chat_template_kwargs", None
+        )
+        if serving_chat_kwargs.get("default_chat_template_kwargs") is None:
+            serving_chat_kwargs["default_chat_template_kwargs"] = (
+                _legacy_chat_template_kwargs
+            )
+        default_chat_template_kwargs: dict[str, Any] = (
+            serving_chat_kwargs["default_chat_template_kwargs"] or {}
+        )
+        online_renderer = NeMoRLOnlineRenderer(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+            enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
+            # Keep the renderer's parser consistent with any parser overrides
+            # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
+            tool_parser=serving_chat_kwargs.get("tool_parser"),
+            reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+            # vLLM merges these into every render, with request-supplied keys
+            # winning (preprocess_chat's default_template_kwargs). The renderer
+            # is shared by /v1/chat/completions and /tokenize, so setting it
+            # here keeps the two endpoints rendering identical prompts.
+            default_chat_template_kwargs=default_chat_template_kwargs,
+        )
+        serving_chat_kwargs.update(
+            dict(
+                engine_client=engine_client,
+                models=openai_serving_models,
+                online_renderer=online_renderer,
+                return_tokens_as_token_ids=True,
+            )
+        )
+        openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
+
+        generation_config = self.cfg
+
+        # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(
+            request: NeMoRLChatCompletionRequest, raw_request: Request
+        ):
+            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
+            # Right now we explicitly assert set this to -1.
+            assert request.top_k in (None, -1), (
+                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+            )
+            request.top_k = -1
+
+            # The request sampling params need to exactly match those as are set in NeMo RL.
+            # If they do not match, the inference will be off policy and destroy training
+            # stability. Validation rollouts are the one exception: they are stamped with
+            # the validation sampling profile (generation.val_temperature / val_top_p),
+            # which is metric-only and safe to serve — grpo.validate() is the only
+            # caller that constructs a non-train GenerationSamplingParams. Multi-turn
+            # agents issue their own requests, so this server-side check is the one
+            # chokepoint they all pass.
+            # vLLM resolves an unset top_p from the model's generation_config.json
+            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
+            # request omitting it would sample off-policy while passing this check.
+            assert request.top_p is not None, (
+                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+                "resolved by vLLM from the model's generation_config.json and would "
+                "bypass the on-policy sampling check."
+            )
+            request_top_p = request.top_p
+            is_train_sampling = (
+                request.temperature == generation_config["temperature"]
+                and request_top_p == generation_config["top_p"]
+            )
+            is_val_sampling = (
+                request.temperature == generation_config["val_temperature"]
+                and request_top_p == generation_config["val_top_p"]
+            )
+            assert is_train_sampling or is_val_sampling, (
+                f"request sampling (temperature={request.temperature}, "
+                f"top_p={request.top_p}) matches neither the train sampling params "
+                f"(temperature={generation_config['temperature']}, "
+                f"top_p={generation_config['top_p']}) nor the validation sampling "
+                f"params (val_temperature={generation_config['val_temperature']}, "
+                f"val_top_p={generation_config['val_top_p']})"
+            )
+
+            try:
+                generator = await openai_serving_chat.create_chat_completion(
+                    request, raw_request
+                )
+            except (VLLMValidationError, ValueError) as e:
+                # vLLM raises VLLMValidationError for prompts exceeding
+                # max_model_len during tokenization, instead of returning an
+                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
+                # detect context-length overflow and handle it gracefully.
+                #
+                # The renderer and _clamp_max_tokens raise a plain ValueError
+                # for the same condition. Without this, it escapes as a 500 and
+                # the Gym vllm_model proxy's handler never fires: it keys on
+                # `e.status == 400 and "context length" in body`, turning the
+                # overflow into an empty completion with finish_reason="length"
+                # (responses_api_models/vllm_model/app.py). A 500 instead burns
+                # the retry budget and then fails the rollout.
+                # Any other ValueError is a real error: let it 500.
+                if not isinstance(e, VLLMValidationError) and not (
+                    is_context_length_error(e)
+                ):
+                    raise
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.error.code
+                )
+
+            elif isinstance(generator, ChatCompletionResponse):
+                return JSONResponse(
+                    content=model_dump_chat_response_with_dynamic_message_fields(
+                        generator
+                    )
+                )
+
+            return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        ########################################
+        # /tokenize endpoint
+        ########################################
+
+        # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
+        class NeMoRLTokenizeChatRequest(
+            NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
+        ):
+            required_prefix_token_ids: Optional[List[int]] = None
+
+        NeMoRLTokenizeRequest = Union[
+            TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
+        ]
+
+        # Tokenize path delegates to OnlineRenderer.preprocess_chat,
+        # where the prefix-token override lives.
+        class NeMoRLServingTokenization(ServingTokenization):
+            pass
+
+        serving_tokenization_kwargs = dict(
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+            models=serving_chat_kwargs["models"],
+            online_renderer=online_renderer,
+            # ServingTokenization reads its own copy in preprocess_chat rather
+            # than the renderer's, so /tokenize would otherwise render with {}
+            # and diverge from /v1/chat/completions under multi-turn.
+            default_chat_template_kwargs=default_chat_template_kwargs,
+        )
+        openai_serving_tokenization = NeMoRLServingTokenization(
+            **serving_tokenization_kwargs
+        )
+
+        @app.post("/tokenize")
+        async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            generator = await openai_serving_tokenization.create_tokenize(
+                request, raw_request
+            )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.error.code
+                )
+            elif isinstance(generator, TokenizeResponse):
+                return JSONResponse(content=generator.model_dump())
+
+        ########################################
+        # Logging
+        ########################################
+        print(
+            "Adding a vLLM logging filter so that the logs aren't spammed with not useful messages like `Added request ...`. This is to help errors pop up better and filter out noise."
+        )
+
+        class CleanLoggingFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage()
+
+                # vLLM does not accept `strict` tool definitions and reporting it to the user is not useful either.
+                return (
+                    "Added request" not in msg
+                    and "The following fields were present in the request but ignored: {'strict'}"
+                    not in msg
+                )
+
+        vllm_async_llm_logger.addFilter(CleanLoggingFilter())
+
+        from logging import getLogger as _getLogger
+
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(
+            CleanLoggingFilter()
+        )
+
+        # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
+        # This is expected during multi-turn rollouts; we log a clean one-line
+        # warning from _preprocess_chat instead.
+        class MaxContextLengthFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                if record.exc_info and record.exc_info[1]:
+                    if "maximum context length" in str(record.exc_info[1]):
+                        return False
+                return True
+
+        _getLogger("vllm.entrypoints.openai.chat_completion.serving").addFilter(
+            MaxContextLengthFilter()
+        )
+
+        return app
+
+    def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        import threading
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord, getLogger
+
+        import uvicorn
+        from fastapi import FastAPI
+
+        # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
+        # e.g. last-run middleware.
+        app = FastAPI()
+
+        app = self._setup_vllm_openai_api_server(app)
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.setup_api_server(app)
+
+        ########################################
+        # Server spinup
+        ########################################
+
+        if self._reserved_socket is not None:
+            # Use the socket reserved during __init__ (deferred model load path).
+            # Pass it directly to uvicorn via sockets= — zero gap, the socket is
+            # never closed and re-opened, so no other process can steal the port.
+            node_ip = self._reserved_node_ip
+            free_port = self._reserved_port
+            reserved_sock = self._reserved_socket
+            self._reserved_socket = None  # Transfer ownership to uvicorn
+        else:
+            node_ip = _get_node_ip_local()
+            port_range_low = self.cfg.get(
+                "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+            )
+            port_range_high = self.cfg.get(
+                "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+            )
+            free_port = _get_free_port_local(port_range_low, port_range_high)
+            reserved_sock = None
+
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        print(f"Starting server on {base_url}")
+
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=free_port,
+            timeout_keep_alive=120,  # Keep connections alive longer (default is 5s), fix for this error: Hit an exception while making a request (try 1): <class 'aiohttp.client_exceptions.ClientOSError'>: [Errno 104] Connection reset by peer
+        )
+        server = uvicorn.Server(config=config)
+
+        print(
+            "Adding a uvicorn logging filter so that the logs aren't spammed with 200 OK messages. This is to help errors pop up better and filter out noise."
+        )
+
+        class No200Filter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage()
+                return not msg.strip().endswith("200")
+
+        uvicorn_logger = getLogger("uvicorn.access")
+        uvicorn_logger.addFilter(No200Filter())
+
+        if reserved_sock is not None:
+            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            # server via server.serve(sockets=). No close-and-rebind needed.
+            import asyncio
+
+            def _run_with_socket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        return thread, base_url, server
+
+    async def _collective_rpc(self, method: str, *, args: tuple[Any, ...]) -> Any:
+        if node_engine_dp_size(self.cfg) == 8:
+            return await _collective_rpc_all_node_engines(
+                self.llm, method, args=args, expected_engines=8
+            )
+        return await self.llm.collective_rpc(method, args=args)
+
+    async def init_collective_async(
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
+    ) -> None:
+        await self._collective_rpc(
+            "init_collective",
+            args=(
+                rank_prefix,
+                ip,
+                port,
+                world_size,
+                train_world_size,
+            ),
+        )
+
+    async def generate_async(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
+
+        Args:
+            data: BatchedDataDict with input_ids and input_lengths
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_async can only be used when async_engine is enabled in vLLM config."
+            )
+
+        # Handle empty input case
+        if len(data["input_ids"]) == 0:
+            return
+
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+
+        input_ids_batch = data["input_ids"]
+        input_lengths_batch = data["input_lengths"]
+        batch_size = input_ids_batch.shape[0]
+
+        # Ensure generate_async only receives single samples (batch_size = 1)
+        assert batch_size == 1, (
+            f"generate_async is restricted to handle only single samples, "
+            f"but received batch_size={batch_size}. Please handle batching outside this method."
+        )
+
+        batch_specific_stop_strings_list = data.get(
+            "stop_strings", [[] for _ in range(batch_size)]
+        )
+
+        # Create tasks for each sample in the batch
+        async def process_single_sample(sample_idx):
+            """Process a single sample and return the result."""
+            current_input_actual_length = input_lengths_batch[sample_idx].item()
+            prompt = format_prompt_for_vllm_generation(data, sample_idx)
+
+            per_sample_stop_strings = None
+            if batch_specific_stop_strings_list and sample_idx < len(
+                batch_specific_stop_strings_list
+            ):
+                per_sample_stop_strings = batch_specific_stop_strings_list[sample_idx]
+
+            final_stop_strings_for_sample = self._merge_stop_strings(
+                [per_sample_stop_strings] if per_sample_stop_strings else None
+            )
+
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            remaining_ctx = max_model_len - current_input_actual_length
+            allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+
+            spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+            spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
+            if allowed_new_tokens > 0 and spec_lookahead > 0:
+                allowed_new_tokens = self._request_max_new_tokens(
+                    configured_max_new_tokens=allowed_new_tokens,
+                    input_length=current_input_actual_length,
+                    max_model_len=max_model_len,
+                    cap_to_context=False,
+                    spec_lookahead=spec_lookahead,
+                )
+
+            # Handle case where no tokens can be generated due to length constraints
+            if allowed_new_tokens == 0:
+                # Access the input data directly from the function parameters
+                input_ids_single_row = input_ids_batch[sample_idx]
+
+                # Create output tensors with just the input (no generated tokens)
+                output_ids_single_item_batched = input_ids_single_row[
+                    :current_input_actual_length
+                ].unsqueeze(0)
+
+                logprobs_single_item = torch.zeros(
+                    (1, current_input_actual_length),
+                    dtype=torch.float32,
+                    device=input_ids_single_row.device,
+                )
+
+                generation_lengths_tensor = torch.tensor(
+                    [0], dtype=torch.long, device=input_ids_single_row.device
+                )
+
+                unpadded_sequence_lengths_tensor = torch.tensor(
+                    [current_input_actual_length],
+                    dtype=torch.long,
+                    device=input_ids_single_row.device,
+                )
+
+                # Not truncated since no generation was attempted (length constraint)
+                truncated_tensor = torch.tensor(
+                    [False], dtype=torch.bool, device=input_ids_single_row.device
+                )
+
+                result_batch = BatchedDataDict[GenerationOutputSpec](
+                    {
+                        "output_ids": output_ids_single_item_batched,
+                        "logprobs": logprobs_single_item,
+                        "generation_lengths": generation_lengths_tensor,
+                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                        "truncated": truncated_tensor,
+                    }
+                )
+
+                return (sample_idx, result_batch)
+
+            sampling_params_for_request = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=final_stop_strings_for_sample,
+                max_new_tokens=allowed_new_tokens,
+            )
+
+            request_id = str(uuid.uuid4())
+
+            # Generate using vLLM async engine
+            vllm_request_generator = self.llm.generate(
+                prompt=prompt,
+                sampling_params=sampling_params_for_request,
+                request_id=request_id,
+            )
+
+            # Get the final result from the generator
+            final_request_output = None
+            async for req_output in vllm_request_generator:
+                final_request_output = req_output
+
+            if final_request_output is None:
+                raise RuntimeError(f"No output received for request {request_id}")
+
+            # Process the output
+            if node_engine_dp_size(self.cfg) == 8:
+                actual_prompt = final_request_output.prompt_token_ids
+                expected_prompt = prompt["prompt_token_ids"]
+                if actual_prompt is None or list(actual_prompt) != list(expected_prompt):
+                    raise RuntimeError("vLLM returned a different prompt token sequence than NeMo RL submitted")
+            generation_details = final_request_output.outputs[0]
+            generated_token_ids = list(generation_details.token_ids)
+            if self._shared_response_allowed_token_ids is not None:
+                excluded = self.cfg["_shared_response_excluded_token_ids"]
+                common_vocab = self.cfg["_shared_response_vocab_size"]
+                if any(token in excluded or not 0 <= token < common_vocab for token in generated_token_ids):
+                    raise RuntimeError("vLLM generated a token outside shared response support")
+            num_generated_tokens = len(generated_token_ids)
+            return_routed_experts = self._return_routed_experts_enabled()
+
+            original_input_ids_single_row = input_ids_batch[sample_idx]
+            final_output_tensor_len = current_input_actual_length + num_generated_tokens
+
+            # Create output_ids tensor for this single item
+            output_ids_single_item = torch.full(
+                (final_output_tensor_len,),
+                self.cfg["_pad_token_id"],
+                dtype=original_input_ids_single_row.dtype,
+                device=original_input_ids_single_row.device,
+            )
+            # Copy original input (up to its actual length)
+            output_ids_single_item[:current_input_actual_length] = (
+                original_input_ids_single_row[:current_input_actual_length]
+            )
+            # Add generated tokens after the actual input
+            output_ids_single_item[
+                current_input_actual_length : current_input_actual_length
+                + num_generated_tokens
+            ] = torch.tensor(
+                generated_token_ids,
+                dtype=original_input_ids_single_row.dtype,
+                device=original_input_ids_single_row.device,
+            )
+
+            # Reshape to (1, seq_len) for BatchedDataDict
+            output_ids_single_item_batched = output_ids_single_item.unsqueeze(0)
+
+            # Create logprobs tensor for this single item
+            logprobs_single_item = torch.zeros(
+                (1, final_output_tensor_len),
+                dtype=torch.float32,
+                device=original_input_ids_single_row.device,
+            )
+            if node_engine_dp_size(self.cfg) == 8:
+                sampled_scores = sampled_token_logprobs(
+                    generated_token_ids, generation_details.logprobs
+                )
+                logprobs_single_item[0, current_input_actual_length:] = torch.tensor(
+                    sampled_scores, dtype=torch.float32, device=original_input_ids_single_row.device
+                )
+            elif hasattr(generation_details, "logprobs") and generation_details.logprobs:
+                for idx, logprob_dict_per_token in enumerate(
+                    generation_details.logprobs
+                ):
+                    if logprob_dict_per_token and idx < len(generated_token_ids):
+                        token_id_at_idx = generated_token_ids[idx]
+                        if token_id_at_idx in logprob_dict_per_token:
+                            logprob_value = logprob_dict_per_token[
+                                token_id_at_idx
+                            ].logprob
+                            position_in_output_tensor = (
+                                current_input_actual_length + idx
+                            )
+                            if position_in_output_tensor < final_output_tensor_len:
+                                logprobs_single_item[0, position_in_output_tensor] = (
+                                    logprob_value
+                                )
+
+            # Generation lengths
+            generation_lengths_tensor = torch.tensor(
+                [num_generated_tokens],
+                dtype=torch.long,
+                device=original_input_ids_single_row.device,
+            )
+
+            # Unpadded sequence lengths (actual_input + actual_generated)
+            unpadded_total_length = current_input_actual_length + num_generated_tokens
+            unpadded_sequence_lengths_tensor = torch.tensor(
+                [unpadded_total_length],
+                dtype=torch.long,
+                device=original_input_ids_single_row.device,
+            )
+
+            # Check if response was truncated (hit max_tokens length limit)
+            is_truncated = generation_details.finish_reason == "length"
+            truncated_tensor = torch.tensor(
+                [is_truncated],
+                dtype=torch.bool,
+                device=original_input_ids_single_row.device,
+            )
+
+            result_dict = {
+                "output_ids": output_ids_single_item_batched,
+                "logprobs": logprobs_single_item,
+                "generation_lengths": generation_lengths_tensor,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                "truncated": truncated_tensor,
+            }
+            routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                final_request_output,
+                generation_details,
+                valid_length=unpadded_total_length,
+                padded_length=final_output_tensor_len,
+                device=original_input_ids_single_row.device,
+                require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
+                routed_experts_dtype=self.routed_experts_dtype,
+            )
+            if return_routed_experts and routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if return_routed_experts:
+                if r3_stats["missing_routes"] > 0:
+                    LOGGER.warning(
+                        "R3 router replay fallback: vLLM returned incomplete "
+                        "routed_experts for sample_idx=%d, missing_token_routes=%d, "
+                        "actual_routes=%d, expected_routes=%d. Megatron will use its "
+                        "own router for those missing token routes.",
+                        sample_idx,
+                        r3_stats["missing_routes"],
+                        r3_stats["actual_routes"],
+                        r3_stats["expected_routes"],
+                    )
+                result_dict["r3_routed_experts_missing_routes"] = torch.tensor(
+                    [r3_stats["missing_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_expected_routes"] = torch.tensor(
+                    [r3_stats["expected_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_actual_routes"] = torch.tensor(
+                    [r3_stats["actual_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+            if routed_experts is not None:
+                result_dict["routed_experts"] = routed_experts.unsqueeze(0)
+
+            result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
+
+            return (sample_idx, result_batch)
+
+        # Create tasks for all samples and yield results as they complete
+        sample_tasks = [
+            asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
+        ]
+
+        # Yield results as they become available
+        try:
+            for completed_task in asyncio.as_completed(sample_tasks):
+                result = await completed_task
+                yield result
+        finally:
+            for task in sample_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*sample_tasks, return_exceptions=True)
+
+    async def generate_text_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate text responses asynchronously, yielding results as they are ready.
+
+        Args:
+            data: BatchedDataDict containing prompts with text strings
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing single text response)
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text_async can only be used when async_engine is enabled in vLLM config."
+            )
+
+        # Handle empty input case
+        if len(data["prompts"]) == 0:
+            return
+
+        prompts = data["prompts"]
+        batch_size = len(prompts)
+
+        # Extract stop_strings if provided, else use default from config
+        batch_stop_strings: list[list[str] | None] = data.get(
+            "stop_strings", [self.cfg.get("stop_strings")] * batch_size
+        )
+
+        # Create tasks for each prompt
+        async def process_single_prompt(prompt_idx):
+            """Process a single prompt and return the result."""
+            prompt = prompts[prompt_idx]
+
+            # Get stop strings for this specific prompt
+            per_prompt_stop_strings = None
+            if batch_stop_strings and prompt_idx < len(batch_stop_strings):
+                per_prompt_stop_strings = batch_stop_strings[prompt_idx]
+
+            # Merge stop strings
+            final_stop_strings = self._merge_stop_strings(
+                [per_prompt_stop_strings] if per_prompt_stop_strings else None
+            )
+
+            # Create sampling parameters
+            top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
+            sampling_params = self.SamplingParams(
+                temperature=self.cfg["temperature"] if not greedy else 0,
+                top_p=self.cfg["top_p"],
+                top_k=top_k if not greedy else 1,
+                max_tokens=self.cfg["max_new_tokens"],
+                stop_token_ids=self.cfg["stop_token_ids"],
+                stop=final_stop_strings,
+                include_stop_str_in_output=True,  # returning stop strings like hf
+            )
+
+            request_id = str(uuid.uuid4())
+
+            # Generate using vLLM async engine
+            vllm_request_generator = self.llm.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+            )
+
+            # Get the final result from the generator
+            final_request_output = None
+            async for req_output in vllm_request_generator:
+                final_request_output = req_output
+
+            if final_request_output is None:
+                raise RuntimeError(f"No output received for request {request_id}")
+
+            # Extract the generated text
+            generated_text = final_request_output.outputs[0].text
+
+            # Create result in BatchedDataDict format
+            result_batch = BatchedDataDict[GenerationOutputSpec](
+                {"texts": [generated_text]}
+            )
+
+            return (prompt_idx, result_batch)
+
+        # Create tasks for all prompts and yield results as they complete
+        prompt_tasks = [
+            asyncio.create_task(process_single_prompt(i)) for i in range(batch_size)
+        ]
+
+        # Yield results as they become available
+        try:
+            for completed_task in asyncio.as_completed(prompt_tasks):
+                result = await completed_task
+                yield result
+        finally:
+            for task in prompt_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
+
+    async def report_device_id_async(self) -> list[str]:
+        """Async version of report_device_id."""
+        assert self.llm is not None, (
+            "Attempting to report device id with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "report_device_id_async can only be used with async_engine=True. Use report_device_id instead."
+            )
+
+        result_or_coro = await self._collective_rpc("report_device_id", args=tuple())
+
+        if asyncio.iscoroutine(result_or_coro):
+            list_of_worker_results = await result_or_coro
+        else:
+            list_of_worker_results = result_or_coro
+
+        return cast(list[str], list_of_worker_results)
+
+    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+        """Async version of prepare_refit_info."""
+        await self._collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
+    async def _reset_encoder_cache_after_weight_update(self) -> None:
+        """Invalidate weight-dependent multimodal encoder outputs when enabled."""
+        if not self.cfg["vllm_cfg"].get(
+            "reset_encoder_cache_after_weight_update", False
+        ):
+            return
+        assert self.llm is not None
+        await self.llm.reset_encoder_cache()
+
+    async def update_weights_via_ipc_zmq_async(
+        self,
+    ) -> bool:
+        """Async version of update_weights_via_ipc_zmq."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_via_ipc_zmq_async can only be used with async_engine=True. Use update_weights_via_ipc_zmq instead."
+                )
+
+            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
+            result_or_coro = await self._collective_rpc(
+                "update_weights_via_ipc_zmq", args=tuple()
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_results = cast(list[bool], worker_results)
+
+            if not worker_results or not all(worker_results):
+                print(
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                )
+                return False
+            await self._reset_encoder_cache_after_weight_update()
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def _collective_refit_scheduler_client(self):
+        if node_engine_dp_size(self.cfg) != 8 or not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError("Collective scheduler pause requires the pinned async DP8 profile")
+        client = getattr(self.llm, "engine_core", None)
+        if type(client).__name__ != "DPLBAsyncMPClient":
+            raise RuntimeError("Collective scheduler pause requires DPLBAsyncMPClient")
+        if len(tuple(getattr(client, "core_engines", ()))) != 8:
+            raise RuntimeError("Collective scheduler pause requires all eight EngineCores")
+        for method in ("pause_scheduler_async", "resume_scheduler_async"):
+            if not callable(getattr(client, method, None)):
+                raise RuntimeError(f"Pinned DP scheduler is missing {method}")
+        return client
+
+    async def pause_for_collective_refit_async(self) -> bool:
+        """Use vLLM's two-phase DP pause without aborting requests or caches."""
+        if getattr(self, "_collective_refit_state", "idle") != "idle":
+            raise RuntimeError("Collective refit scheduler is not idle")
+        client = self._collective_refit_scheduler_client()
+        self._collective_refit_state = "pausing"
+        try:
+            # Native DP pause returns only after all local EngineCores have
+            # reached the DP consensus. Keep live requests and their KV state.
+            await client.pause_scheduler_async(mode="keep", clear_cache=False)
+        except BaseException:
+            self._collective_refit_state = "failed"
+            raise
+        self._collective_refit_state = "paused"
+        return True
+
+    async def resume_after_collective_refit_async(self) -> bool:
+        """Use the native DP resume rendezvous after successful weight transfer.
+
+        While the DP schedulers are still paused (mode="keep" retained live requests
+        and their KV state) preempt every running request and drop the prefix cache,
+        so nothing decodes on KV built under the previous weights and no queued
+        request hits the stale prefix cache once the scheduler resumes. Gated on
+        vllm_cfg.reset_running_requests_on_cache_invalidation; the scheduler's
+        reset_prefix_cache(reset_running_requests=True) is a UTILITY call that the
+        EngineCore services while paused (running requests move to waiting).
+        """
+        if getattr(self, "_collective_refit_state", "idle") != "paused":
+            raise RuntimeError("Collective refit scheduler was not paused")
+        client = self._collective_refit_scheduler_client()
+        self._collective_refit_state = "resuming"
+        try:
+            await self._reset_kv_cache_before_collective_resume_async()
+            await client.resume_scheduler_async()
+        except BaseException:
+            self._collective_refit_state = "failed"
+            raise
+        self._collective_refit_state = "idle"
+        return True
+
+    async def _reset_kv_cache_before_collective_resume_async(self) -> bool | None:
+        """Preempt+reset under the paused DP schedulers; log one [REFIT_KV_RESET] line.
+
+        A reset exception propagates (the collective refit is all-or-nothing and a
+        half-reset DP group would silently train on stale KV); a False result is
+        logged and the resume still proceeds.
+        """
+        if not self._reset_running_requests_on_cache_invalidation():
+            print(
+                "[REFIT_KV_RESET] status=skipped "
+                "reason=vllm_cfg.reset_running_requests_on_cache_invalidation=false",
+                flush=True,
+            )
+            return None
+        start = time.monotonic()
+        try:
+            reset_ok, per_engine, path = await self._reset_prefix_cache_all_engines_async(
+                reset_running_requests=True
+            )
+        except Exception as e:
+            print(
+                f"[REFIT_KV_RESET] status=error reset_running_requests=True "
+                f"elapsed_s={time.monotonic() - start:.3f} "
+                f"error={type(e).__name__}: {e}",
+                flush=True,
+            )
+            raise
+        if reset_ok is None:
+            status = "unknown"
+        else:
+            status = "ok" if reset_ok else "failed"
+        caveat = ""
+        if path == "llm_engine0_only":
+            caveat = (
+                " caveat=DPLBAsyncMPClient.call_utility_async_returns_only_engine0_result"
+            )
+        print(
+            f"[REFIT_KV_RESET] status={status} reset_running_requests=True path={path} "
+            f"engines={len(per_engine) if per_engine is not None else 'n/a'} "
+            f"per_engine={per_engine} elapsed_s={time.monotonic() - start:.3f}{caveat}",
+            flush=True,
+        )
+        return reset_ok
+
+    def _reset_running_requests_on_cache_invalidation(self) -> bool:
+        return bool(
+            self.cfg["vllm_cfg"].get("reset_running_requests_on_cache_invalidation", False)
+        )
+
+    async def _reset_prefix_cache_all_engines_async(
+        self, *, reset_running_requests: bool
+    ) -> tuple[bool | None, list[Any] | None, str]:
+        """Reset the vLLM prefix cache and report ``(ok, per_engine, path)``.
+
+        vLLM's DPLBAsyncMPClient.call_utility_async gathers every engine but returns
+        only engine 0's result, so when the client exposes its per-engine utility
+        (``core_engines`` + ``_call_utility_async``) each engine is reset directly
+        and ``ok`` is the AND over all of them (``path="per_engine"``). Otherwise the
+        AsyncLLM entry point is used (``path="llm"``, or ``"llm_engine0_only"`` when
+        a multi-engine client hides the per-engine call), keeping the TypeError
+        fallback for vLLM builds without ``reset_running_requests``.
+        """
+        client = getattr(self.llm, "engine_core", None)
+        core_engines = tuple(getattr(client, "core_engines", None) or ())
+        per_engine_utility = getattr(client, "_call_utility_async", None)
+        if len(core_engines) > 1 and callable(per_engine_utility):
+            # Positional, like AsyncMPClient.reset_prefix_cache_async does; a plain
+            # reset passes no args so it also works on engines without the parameter.
+            args = (True,) if reset_running_requests else ()
+            per_engine = list(
+                await asyncio.gather(
+                    *[
+                        per_engine_utility("reset_prefix_cache", *args, engine=engine)
+                        for engine in core_engines
+                    ]
+                )
+            )
+            if any(result is None for result in per_engine):
+                return None, per_engine, "per_engine"
+            return all(bool(result) for result in per_engine), per_engine, "per_engine"
+
+        path = "llm_engine0_only" if len(core_engines) > 1 else "llm"
+        if reset_running_requests:
+            try:
+                reset_ok = await self.llm.reset_prefix_cache(reset_running_requests=True)
+            except TypeError:
+                print(
+                    "⚠️ This vLLM build has no reset_running_requests argument; falling back to a plain prefix-cache reset",
+                    flush=True,
+                )
+                reset_ok = await self.llm.reset_prefix_cache()
+        else:
+            reset_ok = await self.llm.reset_prefix_cache()
+        return reset_ok, None, path
+
+    async def update_weights_from_collective_async(self) -> bool:
+        """Async version of update_weights_from_collective."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
+                )
+
+            if node_engine_dp_size(self.cfg) == 8:
+                result_or_coro = await _collective_rpc_all_node_engines(
+                    self.llm, "update_weights_from_collective", args=tuple(),
+                    expected_engines=8,
+                )
+            else:
+                result_or_coro = await self._collective_rpc(
+                    "update_weights_from_collective", args=tuple()
+                )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_results = cast(list[bool], worker_results)
+
+            if not worker_results or not all(worker_results):
+                print(
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                )
+                return False
+            await self._reset_encoder_cache_after_weight_update()
+            if node_engine_dp_size(self.cfg) == 8:
+                LOGGER.info("[VLLM_NODE_REFIT_ACK] internal_ranks=%d all_success=true", len(worker_results))
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    async def init_nccl_reshard_comm_group_async(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Async version of init_nccl_reshard_comm_group."""
+        await self._collective_rpc(
+            "init_nccl_reshard_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
+        """Async version of prepare_nccl_reshard_refit_info."""
+        await self._collective_rpc(
+            "prepare_nccl_reshard_refit_info", args=(refit_info,)
+        )
+
+    async def nccl_reshard_refit_async(self) -> bool:
+        """Async version of nccl_reshard_refit."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            result_or_coro = await self._collective_rpc(
+                "nccl_reshard_refit", args=tuple()
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_result = worker_results[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
+                )
+                return False
+            await self._reset_encoder_cache_after_weight_update()
+            return True
+        except Exception as e:
+            print(f"Exception during nccl_reshard_refit: {e}", flush=True)
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    async def reset_prefix_cache_async(self, reset_running_requests: bool = False):
+        """Async version of reset_prefix_cache.
+
+        The default is a plain prefix-cache reset that never preempts in-flight
+        rollouts (finish_generation calls it after validation). vLLM V1's
+        BlockPool.reset_prefix_cache() refuses (returns False) while any request
+        still holds KV blocks, so the plain call is a no-op under live generation.
+        With ``reset_running_requests=True`` (VllmGeneration.invalidate_kv_cache under
+        vllm_cfg.reset_running_requests_on_cache_invalidation, and the in-pause reset
+        of resume_after_collective_refit_async) the scheduler preempts every running
+        request into the waiting queue; they re-prefill prompt + generated-so-far
+        under the freshly loaded weights, so no KV/SSM state built with the previous
+        weights survives the refit.
+        """
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
+            )
+
+        reset_running = bool(reset_running_requests)
+        reset_ok, per_engine, path = await self._reset_prefix_cache_all_engines_async(
+            reset_running_requests=reset_running
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        if reset_ok is None:
+            return None
+        if not reset_ok:
+            print(
+                "⚠️ vLLM prefix cache reset reported failure "
+                f"(reset_running_requests={reset_running}, path={path}, per_engine={per_engine})",
+                flush=True,
+            )
+        return bool(reset_ok)
+
+    async def sleep_async(self):
+        """Async version of sleep."""
+        assert self.llm is not None, (
+            "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "sleep_async can only be used with async_engine=True. Use sleep instead."
+            )
+
+        # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
+        await self.llm.reset_prefix_cache()
+        # Reset the multimodal processor cache (sender side) so it stays in
+        # sync with the receiver cache that vLLM clears internally during
+        # sleep.  Without this, the sender thinks images are already cached on
+        # the receiver and sends data=None, causing an assertion error.
+        if hasattr(self.llm, "reset_mm_cache"):
+            await self.llm.reset_mm_cache()
+        await self.llm.sleep(level=1)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    async def wake_up_async(self, **kwargs):
+        """Async version of wake_up."""
+        assert self.llm is not None, (
+            "Attempting to wake up with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "wake_up_async can only be used with async_engine=True. Use wake_up instead."
+            )
+
+        tags = kwargs.get("tags")
+
+        wake_up_args = {}
+        if tags is not None:
+            wake_up_args["tags"] = tags
+
+        await self.llm.wake_up(**wake_up_args)
+
+    async def shutdown(self) -> bool:
+        """Clean up vLLM resources."""
+        try:
+            if self._sparse_refit_receiver is not None:
+                await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
+
+            if self.llm is not None:
+                # Clean up extension resources (e.g., ZMQ sockets)
+                await self._collective_rpc("cleanup", args=tuple())
+                try:
+                    self.llm.shutdown()
+                except Exception as e_stop:
+                    print(f"Error calling shutdown_background_loop: {e_stop}")
+
+                # Explicitly delete the engine. This may trigger its __del__ method.
+                del self.llm
+
+            self.llm = None
+            self.tokenizer = None
+
+            # Force garbage collection
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            if self.server_thread is not None:
+                from threading import Thread
+
+                from uvicorn import Server
+
+                self.http_server: Server
+                self.server_thread: Thread
+
+                self.http_server.should_exit = True
+                self.server_thread.join()
+
+            return True
+        except Exception as e:
+            print(f"Error during vLLM shutdown: {e}")
+            return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
+)  # pragma: no cover
+class VllmAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
+    pass
+
+
+@ray.remote  # pragma: no cover - exercised by the GPU integration run
+class VllmNodeAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
+    """One Ray actor owning one local TP1/DP8/EP8 AsyncLLM."""
+
+    @staticmethod
+    def configure_worker(
+        num_gpus: int | float,
+        bundle_indices: tuple[int, list[int]] | None = None,
+        num_gpus_per_node: int | None = None,
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
+        import vllm
+
+        if vllm.__version__ != "0.27.1":
+            raise RuntimeError(
+                "node-owned rollout requires vLLM 0.27.1; "
+                f"got {vllm.__version__}"
+            )
+        if (
+            num_gpus != 1
+            or bundle_indices is None
+            or bundle_indices[1] != [0]
+            or num_gpus_per_node != 8
+        ):
+            raise RuntimeError("node-owned rollout actor requires one atomic GPU8 bundle")
+        actor_index = bundle_indices[0]
+        return (
+            {"num_gpus": 8},
+            {"NVC_ROLLOUT_NODE_ACTOR_INDEX": str(actor_index)},
+            {"bundle_indices": list(range(8)), "seed": actor_index},
+            {},
+        )

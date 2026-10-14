@@ -1,0 +1,549 @@
+{
+  "checkpointing": {
+    "allocation_deadline_env": "NVC_CHECKPOINT_DEADLINE_EPOCH",
+    "checkpoint_dir": "@RL_ROOT@/experiments/@LINEAGE@/checkpoints",
+    "checkpoint_must_save_by": null,
+    "deadline_step_reserve_seconds": 1800,
+    "enabled": true,
+    "ft_keep_latest_k": 1,
+    "ft_save_period": 5,
+    "hf_export_dir": "@RL_ROOT@/experiments/@LINEAGE@/hf",
+    "hf_export_period": 20,
+    "hf_keep_latest_k": null,
+    "higher_is_better": true,
+    "idle_watchdog_enabled": true,
+    "idle_watchdog_request_seconds": 2400,
+    "idle_watchdog_terminate_seconds": 3000,
+    "keep_top_k": 0,
+    "length_monitor": {
+      "baseline_batches": 3,
+      "cap_hit_stop_fraction": 0.2,
+      "cap_hit_stop_fraction_by_domain": {
+        "tau2": 0.05,
+        "conversational_tool_use_agent": 0.05,
+        "single_step_tool_use_with_argument_comparison_agent": 0.05,
+        "toolcall_schema_single_step_tool_use_with_argument_comparison_agent": 0.05,
+        "workplace_assistant_simple_agent": 0.05,
+        "search_pivot_single_step_tool_use_with_argument_comparison_agent": 0.05
+      },
+      "cap_hit_stop_min_samples": 32,
+      "enabled": true,
+      "min_domain_samples": 8,
+      "stop_after_consecutive": 3
+    },
+    "load_replay_buffer": false,
+    "metric_name": null,
+    "monitor_dir": "@RL_ROOT@/experiments/@LINEAGE@/monitor",
+    "require_single_recovery_checkpoint": true,
+    "save_optimizer": true,
+    "save_period": 10
+  },
+  "cluster": {
+    "gpus_per_node": 8,
+    "master_port_range_high": 1999,
+    "master_port_range_low": 1400,
+    "num_nodes": 10,
+    "segment_size": null
+  },
+  "data": {
+    "default": null,
+    "max_input_seq_length": null,
+    "num_workers": 1,
+    "shuffle": false,
+    "train": [
+      {
+        "data_path": "@BUNDLE@/train.jsonl",
+        "dataset_name": "NemoGymDataset",
+        "env_name": "nemo_gym",
+        "processor": "nemo_gym_data_processor",
+        "prompt_file": null,
+        "system_prompt_file": null
+      }
+    ],
+    "use_multiple_dataloader": false,
+    "validation": [
+      {
+        "data_path": "@BUNDLE@/val.jsonl",
+        "dataset_name": "NemoGymDataset",
+        "env_name": "nemo_gym",
+        "processor": "nemo_gym_data_processor",
+        "prompt_file": null,
+        "system_prompt_file": null
+      }
+    ]
+  },
+  "data_plane": null,
+  "env": {
+    "genrm_agent_names": [],
+    "nemo_gym": {
+      "allow_openai_version_skew": true,
+      "config_paths": [
+        "@SERVICES_YAML@"
+      ],
+      "global_aiohttp_client_request_debug": false,
+      "gym_data_asset_dir": "@GYM_ASSET_DIR@",
+      "invalid_tool_call_patterns": [
+        "<tool_call>",
+        "</tool_call>",
+        "<function_call>",
+        "</function_call>"
+      ],
+      "nemo_gym_log_dir": "${logger.log_dir}/nemo_gym",
+      "num_gpu_nodes": 0,
+      "port_range_high": 5999,
+      "port_range_low": 5000,
+      "skip_venv_if_present": true,
+      "strict_judge_failures": true,
+      "strict_shutdown": true,
+      "thinking_tags": [
+        "<think>",
+        "</think>"
+      ],
+      "uv_venv_dir": "@RL_ROOT@/runtime/gym-v1/venvs-ext",
+      "drop_zero_variance_groups": true
+    },
+    "should_log_nemo_gym_responses": true,
+    "closed_trajectory_dump": {
+      "enabled": true,
+      "every_n_steps": 1,
+      "max_samples": 256
+    },
+    "should_use_nemo_gym": true,
+    "use_genrm_compare": false
+  },
+  "grpo": {
+    "adv_estimator": {
+      "minus_baseline": true,
+      "name": "grpo",
+      "normalize_rewards": true,
+      "proximal_teacher_alpha": 1,
+      "reward_weights": null,
+      "subtract_global_baseline": false,
+      "use_leave_one_out_baseline": true,
+      "std_scope": "group",
+      "std_source": "unshaped_reward"
+    },
+    "advantage_clip_high": 5,
+    "advantage_clip_low": -5,
+    "async_grpo": {
+      "enabled": true,
+      "in_flight_weight_updates": true,
+      "max_generation_failures": 8,
+      "max_trajectory_age_steps": 2,
+      "recompute_kv_cache_after_weight_updates": false
+    },
+    "batch_multiplier": 1,
+    "calculate_advantages_on_gpu": false,
+    "debug_payload_metrics": false,
+    "deduplicate_multimodal_data": false,
+    "dynamic_sampling_max_gen_batches": 10,
+    "invalid_tool_call_advantage": -2,
+    "malformed_thinking_advantage": null,
+    "max_num_epochs": 3,
+    "max_num_steps": 120,
+    "max_rollout_turns": 1,
+    "max_val_samples": 192,
+    "normalize_rewards": true,
+    "num_generations_per_prompt": 8,
+    "num_prompts_per_step": 256,
+    "overlong_filtering": false,
+    "reward_scaling": {
+      "enabled": false,
+      "source_max": 1,
+      "source_min": 0,
+      "target_max": 1,
+      "target_min": 0
+    },
+    "reward_shaping": {
+      "enabled": false,
+      "max_response_length": null,
+      "overlong_buffer_length": null,
+      "overlong_buffer_penalty": null,
+      "stop_properly_penalty_coef": null
+    },
+    "reward_training": {
+      "enabled": false
+    },
+    "seed": 42,
+    "seq_logprob_error_threshold": 2,
+    "skip_reference_policy_logprobs_calculation": true,
+    "stop_at_validation_metric": null,
+    "stop_at_validation_threshold": null,
+    "use_dynamic_sampling": false,
+    "use_leave_one_out_baseline": true,
+    "val_at_end": false,
+    "val_at_start": true,
+    "val_batch_size": 192,
+    "val_num_generations_per_prompt": 4,
+    "val_period": 10,
+    "val_start_at": -1,
+    "zero_variance_prompt_filtering": false
+  },
+  "logger": {
+    "gpu_monitoring": {
+      "collection_interval": 10,
+      "flush_interval": 10
+    },
+    "log_dir": "@RL_ROOT@/runs/UNFROZEN/train",
+    "mlflow": {
+      "experiment_name": "grpo-dev",
+      "run_name": "grpo-dev-logger"
+    },
+    "mlflow_enabled": false,
+    "monitor_gpus": true,
+    "num_val_samples_to_print": 0,
+    "swanlab_enabled": false,
+    "tensorboard": {},
+    "tensorboard_enabled": true,
+    "wandb": {
+      "log_nemo_gym_full_result_tables": false,
+      "name": "@RUN_NAME@",
+      "project": "unified_opd_tests_main_hsg"
+    },
+    "wandb_enabled": false
+  },
+  "loss_fn": {
+    "disable_ppo_ratio": true,
+    "force_on_policy_ratio": true,
+    "kl_input_clamp_value": null,
+    "kl_output_clamp_value": null,
+    "positive_example_nll_weight": 0,
+    "ratio_clip_c": null,
+    "ratio_clip_max": 0.28,
+    "ratio_clip_min": 0.2,
+    "reference_policy_kl_penalty": 0,
+    "reference_policy_kl_type": "k3",
+    "sequence_level_importance_ratios": false,
+    "token_level_loss": true,
+    "truncated_importance_sampling_ratio": 5,
+    "truncated_importance_sampling_ratio_min": null,
+    "truncated_importance_sampling_type": "tis",
+    "use_cispo": false,
+    "use_importance_sampling_correction": true,
+    "use_kl_in_reward": false,
+    "use_on_policy_kl_approximation": true
+  },
+  "on_policy_distillation": {
+    "deduplicate_shared_teacher_checkpoints": true,
+    "default_teacher_alias": "text_opd_teacher_v1",
+    "enabled": false,
+    "non_colocated_teachers": {
+      "default_teacher_cfg": {
+        "context_parallel_size": 2,
+        "empty_unused_memory_level": 1,
+        "expert_model_parallel_size": 8,
+        "gpus_per_node": 8,
+        "micro_batch_size": 1,
+        "moe_router_dtype": "fp32",
+        "moe_shared_expert_overlap": false,
+        "mtp_loss_scaling_factor": 0.0,
+        "mtp_num_layers": 0,
+        "num_nodes": 2,
+        "pipeline_model_parallel_size": 1,
+        "precision": "bf16",
+        "tensor_model_parallel_size": 4
+      },
+      "enabled": false,
+      "teacher_overrides": {}
+    },
+    "strict_agent_name_match": false,
+    "teacher_input_mode": "independent_text",
+    "teacher_model_by_agent_name": {
+      "text_opd_teacher_v1": "/lustre/fsw/portfolios/nemotron/users/cchen1/NemotronVC/checkpoints/teacher/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+    },
+    "teacher_tokenizer_by_alias": {
+      "text_opd_teacher_v1": {
+        "chat_template": "default",
+        "chat_template_kwargs": {
+          "enable_thinking": true,
+          "reasoning_budget": null,
+          "truncate_history_thinking": false
+        },
+        "fix_mistral_regex": true,
+        "name": "/lustre/fsw/portfolios/nemotron/users/cchen1/NemotronVC/checkpoints/teacher/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        "required_rendered_prompt_suffix": "<|im_start|>assistant\n<think>\n",
+        "use_fastokens": false
+      }
+    }
+  },
+  "policy": {
+    "draft": {
+      "aux_layer_indices": null,
+      "enabled": false,
+      "loss_weight": 0.1,
+      "model_name": null,
+      "num_layers": null
+    },
+    "dtensor_cfg": {
+      "_v2": true,
+      "activation_checkpointing": false,
+      "context_parallel_size": 1,
+      "cpu_offload": false,
+      "custom_parallel_plan": null,
+      "enabled": false,
+      "sequence_parallel": false,
+      "tensor_parallel_size": 1
+    },
+    "dynamic_batching": {
+      "enabled": false,
+      "logprob_mb_tokens": 65536,
+      "max_sequences_per_microbatch": 1,
+      "sequence_length_round": 4,
+      "train_mb_tokens": 65536
+    },
+    "generation": {
+      "async_global_ready_queue": {
+        "enabled": true,
+        "max_inflight_per_replica": 256
+      },
+      "backend": "vllm",
+      "colocated": {
+        "enabled": false,
+        "resources": {
+          "gpus_per_node": 8,
+          "num_nodes": 8
+        }
+      },
+      "max_new_tokens": 8192,
+      "mcore_generation_config": {
+        "async_engine": false,
+        "block_size_tokens": 256,
+        "buffer_size_gb": 10,
+        "cuda_graph_impl": "local",
+        "enable_chunked_prefill": true,
+        "enable_prefix_caching": false,
+        "expose_http_server": false,
+        "inference_cuda_graph_scope": "block",
+        "kv_cache_management_mode": "persist",
+        "materialize_only_last_token_logits": true,
+        "max_model_len": 71680,
+        "max_tokens": 16384,
+        "num_cuda_graphs": 4,
+        "num_speculative_tokens": 0,
+        "parsers": [],
+        "refit_backend": "nvshmem",
+        "use_cuda_graphs_for_non_decode_steps": true
+      },
+      "model_name": "@STUDENT_HF@",
+      "node_engine_data_parallel_size": 8,
+      "port_range_high": 4999,
+      "port_range_low": 3000,
+      "real_quant_export_cpu_offload": true,
+      "refit_cfg": {
+        "nixl": {
+          "backend_init_params": null,
+          "backend_name": "UCX",
+          "device": "cuda",
+          "release_after_refit": false,
+          "shard_expert_weights": false,
+          "update_weights_bucket_memory_ratio": 0.05
+        }
+      },
+      "refit_transport": null,
+      "stop_strings": null,
+      "stop_token_ids": null,
+      "temperature": 1.0,
+      "top_k": null,
+      "top_p": 1.0,
+      "val_temperature": 1.0,
+      "val_top_k": null,
+      "val_top_p": 1.0,
+      "vllm_cfg": {
+        "async_engine": true,
+        "enable_prefix_caching": true,
+        "reset_running_requests_on_cache_invalidation": true,
+        "enable_vllm_metrics_logger": true,
+        "enforce_eager": false,
+        "env_vars": {
+          "NRL_REFIT_BUFFER_MEMORY_RATIO": "0.005",
+          "NRL_REFIT_NUM_BUFFERS": "1",
+          "NRL_VLLM_FP32_LM_HEAD": "1"
+        },
+        "expert_parallel_size": 8,
+        "expose_http_server": true,
+        "gpu_memory_utilization": 0.85,
+        "http_refit_api_key_env_var": null,
+        "http_refit_server_port": null,
+        "http_server_serving_chat_kwargs": {
+          "enable_auto_tools": true,
+          "reasoning_parser": "nano_v3",
+          "tool_parser": "qwen3_coder",
+          "chat_template_content_format": "string"
+        },
+        "kv_cache_dtype": "auto",
+        "load_format": "dummy",
+        "logprobs_mode": "processed_logprobs",
+        "max_model_len": 65536,
+        "num_first_layers_in_bf16": 0,
+        "num_last_layers_in_bf16": 0,
+        "pipeline_parallel_size": 1,
+        "precision": "bfloat16",
+        "reasoning_parser_plugin": "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",
+        "skip_tokenizer_init": false,
+        "tensor_parallel_size": 1,
+        "use_deep_gemm": false,
+        "use_tqdm": true,
+        "vllm_metrics_logger_interval": 0.5,
+        "zmq_refit_server_port": null
+      },
+      "vllm_kwargs": {
+        "all2all_backend": "allgather_reducescatter",
+        "enable_chunked_prefill": true,
+        "enable_return_routed_experts": false,
+        "hf_overrides": {},
+        "kernel_config": {
+          "enable_flashinfer_autotune": false,
+          "moe_backend": "triton"
+        },
+        "limit_mm_per_prompt": {
+          "audio": 0
+        },
+        "mamba_backend": "flashinfer",
+        "mamba_cache_mode": "align",
+        "mamba_ssm_cache_dtype": "float32",
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 64,
+        "mm_processor_cache_gb": 0,
+        "skip_mm_profiling": true
+      }
+    },
+    "generation_batch_size": 2048,
+    "is_vlm": true,
+    "logprob_batch_size": 1,
+    "logprob_chunk_size": 2048,
+    "make_sequence_length_divisible_by": 128,
+    "max_grad_norm": 1,
+    "max_total_sequence_length": 65536,
+    "megatron_cfg": {
+      "activation_checkpointing": true,
+      "apply_rope_fusion": true,
+      "bias_activation_fusion": false,
+      "checkpoint": {
+        "async_save": false,
+        "load_rng": false
+      },
+      "context_parallel_size": 2,
+      "defer_fp32_logits": true,
+      "distributed_data_parallel_config": {
+        "average_in_collective": false,
+        "data_parallel_sharding_strategy": "optim_grads_params",
+        "grad_reduce_in_fp32": false,
+        "overlap_grad_reduce": false,
+        "overlap_param_gather": false,
+        "use_custom_fsdp": false
+      },
+      "empty_unused_memory_level": 2,
+      "enabled": true,
+      "env_vars": {
+        "NRL_REFIT_BUFFER_MEMORY_RATIO": "0.005",
+        "NRL_REFIT_NUM_BUFFERS": "1",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "MAMBA_DETERMINISTIC": "1"
+      },
+      "expert_model_parallel_size": 8,
+      "expert_tensor_parallel_size": 1,
+      "freeze_moe_router": true,
+      "freeze_sound_encoder": true,
+      "freeze_sound_projection": true,
+      "freeze_vision_model": true,
+      "freeze_vision_projection": true,
+      "gradient_accumulation_fusion": false,
+      "mamba_training_ssm_states_dtype": "float32",
+      "moe_aux_loss_coeff": 0,
+      "moe_enable_deepep": false,
+      "moe_per_layer_logging": false,
+      "moe_permute_fusion": true,
+      "moe_router_bias_update_rate": 0,
+      "moe_router_dtype": "fp32",
+      "moe_router_enable_expert_bias": true,
+      "moe_router_load_balancing_type": "none",
+      "moe_shared_expert_overlap": false,
+      "moe_token_dispatcher_type": "alltoall",
+      "mtp_detach_heads": true,
+      "mtp_loss_scaling_factor": 0.0,
+      "mtp_num_layers": 0,
+      "mtp_use_repeated_layer": false,
+      "num_layers_in_first_pipeline_stage": null,
+      "num_layers_in_last_pipeline_stage": null,
+      "optimizer": {
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.999,
+        "adam_eps": 1e-08,
+        "bf16": true,
+        "clip_grad": 1,
+        "fp16": false,
+        "lr": 2e-06,
+        "min_lr": 2e-06,
+        "optimizer": "adam",
+        "optimizer_cpu_offload": true,
+        "optimizer_offload_fraction": 0.5,
+        "overlap_cpu_optimizer_d2h_h2d": false,
+        "params_dtype": "float32",
+        "sgd_momentum": 0.9,
+        "use_distributed_optimizer": true,
+        "use_precision_aware_optimizer": true,
+        "weight_decay": 0
+      },
+      "pipeline_dtype": "bfloat16",
+      "pipeline_model_parallel_size": 1,
+      "radio_force_cpe_eval_mode": true,
+      "recompute_granularity": "full",
+      "scheduler": {
+        "end_weight_decay": 0,
+        "lr_decay_iters": 120,
+        "lr_decay_style": "constant",
+        "lr_warmup_init": 2e-07,
+        "lr_warmup_iters": 10,
+        "override_opt_param_scheduler": false,
+        "start_weight_decay": 0,
+        "use_checkpoint_opt_param_scheduler": false,
+        "weight_decay_incr_style": "constant"
+      },
+      "sequence_parallel": true,
+      "tensor_model_parallel_size": 4,
+      "track_moe_metrics": true,
+      "train_iters": 120,
+      "use_fused_weighted_squared_relu": false,
+      "fp32_lm_head": "tf32"
+    },
+    "model_name": "@STUDENT_HF@",
+    "offload_optimizer_for_logprob": false,
+    "optimizer": null,
+    "precision": "bfloat16",
+    "router_replay": {
+      "enabled": false
+    },
+    "scheduler": null,
+    "sequence_packing": {
+      "algorithm": "modified_first_fit_decreasing",
+      "enabled": true,
+      "logprob_mb_tokens": 65536,
+      "microbatch_order": "largest_first",
+      "sequence_length_round": 64,
+      "train_mb_tokens": 65536
+    },
+    "tokenizer": {
+      "chat_template": "default",
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "truncate_history_thinking": false
+      },
+      "fix_mistral_regex": true,
+      "name": "@STUDENT_HF@",
+      "use_fastokens": false
+    },
+    "train_global_batch_size": 2048,
+    "train_micro_batch_size": 1
+  },
+  "reward_penalties": {
+    "penalize_duplicated_reasoning": true,
+    "penalize_empty_final_answer": true,
+    "penalize_malformed_think_tag": true,
+    "penalize_unwanted_tokens": false,
+    "token_ids": {
+      "think_close": 13,
+      "think_open": 12,
+      "unwanted": []
+    }
+  }
+}

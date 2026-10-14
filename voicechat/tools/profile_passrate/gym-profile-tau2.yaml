@@ -1,0 +1,25 @@
+# tau2 telecom agent variants (kept separate: needs the tau2 package in the agent venv).
+tau2:
+  responses_api_agents:
+    tau2:
+      entrypoint: app.py
+      domain: agent
+      model_server: {type: responses_api_models, name: policy_model}
+      user_model_server: {type: responses_api_models, name: policy_model}
+      num_workers: 8
+      user_llm_args: {temperature: 0.7}
+      max_steps: 200
+      max_agent_steps: 60
+      debug: false
+      print_step_counts: false
+      datasets: []
+tau2_qwen:
+  _copy: tau2
+  responses_api_agents:
+    tau2:
+      user_model_server: {type: responses_api_models, name: sim_qwen}
+tau2_gptoss:
+  _copy: tau2
+  responses_api_agents:
+    tau2:
+      user_model_server: {type: responses_api_models, name: sim_gptoss}

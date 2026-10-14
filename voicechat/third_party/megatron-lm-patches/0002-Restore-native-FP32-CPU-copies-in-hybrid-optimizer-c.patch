@@ -1,0 +1,59 @@
+From 468bbe29451561d4f803f73ee648144ae782bf41 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 20 Sep 2026 01:18:26 -0700
+Subject: [PATCH 2/3] Restore native FP32 CPU copies in hybrid optimizer
+ checkpoints
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ .../core/optimizer/cpu_offloading/hybrid_optimizer.py     | 7 ++++---
+ tests/unit_tests/test_hdo_dp_reshardable_cpu.py           | 8 ++++++--
+ 2 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index 5c14957e4..268be43ab 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -372,9 +372,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         if not self.param_update_in_fp32:
+             return
+         for param, v in self.state.items():
+-            # Native FP32 params do not need a separate master parameter and are
+-            # intentionally absent from param_to_fp32_param.
+-            fp32_param = self.param_to_fp32_param.get(param)
++            # Restore the parameter the sub-optimizer actually updates. Native
++            # FP32 parameters can have an offloaded CPU copy even though they
++            # are absent from the low-precision promotion map.
++            fp32_param = self.param_to_inner_param.get(param)
+             if fp32_param is not None:
+                 fp32_param.data.copy_(v["master_param"])
+ 
+diff --git a/tests/unit_tests/test_hdo_dp_reshardable_cpu.py b/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+index 7699df6fe..6ae6aa834 100644
+--- a/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
++++ b/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+@@ -18,7 +18,7 @@ class TestHDODPReshardableCPU(unittest.TestCase):
+     def test_restored_master_and_next_adam_step_match_uninterrupted_training(self):
+         # The HDO constructor needs CUDA streams. Build only its CPU Adam branch,
+         # retaining the real shared-state and FP32-master mappings used after load.
+-        for dtype in (torch.bfloat16, torch.float16):
++        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+             with self.subTest(dtype=dtype):
+                 reference_param = torch.nn.Parameter(
+                     torch.tensor([1.000123, -2.000321])
+@@ -59,7 +59,11 @@ class TestHDODPReshardableCPU(unittest.TestCase):
+                 hdo.cpu_optimizers = [inner]
+                 hdo.gpu_optimizer = None
+                 hdo.param_update_in_fp32 = True
+-                hdo.param_to_fp32_param = {shard_param: inner_param}
++                hdo.param_to_fp32_param = (
++                    {shard_param: inner_param} if dtype != torch.float32 else {}
++                )
++                hdo.param_to_inner_param = {shard_param: inner_param}
++                hdo.gpu_params_map_cpu_copy = {shard_param: inner_param}
+                 hdo.inner_param_to_orig_param = {inner_param: shard_param}
+                 hdo.defaults = {"cpu_optimizer_cls": torch.optim.AdamW}
+                 wrapper = SimpleNamespace(
+-- 
+2.25.1
+

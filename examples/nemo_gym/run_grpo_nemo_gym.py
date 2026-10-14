@@ -1,0 +1,366 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import os
+import pprint
+import time
+
+# Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
+import wandb.util
+
+wandb.util.VALUE_BYTES_LIMIT = 10_000_000
+
+from omegaconf import OmegaConf
+from wandb import Table
+
+from nemo_rl.algorithms.grpo import (
+    ColocatablePolicyInterface,
+    EnvironmentInterface,
+    GenerationInterface,
+    Logger,
+    MasterConfig,
+    StatefulDataLoader,
+    TokenizerType,
+    grpo_train,
+    refit_policy_generation,
+    setup,
+    shutdown_environments,
+)
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.utils import setup_response_data
+from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.nemo_gym import (
+    setup_nemo_gym_config,
+    should_use_nemo_gym,
+)
+from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
+from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.timer import Timer
+
+
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
+    parser.add_argument(
+        "--config", type=str, default=None, help="Path to YAML config file"
+    )
+
+    # Parse known args for the script
+    args, overrides = parser.parse_known_args()
+
+    return args, overrides
+
+
+# These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
+def collect_trajectories(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    val_dataloader: StatefulDataLoader,
+    tokenizer: TokenizerType,
+    val_task_to_env: dict[str, EnvironmentInterface],
+    logger: Logger,
+    master_config: MasterConfig,
+) -> None:
+    """Run trajectory collection."""
+    # common config/state items
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_policy_generation(policy, policy_generation, colocated_inference)
+
+    log_filename = "trajectory_collection.jsonl"
+
+    print("\n🔍 Running trajectory collection...", flush=True)
+    generation_config = master_config.policy["generation"]
+    for val_batch in val_dataloader:
+        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+            policy_generation=policy_generation,
+            input_batch=val_batch,
+            tokenizer=tokenizer,
+            task_to_env=val_task_to_env,
+            max_seq_len=master_config.policy["max_total_sequence_length"],
+            generation_config=generation_config,
+            # This utility consumes the Tables below to write its trajectory JSONL.
+            log_full_result_tables=True,
+            max_rollout_turns=None,
+            greedy=False,
+        )
+
+        rows_to_log: list[str] = []
+        for key, value in nemo_gym_rollout_result.rollout_metrics.items():
+            if "full_result" not in key:
+                continue
+
+            value: Table
+            data: list[list[str]] = value.data  # (n, 1)
+            rows_to_log.extend(v[0] for v in data)
+
+        logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+
+        # TODO: eventually as trajectory collection use cases exceed 4 hours, we can leverage the dataloader save functionality to resume
+        # And also leverage the TimeoutChecker functionality as well
+
+    policy_generation.finish_generation()
+
+
+def main() -> None:
+    """Main entry point."""
+    main_start = time.perf_counter()
+    log_container_init_timing()
+    rl_init_timer = Timer(context={"worker": "driver"})
+
+    register_omegaconf_resolvers()
+    args, overrides = parse_args()
+
+    if not args.config:
+        args.config = os.path.join(
+            os.path.dirname(__file__),
+            "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml",
+        )
+
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
+
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
+
+        config = OmegaConf.to_container(config, resolve=True)
+        config = MasterConfig(**config)
+        materialize_vllm_video_config(config.policy, config.data)
+        print("Applied CLI overrides")
+
+    # Get the next experiment directory with incremented ID
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
+        print(
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
+        )
+
+    with rl_init_timer.time("tokenizer"):
+        is_vlm = bool(config.policy.get("is_vlm"))
+        if is_vlm:
+            processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
+            tokenizer = processor.tokenizer
+        else:
+            processor = None
+            tokenizer = get_tokenizer(config.policy["tokenizer"])
+
+        assert config.policy["generation"] is not None, (
+            "A generation config is required for GRPO"
+        )
+        has_refit_draft_weights = (
+            "draft" in config.policy and config.policy["draft"]["enabled"]
+        )
+        trains_mtp = (
+            "megatron_cfg" in config.policy
+            and config.policy["megatron_cfg"]["enabled"]
+            and bool(config.policy["megatron_cfg"].get("mtp_num_layers"))
+        )
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+            trains_mtp=trains_mtp,
+        )
+        if is_vlm and "vllm_cfg" in config.policy["generation"]:
+            assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
+                "VLMs require tokenizer to be initialized before generation, "
+                "so skip_tokenizer_init must be set to False."
+            )
+
+        # NeMo-Gym specific config setup.
+        setup_nemo_gym_config(config, tokenizer)
+
+    # We assert here since this is right after the final config has been materialized.
+    assert should_use_nemo_gym(config)
+
+    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
+    # before setup() so it is not forwarded into NeMo-Gym's global config. It
+    # also determines whether the validation dataset is the collection input.
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].pop("is_trajectory_collection", False)
+    )
+    should_load_validation = is_trajectory_collection or (
+        config.grpo.val_period > 0 or config.grpo.val_at_start or config.grpo.val_at_end
+    )
+
+    # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
+    with rl_init_timer.time("data"):
+        print("\n▶ Setting up data...")
+        data_tokenizer = processor if processor is not None else tokenizer
+        if not should_load_validation and config.data.get("validation") is not None:
+            print("  - Skipping validation dataset because validation is disabled.")
+        train_dataset, val_dataset = setup_response_data(
+            data_tokenizer,
+            config.data,
+            env_configs=None,
+            load_validation=should_load_validation,
+        )
+
+    # Validation dataset config setup.
+    if config.grpo.max_val_samples is not None:
+        raise ValueError(
+            """A non-null `grpo.max_val_samples` parameter is not supported.
+
+Gym principle is that there is no hidden data pre or post processing from you. What you see is what you get.
+
+The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
+        )
+
+    if val_dataset is not None:
+        print(
+            f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
+        )
+        config.grpo.max_val_samples = len(val_dataset)
+        config.grpo.val_batch_size = config.grpo.max_val_samples
+
+    # Print config
+    print("Final config:")
+    pprint.pprint(config)
+
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
+
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            nemo_gym,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            teacher_worker_groups,
+            alias_to_group_alias,
+        ) = setup(
+            config,
+            tokenizer,
+            train_dataset,
+            val_dataset,
+            processor=processor,
+        )
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
+
+    # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
+    # Bind task_to_env and val_task_to_env for the nemo_gym env.
+    # NeMo-Gym is the only environment used by this runner.
+    task_to_env = {"nemo_gym": nemo_gym}
+    val_task_to_env = task_to_env
+
+    try:
+        if is_trajectory_collection:
+            collect_trajectories(
+                policy=policy,
+                policy_generation=policy_generation,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                master_config=master_config,
+            )
+        # Check if async mode is enabled
+        elif config.grpo.async_grpo.enabled:
+            # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+            if config.grpo.use_dynamic_sampling:
+                raise NotImplementedError(
+                    "use_dynamic_sampling is not supported with async GRPO"
+                )
+            if config.grpo.reward_scaling.enabled:
+                raise NotImplementedError(
+                    "reward_scaling is not supported with async GRPO"
+                )
+            if config.grpo.reward_shaping.enabled:
+                raise NotImplementedError(
+                    "reward_shaping is not supported with async GRPO"
+                )
+
+            # Async GRPO does not support multiple dataloaders
+            if config.data["use_multiple_dataloader"]:
+                raise NotImplementedError(
+                    "use_multiple_dataloader is not supported with async GRPO"
+                )
+
+            from nemo_rl.algorithms.grpo import async_grpo_train
+
+            print("🚀 Running async GRPO training")
+
+            # Run async GRPO training
+            async_grpo_train(
+                policy=policy,
+                policy_generation=policy_generation,
+                dataloader=dataloader,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                loss_fn=loss_fn,
+                task_to_env=task_to_env,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                checkpointer=checkpointer,
+                grpo_save_state=grpo_state,
+                master_config=master_config,
+                max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=alias_to_group_alias,
+                processor=processor,
+            )
+        else:
+            print("🚀 Running synchronous GRPO training")
+
+            # Run standard GRPO training
+            grpo_train(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                processor=processor,
+            )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation: {error}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

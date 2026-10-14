@@ -1,0 +1,24 @@
+defaults: vlm_grpo_3B.yaml
+policy:
+  dtensor_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    enabled: true
+    peft:
+      lora_dtype: null
+    optimizer:
+      lr: 2.0e-07
+      min_lr: 2.0e-07
+    scheduler:
+      lr_warmup_iters: 50
+      lr_warmup_init: 2.0e-08
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+logger:
+  wandb:
+    name: vlm-grpo-3b-megatron
+  swanlab:
+    name: vlm-grpo-3b-megatron

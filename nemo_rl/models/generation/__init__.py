@@ -1,0 +1,113 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import warnings
+from typing import cast
+
+from transformers import PreTrainedTokenizerBase
+
+from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.trtllm import TrtllmConfig
+from nemo_rl.models.generation.vllm import VllmConfig
+from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
+
+TokenizerType = PreTrainedTokenizerBase
+
+
+def configure_generation_config(
+    config: GenerationConfig,
+    tokenizer: TokenizerType,
+    is_eval: bool = False,
+    has_refit_draft_weights: bool = False,
+    trains_mtp: bool = False,
+) -> GenerationConfig:
+    """Apply specific configurations to generation config."""
+    # tokenizer setting
+    if "_pad_token_id" in config:
+        warnings.warn(
+            "'_pad_token_id' found in generation config and will be overridden with tokenizer.pad_token_id. "
+            "Note: '_pad_token_id' is intended for internal use and has no effect when set in user-provided configs.",
+            UserWarning,
+        )
+    config["_pad_token_id"] = tokenizer.pad_token_id
+    if config["stop_token_ids"] is None:
+        config["stop_token_ids"] = [tokenizer.eos_token_id]
+
+    # vLLM setting shared by the standard and managed Dynamo backends.
+    if config["backend"] in ("vllm", "dynamo"):
+        vllm_backed_config = cast(VllmConfig, config)
+        # Respect an explicit recipe override. VLM training needs "auto": the
+        # trainer freezes (and therefore never refits) the vision tower, so a
+        # dummy-initialized engine keeps a random vision encoder forever and
+        # rewards on visual tasks collapse.
+        vllm_backed_config["vllm_cfg"].setdefault(
+            "load_format", "auto" if is_eval else "dummy"
+        )
+
+    if config["backend"] == "vllm":
+        config = cast(VllmConfig, config)
+        if config.get("real_quant"):
+            export_cpu_offload = config.get("real_quant_export_cpu_offload")
+            if not isinstance(export_cpu_offload, bool):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload must be a boolean"
+                )
+            colocated = config.get("colocated")
+            if not export_cpu_offload and (
+                colocated is None
+                or not colocated["enabled"]
+                or config.get("refit_transport") is not None
+            ):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload=false requires "
+                    "colocated CUDA-IPC refit with no explicit refit_transport"
+                )
+
+        # set load_format
+        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+            config["vllm_cfg"]["load_format"] = "auto"
+        speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
+        if speculative_config and not is_eval and not has_refit_draft_weights:
+            # Speculative decoding needs real draft weights at startup, since the
+            # draft is not covered by the initial refit.
+            if speculative_config.get("method") not in ("deepseek_mtp", "mtp"):
+                # Non-MTP methods (e.g. Eagle) must read the drafter's real
+                # weights from the checkpoint, so load everything.
+                warnings.warn(
+                    "Speculative decoding is enabled without draft refit sync. "
+                    "Setting vllm_cfg['load_format'] to 'auto' so the drafter does "
+                    "not start from dummy weights."
+                )
+                config["vllm_cfg"]["load_format"] = "auto"
+
+        # MTP draft weights arrive via refit if the trainer trains the MTP layer.
+        # If the trainer does not train the MTP layer, the weights need to be
+        # loaded from the checkpoint.
+        config["_mtp_weights_from_refit"] = trains_mtp
+
+        # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
+        if "skip_tokenizer_init" not in config["vllm_cfg"]:
+            # set skip_tokenizer_init
+            if (
+                is_eval
+                or config["stop_strings"] is not None
+                or config["vllm_cfg"].get("expose_http_server", None)
+            ):
+                config["vllm_cfg"]["skip_tokenizer_init"] = False
+            else:
+                config["vllm_cfg"]["skip_tokenizer_init"] = True
+
+    elif config["backend"] == "trtllm":
+        config = cast(TrtllmConfig, config)
+
+    return config

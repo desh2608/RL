@@ -1,0 +1,625 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import multiprocessing
+import os
+import sys
+import time
+import traceback
+import unittest.mock
+import weakref
+
+import pytest
+import torch
+import zmq
+
+from nemo_rl.models.policy.utils import (
+    IPCProtocol,
+    aggregate_per_sample_handles,
+    calculate_aligned_size,
+    ensure_teacher_ipc_buffer,
+    get_megatron_checkpoint_dir,
+    rebuild_cuda_tensor_from_ipc,
+    stream_weights_via_ipc_zmq_impl,
+)
+
+
+class TestGetMegatronCheckpointDir:
+    """Test cases for the get_megatron_checkpoint_dir function."""
+
+    def test_nrl_megatron_checkpoint_dir_takes_precedence(self):
+        """Test that NRL_MEGATRON_CHECKPOINT_DIR environment variable takes highest precedence."""
+        expected_dir = "/custom/nrl/checkpoint/path"
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "NRL_MEGATRON_CHECKPOINT_DIR": expected_dir,
+                "HF_HOME": "/some/hf/home",
+                "HOME": "/some/home",
+            },
+        ):
+            result = get_megatron_checkpoint_dir()
+            assert result == expected_dir
+
+    def test_hf_home_fallback_when_nrl_not_set(self):
+        """Test that HF_HOME/nemo_rl is used when NRL_MEGATRON_CHECKPOINT_DIR is not set."""
+        hf_home = "/path/to/hf/home"
+        expected_dir = os.path.join(hf_home, "nemo_rl")
+
+        env_vars = {"HF_HOME": hf_home, "HOME": "/some/home"}
+        # Remove NRL_MEGATRON_CHECKPOINT_DIR if it exists
+        env_vars.pop("NRL_MEGATRON_CHECKPOINT_DIR", None)
+
+        with unittest.mock.patch.dict(os.environ, env_vars, clear=True):
+            result = get_megatron_checkpoint_dir()
+            assert result == expected_dir
+
+    def test_default_fallback_when_no_env_vars_set(self):
+        """Test that ~/.cache/huggingface/nemo_rl is used when no environment variables are set."""
+        home_dir = "/home/testuser"
+        expected_dir = os.path.join(home_dir, ".cache", "huggingface", "nemo_rl")
+
+        with unittest.mock.patch.dict(os.environ, {"HOME": home_dir}, clear=True):
+            with unittest.mock.patch("os.path.expanduser") as mock_expanduser:
+                mock_expanduser.return_value = home_dir
+                result = get_megatron_checkpoint_dir()
+                assert result == expected_dir
+                mock_expanduser.assert_called_once_with("~")
+
+    def test_nrl_checkpoint_dir_empty_string_treated_as_unset(self):
+        """Test that an empty NRL_MEGATRON_CHECKPOINT_DIR is treated as unset."""
+        hf_home = "/path/to/hf/home"
+        expected_dir = os.path.join(hf_home, "nemo_rl")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "NRL_MEGATRON_CHECKPOINT_DIR": "",
+                "HF_HOME": hf_home,
+                "HOME": "/some/home",
+            },
+        ):
+            result = get_megatron_checkpoint_dir()
+            assert result == expected_dir
+
+    def test_hf_home_empty_string_treated_as_unset(self):
+        """Test that an empty HF_HOME is treated as unset."""
+        home_dir = "/home/testuser"
+        expected_dir = os.path.join(home_dir, ".cache", "huggingface", "nemo_rl")
+
+        with unittest.mock.patch.dict(
+            os.environ, {"HF_HOME": "", "HOME": home_dir}, clear=True
+        ):
+            with unittest.mock.patch("os.path.expanduser") as mock_expanduser:
+                mock_expanduser.return_value = home_dir
+                result = get_megatron_checkpoint_dir()
+                assert result == expected_dir
+
+    def test_function_prints_selected_directory(self, capsys):
+        """Test that the function prints the selected directory."""
+        expected_dir = "/custom/checkpoint/dir"
+
+        with unittest.mock.patch.dict(
+            os.environ, {"NRL_MEGATRON_CHECKPOINT_DIR": expected_dir}
+        ):
+            result = get_megatron_checkpoint_dir()
+
+            captured = capsys.readouterr()
+            assert (
+                f"Using default megatron checkpoint dir: {expected_dir}" in captured.out
+            )
+            assert result == expected_dir
+
+
+class _FakeIpcSocket:
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, payload):
+        self.sent.append(payload)
+
+    def recv(self):
+        return b""
+
+    def getsockopt(self, _option):
+        return 0
+
+
+def test_stream_weights_releases_buffers_before_complete_without_full_gc(
+    monkeypatch,
+):
+    """The final data ACK is sufficient to reclaim both acyclic IPC buffers."""
+
+    tensor = torch.ones(4, dtype=torch.float32)
+    buffer_refs = []
+    events = []
+    original_empty = torch.empty
+
+    def tracking_empty(*args, **kwargs):
+        buffer = original_empty(*args, **kwargs)
+        buffer_refs.append(weakref.ref(buffer))
+        return buffer
+
+    def empty_cache():
+        events.append("empty_cache")
+        assert len(buffer_refs) == 2
+        assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+
+    class ReleaseAwareSocket(_FakeIpcSocket):
+        def send_pyobj(self, payload):
+            if payload == IPCProtocol.COMPLETE:
+                assert events == ["empty_cache"]
+                assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+            super().send_pyobj(payload)
+
+    monkeypatch.setattr(torch, "empty", tracking_empty)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.gc.collect",
+        lambda: pytest.fail("IPC buffer cleanup must not scan the full object graph"),
+    )
+
+    socket = ReleaseAwareSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("weight", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert events == ["empty_cache"]
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
+    """CPU-exported tensors should still be packed into CUDA IPC buffers."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensor = torch.ones(4, dtype=torch.float32)
+    captured = {}
+
+    def fake_get_handle_from_tensor(tensor):
+        captured["buffer_device"] = tensor.device
+        return ("ipc-handle",)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        fake_get_handle_from_tensor,
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("weight", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert captured["buffer_device"].type == "cuda"
+    payload = socket.sent[0]
+    assert payload[0] == ("ipc-handle",)
+    assert payload[1] == ["weight"]
+    assert payload[2] == calculate_aligned_size(tensor.nbytes)
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
+    """CPU-exported tensor groups report aligned byte offsets."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensors = [
+        ("weight", torch.ones(4, dtype=torch.float32)),
+        ("bias", torch.ones(3, dtype=torch.float16)),
+    ]
+    captured = {}
+
+    def fake_get_handle_from_tensor(tensor):
+        captured["buffer_device"] = tensor.device
+        return ("ipc-handle",)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        fake_get_handle_from_tensor,
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter(tensors),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert captured["buffer_device"].type == "cuda"
+    payload = socket.sent[0]
+    assert payload[1] == ["weight", "bias"]
+    assert payload[2] == sum(
+        calculate_aligned_size(tensor.nbytes) for _, tensor in tensors
+    )
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_preserves_cpu_and_gpu_source_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU and GPU sources must produce identical CUDA IPC staging payloads."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    source_tensors = [
+        ("packed.weight", torch.tensor([[0, 1], [254, 255]], dtype=torch.uint8)),
+        ("weight_scale", torch.tensor([1.0, -2.0], dtype=torch.float32)),
+        ("weight_scale_2", torch.tensor([0.5], dtype=torch.float32)),
+    ]
+
+    def capture_staging_payload(
+        tensors: list[tuple[str, torch.Tensor]],
+    ) -> tuple[list[str], int, list[torch.Tensor]]:
+        captured: dict[str, torch.Tensor] = {}
+
+        def fake_get_handle_from_tensor(buffer: torch.Tensor) -> tuple[str]:
+            captured["buffer"] = buffer.detach().cpu().clone()
+            return ("ipc-handle",)
+
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.get_handle_from_tensor",
+            fake_get_handle_from_tensor,
+        )
+        socket = _FakeIpcSocket()
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=iter(tensors),
+            buffer_size_bytes=4096,
+            zmq_socket=socket,
+            rank=0,
+            worker_name="test_worker",
+        )
+        _, names, used_bytes = socket.sent[0]
+        offset = 0
+        tensor_bytes = []
+        for _, tensor in source_tensors:
+            tensor_bytes.append(captured["buffer"][offset : offset + tensor.nbytes])
+            offset += calculate_aligned_size(tensor.nbytes)
+        assert offset == used_bytes
+        return names, used_bytes, tensor_bytes
+
+    cpu_payload = capture_staging_payload(source_tensors)
+    gpu_payload = capture_staging_payload(
+        [(name, tensor.cuda()) for name, tensor in source_tensors]
+    )
+
+    assert cpu_payload[0] == gpu_payload[0]
+    assert cpu_payload[1] == gpu_payload[1]
+    assert all(
+        torch.equal(cpu_bytes, gpu_bytes)
+        for cpu_bytes, gpu_bytes in zip(cpu_payload[2], gpu_payload[2], strict=True)
+    )
+
+
+def server_process(
+    zmq_addr: str,
+    known_tensors: list[tuple[str, torch.Tensor]],
+    buffer_size_bytes: int,
+    ready_queue: multiprocessing.Queue,
+) -> None:
+    """Server process that streams tensors via IPC ZMQ."""
+    try:
+        device = torch.device("cuda:0")
+        gpu_tensors = [(name, tensor.to(device)) for name, tensor in known_tensors]
+
+        context = zmq.Context()
+        socket = context.socket(zmq.PAIR)
+        socket.setsockopt(zmq.LINGER, 0)  # Close immediately on error
+        socket.setsockopt(zmq.RCVTIMEO, 10000)  # 10 second timeout
+        socket.bind(zmq_addr)
+        ready_queue.put(("ready", None))
+
+        stream_weights_via_ipc_zmq_impl(
+            (t for t in gpu_tensors),
+            buffer_size_bytes,
+            socket,
+            rank=0,
+            worker_name="test_server",
+        )
+    except Exception as e:
+        import sys
+        import traceback
+
+        error_details = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        ready_queue.put(("error", error_details))
+        sys.exit(
+            1
+        )  # Exit with non-zero code so check_process_error detects the failure
+    finally:
+        socket.close()
+        context.term()
+
+
+def client_process(
+    zmq_addr: str,
+    known_tensors_data: list[tuple[str, tuple, torch.dtype, torch.Tensor]],
+    result_queue: multiprocessing.Queue,
+) -> None:
+    """Client process that receives and validates tensors via IPC ZMQ."""
+    try:
+        device = torch.device("cuda:0")
+
+        # Prepare expected tensors on GPU
+        expected_tensors = {
+            name: tensor.to(device) for name, _, _, tensor in known_tensors_data
+        }
+        state_dict_info = {
+            name: (shape, dtype) for name, shape, dtype, _ in known_tensors_data
+        }
+
+        context = zmq.Context()
+        socket = context.socket(zmq.PAIR)
+        socket.setsockopt(zmq.LINGER, 0)  # Close immediately on error
+        socket.setsockopt(zmq.RCVTIMEO, 10000)  # 10 second timeout
+        socket.connect(zmq_addr)
+
+        # Receive and validate loop
+        while True:
+            payload = socket.recv_pyobj()
+            if payload == IPCProtocol.COMPLETE:
+                socket.send(IPCProtocol.ACK.value.encode())
+                break
+
+            ipc_handle, list_keys, used_bytes = payload
+            buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, device.index)
+
+            offset = 0
+            for key in list_keys:
+                shape, dtype = state_dict_info[key]
+                shape = torch.Size(shape) if isinstance(shape, list) else shape
+                size_in_bytes = dtype.itemsize * shape.numel()
+
+                tensor = (
+                    buffer[offset : offset + size_in_bytes]
+                    .view(dtype=dtype)
+                    .view(shape)
+                )
+                expected = expected_tensors[key]
+
+                # Validate tensor
+                assert tensor.shape == expected.shape, f"Shape mismatch for {key}"
+                assert tensor.dtype == expected.dtype, f"Dtype mismatch for {key}"
+                assert torch.allclose(tensor, expected, rtol=1e-7, atol=1e-7), (
+                    f"Values mismatch for {key}"
+                )
+
+                offset += calculate_aligned_size(size_in_bytes)
+
+            assert offset == used_bytes, f"Offset mismatch: {offset} != {used_bytes}"
+            socket.send(b"")
+
+        result_queue.put(("success", "All tensors validated"))
+    except Exception as e:
+        error_details = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        result_queue.put(("error", error_details))
+        sys.exit(1)
+    finally:
+        socket.close()
+        context.term()
+
+
+def check_process_error(
+    proc: multiprocessing.Process,
+    queue: multiprocessing.Queue,
+    process_name: str,
+) -> None:
+    """Check if a process failed and assert with detailed error message if available."""
+    if proc.exitcode == 0:
+        return
+
+    # Get error details from queue
+    error_msg = None
+    while not queue.empty():
+        status, msg = queue.get_nowait()
+        if status == "error":
+            error_msg = msg
+            break
+
+    if proc.exitcode is None:
+        assert False, f"{process_name} timed out"
+    else:
+        details = f"\n{error_msg}" if error_msg else ""
+        assert False, f"{process_name} failed (exitcode={proc.exitcode}){details}"
+
+
+class TestStreamWeightsViaIPC:
+    """Test suite for IPC weight streaming functionality."""
+
+    TIMEOUT = 30  # 30 second timeout for additional overhead when running with coverage
+
+    @pytest.mark.parametrize(
+        "test_case,tensor_specs,buffer_size_bytes,test_description",
+        [
+            (
+                "large_buffer",
+                [
+                    ("tensor_1", (10, 20), torch.float32),  # 0.78KB
+                    ("tensor_2", (5, 15, 25), torch.float32),  # 7.32KB
+                    ("tensor_3", (100,), torch.float16),  # 0.20KB
+                    ("tensor_4", (50, 50), torch.bfloat16),  # 4.88KB
+                    ("tensor_5", (8, 16, 32), torch.float32),  # 16.00KB
+                ],  # Total: 29.18KB
+                100 * 1024,  # 100 KB - large buffer for single batch (50KB per side)
+                "Test with various shapes/dtypes in large buffer (single batch)",
+            ),
+            (
+                "small_buffer",
+                [
+                    ("small_1", (30, 30), torch.float32),  # 3.52KB
+                    ("small_2", (20, 40), torch.float16),  # 1.56KB
+                    ("small_3", (128,), torch.float32),  # 0.50KB
+                    ("small_4", (25, 35), torch.float32),  # 3.42KB
+                ],  # Total: 9.00KB
+                10 * 1024,  # 10 KB - forces multiple batches (5KB per side)
+                "Test with small buffer forcing multiple batches",
+            ),
+        ],
+    )
+    def test_stream_weights_via_ipc_zmq_impl(
+        self, test_case, tensor_specs, buffer_size_bytes, test_description
+    ):
+        """Test streaming weights via IPC ZMQ between server and client processes."""
+        # Generate test tensors
+        known_tensors = [
+            (name, torch.randn(*shape, dtype=dtype))
+            for name, shape, dtype in tensor_specs
+        ]
+        self._run_stream_weights_roundtrip(test_case, known_tensors, buffer_size_bytes)
+
+    def test_stream_weights_via_ipc_zmq_impl_non_contiguous(self):
+        """Regression: tensors yielded by the params iterator may be non-contiguous.
+
+        For example, ``Megatron-Bridge``'s ``QKVMapping.megatron_to_hf`` returns
+        Q/K/V shards via advanced indexing + ``reshape`` that can produce views
+        with non-canonical strides. Before the fix, ``pack_tensor`` called
+        ``view(-1)`` which raises ``RuntimeError: view size is not compatible
+        with input tensor's size and stride``.
+        """
+        # transpose(): non-contiguous, contains all elements
+        t1 = torch.randn(8, 16, dtype=torch.float32).t()
+        # slicing with stride: non-contiguous
+        t2 = torch.randn(40, 60, dtype=torch.float32)[:, ::2]
+        # permute on 3D: non-contiguous
+        t3 = torch.randn(4, 8, 12, dtype=torch.bfloat16).permute(2, 0, 1)
+        for t in (t1, t2, t3):
+            assert not t.is_contiguous(), "test tensor must be non-contiguous"
+
+        known_tensors = [("qkv_q_proj", t1), ("qkv_k_proj", t2), ("qkv_v_proj", t3)]
+        self._run_stream_weights_roundtrip(
+            "non_contiguous", known_tensors, buffer_size_bytes=100 * 1024
+        )
+
+    def _run_stream_weights_roundtrip(
+        self,
+        test_case: str,
+        known_tensors: list[tuple[str, torch.Tensor]],
+        buffer_size_bytes: int,
+    ) -> None:
+        """Shared driver: spawn server/client and validate the round-trip."""
+        known_tensors_data = [
+            (name, list(t.shape), t.dtype, t) for name, t in known_tensors
+        ]
+
+        # Create unique socket path and queues
+        socket_path = f"/tmp/test_ipc_zmq_{test_case}_{os.getpid()}_{time.time()}"
+        zmq_addr = f"ipc://{socket_path}"
+
+        mp_context = multiprocessing.get_context("spawn")
+        ready_queue = mp_context.Queue()
+        result_queue = mp_context.Queue()
+
+        # Start server and client
+        server_proc = mp_context.Process(
+            target=server_process,
+            args=(zmq_addr, known_tensors, buffer_size_bytes, ready_queue),
+        )
+        server_proc.start()
+
+        status, msg = ready_queue.get(timeout=self.TIMEOUT)
+        assert status == "ready", f"Server failed: {msg}"
+
+        client_proc = mp_context.Process(
+            target=client_process,
+            args=(zmq_addr, known_tensors_data, result_queue),
+        )
+        client_proc.start()
+
+        # Wait and validate
+        try:
+            server_proc.join(timeout=self.TIMEOUT)
+            client_proc.join(timeout=self.TIMEOUT)
+
+            # Check client first since client failure often causes server to fail
+            check_process_error(client_proc, result_queue, "Client")
+            check_process_error(server_proc, ready_queue, "Server")
+
+            # Verify client success message
+            status, msg = result_queue.get(timeout=self.TIMEOUT)
+            assert status == "success", f"Validation failed: {msg}"
+        finally:
+            for proc in [server_proc, client_proc]:
+                if proc and proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=self.TIMEOUT)
+                    if proc.is_alive():
+                        proc.kill()
+
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+
+
+class TestAggregatePerSampleHandles:
+    def test_orders_by_dp_rank(self):
+        out = aggregate_per_sample_handles(
+            [
+                {"dp_rank": 1, "per_sample_handles": ["b0", "b1"]},
+                {"dp_rank": 0, "per_sample_handles": ["a0", "a1"]},
+            ]
+        )
+        assert [e["teacher_shards"] for e in out] == [["a0"], ["a1"], ["b0"], ["b1"]]
+
+    def test_collects_replicas_per_sample(self):
+        out = aggregate_per_sample_handles(
+            [
+                {"dp_rank": 0, "per_sample_handles": ["r0s0", "r0s1"]},
+                {"dp_rank": 0, "per_sample_handles": ["r1s0", "r1s1"]},
+            ]
+        )
+        assert [e["teacher_shards"] for e in out] == [
+            ["r0s0", "r1s0"],
+            ["r0s1", "r1s1"],
+        ]
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(AssertionError):
+            aggregate_per_sample_handles(
+                [
+                    {"dp_rank": 0, "per_sample_handles": ["a0", "a1"]},
+                    {"dp_rank": 0, "per_sample_handles": ["b0"]},
+                ]
+            )
+
+
+class TestEnsureTeacherIpcBuffer:
+    def test_alloc_reuse_and_grow(self):
+        dev = torch.device("cpu")
+        s, h = ensure_teacher_ipc_buffer(None, None, 2, 1, 4, 8, torch.float32, dev)
+        assert s.shape == (2, 1, 4, 8) and h is not None
+        s2, h2 = ensure_teacher_ipc_buffer(s, h, 2, 1, 4, 8, torch.float32, dev)
+        assert s2 is s and h2 is h
+        s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
+        assert s3 is not s and s3.shape == (3, 1, 4, 8)

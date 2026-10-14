@@ -1,0 +1,9 @@
+# Environment/processor fragment, merged into a sealed GRPO debug config.
+# This is not a standalone training recipe or authorization for a full run.
+# In each data.train entry set processor: terminal_text_reward_processor and
+# env_name: terminal_text_reward, retaining its frozen data path/hash/row count.
+env:
+  terminal_text_reward:
+    response_scope: final_after_think
+    require_think_close: true
+    reject_truncated: true

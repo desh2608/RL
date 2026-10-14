@@ -1,0 +1,258 @@
+{
+  "policy_model": {
+    "responses_api_models": {
+      "vllm_model": {
+        "api_key": "${policy_api_key}",
+        "base_url": "${policy_base_url}",
+        "chat_template_kwargs": {
+          "enable_thinking": true,
+          "truncate_history_thinking": false
+        },
+        "engine_data_parallel_size": 8,
+        "entrypoint": "app.py",
+        "model": "${policy_model_name}",
+        "num_workers": 16,
+        "request_prompt_and_generation_token_ids": true,
+        "return_token_id_information": true,
+        "sequential_reasoning_allowed": false,
+        "uses_reasoning_parser": true
+      }
+    }
+  },
+  "single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "Conversational tool-use RL from expert trajectories; behavior cloning per step across auth, lookup, and servicing domains.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  },
+  "multiturn_single_call_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "multiturn_single_call_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "multiturn_single_call_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "Single next tool call inside an SFT tool-use dialog prefix (>=1 earlier call and tool result in context); function_call gold with the strict single-call contract (>=2 calls or text score 0).",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  },
+  "hard_no_call_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "hard_no_call_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "hard_no_call_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "No-call turns (message gold) from SFT dialogs and library rows: the right action is to answer, clarify, or decline because the available tools cannot fulfil the request; any tool call scores 0.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  },
+  "irrelevance_near_miss_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "irrelevance_near_miss_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "irrelevance_near_miss_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "BFCL-irrelevance-shaped near-miss prompts (message gold): a fresh user request with 1-4 tools of which one looks lexically relevant but cannot fulfil it; the right action is to answer, clarify or decline; any tool call scores 0.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  },
+  "parallel_tool_calls_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "parallel_tool_calls_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "parallel_tool_calls_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "Parallel tool-call verification; the model must emit exactly the expected set of tool calls (function_call_batch gold) in a single turn, in any order. binary_strict: 1.0 only when every expected call is matched and no surplus call is emitted (allow_subset false, allow_superset false), else 0.0 \u2014 mirrors BFCL parallel scoring.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1,
+          "parallel_tool_call_rewarding": true,
+          "allow_subset": false,
+          "allow_superset": false,
+          "parallel_tool_call_reward_mode": "binary_strict"
+        },
+        "verified": false
+      }
+    }
+  },
+  "tau_mms_pivot_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "tau_mms_pivot_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "tau_mms_pivot_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "tau2-style pivots from 10 synthetic customer-service domains (banking, brokerage, insurance, hospitality, delivery, shipping, marketplace, utility, smart_home, telehealth; policy document + 13-29 DB-backed tools; reward-1 expert trajectories cut at every assistant step). Mixed gold: function_call rows need exactly the expert call (name + arguments), message rows score any text 1 and any call 0.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  },
+  "ctu_pivot_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "ctu_pivot_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "ctu_pivot_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "Conversational-tool-use pivots (Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1, 838 synthetic customer-service domains) selected for tau2 relevance (write/transfer calls, booking/order/telecom/utility domains) with K32 and K16 priors in (0.05, 0.95). Mixed gold as above.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  },
+  "telecom_teacher_pivot_single_step_tool_use_with_argument_comparison_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "telecom_teacher_pivot_single_step_tool_use_with_argument_comparison_resources_server",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "telecom_teacher_pivot_single_step_tool_use_with_argument_comparison_resources_server": {
+    "resources_servers": {
+      "single_step_tool_use_with_argument_comparison": {
+        "description": "tau2 telecom pivots cut from Qwen3.8-27B teacher episodes that the tau2 evaluator scored 1.0 on the 2,139 non-eval telecom tasks (gpt-oss-120b user simulator); calls = exact teacher call, messages only when they name a user-side tool, plus negatives (message gold) right after the agent called a user-side tool and got an error. Mixed gold.",
+        "domain": "agent",
+        "entrypoint": "app.py",
+        "tool_call_comparator_config": {
+          "word_count_similarity_threshold": 0.1
+        },
+        "verified": false
+      }
+    }
+  }
+}

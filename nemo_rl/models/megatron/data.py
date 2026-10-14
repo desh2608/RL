@@ -1,0 +1,1472 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional, Tuple
+
+import torch
+from megatron.bridge.training.utils.packed_seq_utils import (
+    get_packed_seq_cp_partition_indices,
+)
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
+)
+from megatron.core.utils import StragglerDetector
+
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.utils.r3_trace import (
+    r3_trace_verify_forward_enabled,
+    trace_cp_routed_experts,
+)
+from nemo_rl.utils.routed_experts_ref import materialize_routed_experts_refs
+
+
+@dataclass
+class ProcessedInputs:
+    """Processed microbatch inputs used for model forward pass."""
+
+    input_ids: torch.Tensor
+    input_ids_cp_sharded: torch.Tensor
+    attention_mask: Optional[torch.Tensor]
+    position_ids: Optional[torch.Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
+    cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
+    routed_experts: Optional[torch.Tensor] = None
+    routed_experts_cp_sharded: Optional[torch.Tensor] = None
+    media_token_validity_mask: Optional[torch.Tensor] = None
+
+
+@dataclass
+class ProcessedMicrobatch:
+    """Container for a processed microbatch ready for model forward pass.
+
+    This dataclass holds both the original data dictionary and the processed
+    tensors needed for the Megatron model forward pass.
+
+    Attributes:
+        data_dict: The original BatchedDataDict containing raw batch data
+        input_ids: Processed input token IDs (may be packed for sequence packing)
+        input_ids_cp_sharded: Model-forward token IDs. Usually CP-sharded; models
+            that insert media before CP selection receive the full packed THD row.
+        attention_mask: Attention mask tensor (None for packed sequences)
+        position_ids: Position IDs tensor (None for packed sequences)
+        packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
+        cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
+        mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
+            None when MTP is disabled or token/sample masks are absent.
+        routed_experts: Optional token-aligned routed expert ids
+        routed_experts_cp_sharded: Context-parallel sharded routed expert ids
+        media_token_validity_mask: Which media-token positions actually anchor a
+            projected feature, in the model's own token layout. None when the
+            batch needs no correction and the model should derive its own.
+    """
+
+    data_dict: BatchedDataDict[Any]
+    input_ids: torch.Tensor
+    input_ids_cp_sharded: torch.Tensor
+    attention_mask: Optional[torch.Tensor]
+    position_ids: Optional[torch.Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
+    cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
+    routed_experts: Optional[torch.Tensor] = None
+    routed_experts_cp_sharded: Optional[torch.Tensor] = None
+    media_token_validity_mask: Optional[torch.Tensor] = None
+
+
+def make_processed_microbatch_iterator(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+    cfg: dict[str, Any],
+    seq_length_key: Optional[str],
+    pad_individual_seqs_to_multiple_of: int,
+    pad_packed_seq_to_multiple_of: int,
+    straggler_timer: StragglerDetector,
+    pad_full_seq_to: Optional[int],
+    delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
+) -> Iterator[ProcessedMicrobatch]:
+    """Wrap a raw microbatch iterator to yield processed microbatches.
+
+    This function takes a raw iterator that yields BatchedDataDict objects and
+    wraps it to yield ProcessedMicrobatch objects that contain both the original
+    data and the processed tensors ready for model forward pass.
+
+    Args:
+        raw_iterator: Iterator yielding raw BatchedDataDict microbatches
+        cfg: Configuration dictionary containing sequence_packing settings
+        seq_length_key: Key for sequence length in data dict (required for packing)
+        pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
+        pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
+        pad_full_seq_to: Target length for full sequence padding (optional)
+
+    Yields:
+        ProcessedMicrobatch objects containing processed tensors ready for model forward
+    """
+    pack_sequences = cfg["sequence_packing"]["enabled"]
+
+    for data_dict in raw_iterator:
+        routed_experts = data_dict.get("routed_experts")
+        if routed_experts is not None and not isinstance(routed_experts, torch.Tensor):
+            if "input_lengths" not in data_dict:
+                raise ValueError(
+                    "Ray-reference routed_experts requires input_lengths for "
+                    "microbatch-local materialization."
+                )
+            data_dict["routed_experts"] = materialize_routed_experts_refs(
+                routed_experts,
+                input_ids=data_dict["input_ids"],
+                input_lengths=data_dict["input_lengths"],
+            )
+
+        # Sequence packing discards the rectangular per-sample padding and then
+        # selects this CP rank's tokens.  Keep routed_experts on CPU until those
+        # transforms have run: moving [B, max_seq, layers, topk] here can require
+        # tens of GiB even though the model consumes only the compact CP-local
+        # tensor.  Other tensors retain the existing eager H2D behavior.
+        routed_experts_for_cpu_packing = None
+        if pack_sequences:
+            routed_experts = data_dict.get("routed_experts")
+            if (
+                isinstance(routed_experts, torch.Tensor)
+                and routed_experts.device.type == "cpu"
+            ):
+                routed_experts_for_cpu_packing = routed_experts
+                del data_dict["routed_experts"]
+
+        data_dict = data_dict.to("cuda")
+        if routed_experts_for_cpu_packing is not None:
+            data_dict["routed_experts"] = routed_experts_for_cpu_packing
+
+        # Process the microbatch
+        try:
+            processed_inputs = process_microbatch(
+                data_dict=data_dict,
+                seq_length_key=seq_length_key,
+                pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
+                pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                pad_full_seq_to=pad_full_seq_to,
+                pack_sequences=pack_sequences,
+                delegate_pack_to_model=delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                straggler_timer=straggler_timer,
+            )
+        finally:
+            # No forward/loss consumer reads routed_experts from data_dict; the
+            # processed CP-local tensor is carried explicitly below.  Drop the
+            # potentially enormous rectangular CPU materialization promptly.
+            if routed_experts_for_cpu_packing is not None:
+                del data_dict["routed_experts"]
+
+        yield ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=processed_inputs.input_ids,
+            input_ids_cp_sharded=processed_inputs.input_ids_cp_sharded,
+            attention_mask=processed_inputs.attention_mask,
+            position_ids=processed_inputs.position_ids,
+            packed_seq_params=processed_inputs.packed_seq_params,
+            cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
+            mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            routed_experts=processed_inputs.routed_experts,
+            routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
+            media_token_validity_mask=processed_inputs.media_token_validity_mask,
+        )
+
+
+def get_microbatch_iterator(
+    data: BatchedDataDict[Any],
+    cfg: dict[str, Any],
+    mbs: int,
+    straggler_timer: StragglerDetector,
+    seq_length_key: Optional[str] = None,
+    delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
+) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
+    """Create a processed microbatch iterator from a batch of data.
+
+    This function creates an iterator that yields ProcessedMicrobatch objects,
+    which contain both the original data dictionary and the processed tensors
+    ready for model forward pass.
+
+    Args:
+        data: The batch data to create microbatches from
+        cfg: Configuration dictionary
+        mbs: Microbatch size
+        seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+
+    Returns:
+        Tuple containing the iterator and metadata
+        - iterator: Iterator yielding ProcessedMicrobatch objects
+        - data_iterator_len: Number of microbatches in the iterator
+        - micro_batch_size: Size of each microbatch
+        - seq_dim_size: Sequence length dimension size
+        - padded_seq_length: Padded sequence length for pipeline parallelism (may differ from seq_length)
+    """
+    micro_batch_size = mbs
+    pad_factor = 1
+    pad_full_seq_to = None
+    pad_packed_seq_to_multiple_of = 1
+
+    _, seq_dim_size = get_and_validate_seqlen(data)
+
+    # Auto-detect seq_length_key if not provided
+    if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
+        seq_length_key = "input_lengths"
+
+    if cfg["dynamic_batching"]["enabled"]:
+        raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+        data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+    elif cfg["sequence_packing"]["enabled"]:
+        raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
+        data_iterator_len, pack_seq_dim_size = (
+            data.get_microbatch_iterator_for_packable_sequences_len()
+        )
+        (
+            pad_factor,
+            pad_packed_seq_to_multiple_of,
+            pad_full_seq_to,
+        ) = _get_pack_sequence_parameters_for_megatron(
+            cfg["megatron_cfg"],
+            cfg["make_sequence_length_divisible_by"],
+            pack_seq_dim_size,
+        )
+        micro_batch_size = 1
+    else:
+        raw_iterator = data.make_microbatch_iterator(mbs)
+        data_iterator_len = data.size // mbs
+
+    # Wrap the raw iterator with processing
+    processed_iterator = make_processed_microbatch_iterator(
+        raw_iterator=raw_iterator,
+        cfg=cfg,
+        seq_length_key=seq_length_key,
+        pad_individual_seqs_to_multiple_of=pad_factor,
+        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+        pad_full_seq_to=pad_full_seq_to,
+        straggler_timer=straggler_timer,
+        delegate_pack_to_model=delegate_pack_to_model,
+        delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
+        model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+    )
+
+    # Compute padded sequence length for pipeline parallelism
+    padded_seq_length = pad_full_seq_to if pad_full_seq_to is not None else seq_dim_size
+
+    return (
+        processed_iterator,
+        data_iterator_len,
+        micro_batch_size,
+        seq_dim_size,
+        padded_seq_length,
+    )
+
+
+def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
+    """Lazy proxy for `megatron.training.utils.get_ltor_masks_and_position_ids`.
+
+    The underlying import is deferred to call time so that importing this module does
+    not pull in `megatron.training` -> modelopt -> transformers -> torchvision, which
+    can crash on a duplicate torchvision ``roi_align` meta-kernel registration in the mcore venv.
+    """
+    from megatron.training.utils import get_ltor_masks_and_position_ids as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def process_microbatch(
+    data_dict: BatchedDataDict[Any],
+    seq_length_key: Optional[str] = None,
+    pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
+    pad_full_seq_to: Optional[int] = None,
+    pack_sequences: bool = False,
+    delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
+    straggler_timer: Optional[StragglerDetector] = None,
+) -> ProcessedInputs:
+    """Process a microbatch for Megatron model forward pass."""
+    ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
+    with ctx:
+        input_ids = data_dict["input_ids"]
+        attention_mask = None
+        position_ids = None
+        packed_seq_params = None
+        routed_experts = (
+            data_dict["routed_experts"] if "routed_experts" in data_dict else None
+        )
+        token_identity_cp_sharded = None
+        if routed_experts is not None and routed_experts.dim() != 4:
+            raise ValueError(
+                "routed_experts must have shape [batch, seq, num_moe_layers, topk] "
+                f"before Megatron packing; got {tuple(routed_experts.shape)}"
+            )
+        routed_experts_cp_sharded = routed_experts
+
+        original_batch_size = input_ids.shape[0]
+        original_seq_length = input_ids.shape[1]
+        seq_lengths = None  # Will be set if using packed sequences
+        cu_seqlens = None
+        cu_seqlens_padded = None
+        mtp_loss_mask = None
+        media_token_validity_mask = None
+
+        if pack_sequences:
+            # For packed sequences with padded input, we need sequence lengths
+            assert seq_length_key is not None, (
+                "seq_length_key must be provided for packed sequences"
+            )
+            assert seq_length_key in data_dict, (
+                f"{seq_length_key} not found in data_dict"
+            )
+
+            # Get sequence lengths and context parallel size
+            seq_lengths = data_dict[seq_length_key]
+
+            if delegate_pack_to_model:
+                has_mtp_loss_mask = "mtp_loss_mask" in data_dict
+                assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
+                    "MTP training requires a self-packing VLM that advertises "
+                    "model_owns_mtp_loss_mask_packing"
+                )
+                if "media_token_validity_mask" in data_dict:
+                    # A self-packing model repacks internally, so a mask built
+                    # against caller-side rows would reach the merge in a layout
+                    # that no longer matches its tokens -- and a media mask that
+                    # is merely misaligned silently attaches features to the
+                    # wrong positions rather than failing.
+                    raise NotImplementedError(
+                        "media_token_validity_mask is not supported for models "
+                        "that pack sequences internally (delegate_pack_to_model); "
+                        "the mask would need to be packed inside the model."
+                    )
+                # VLM path: model (e.g. mbridge Qwen3VL) does its own
+                # preprocess_packed_seqs; NeMo-RL must NOT pre-pack + CP-shard,
+                # or the double-processing produces shape mismatches downstream
+                # (GDN/RoPE/MoE). We only pad each sequence individually and
+                # hand the model [B, max_seq] + bool attention_mask + cu_seqlens.
+                if routed_experts is not None:
+                    # Router replay needs routed_experts CP-sharded into the
+                    # model's local token order, but a self-packing model packs
+                    # and CP-shards internally, so NeMo-RL cannot build a matching
+                    # layout here. Fail loudly rather than feed misaligned routes.
+                    raise NotImplementedError(
+                        "Router replay (routed_experts) is not supported with "
+                        "models that pack and context-parallel shard internally "
+                        "(delegate_pack_to_model=True)."
+                    )
+                (
+                    input_ids,
+                    input_ids_cp_sharded,
+                    attention_mask,
+                    packed_seq_params,
+                    cu_seqlens,
+                    cu_seqlens_padded,
+                ) = _prepare_vlm_batch_for_megatron(
+                    input_ids,
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_full_seq_to=pad_full_seq_to,
+                )
+                if has_mtp_loss_mask:
+                    source_mtp_loss_mask = data_dict["mtp_loss_mask"]
+                    assert source_mtp_loss_mask.ndim == 2
+                    assert (
+                        source_mtp_loss_mask.shape[0] == input_ids_cp_sharded.shape[0]
+                    )
+                    mtp_loss_mask = source_mtp_loss_mask.new_zeros(
+                        input_ids_cp_sharded.shape
+                    )
+                    copied_length = min(
+                        source_mtp_loss_mask.shape[1],
+                        input_ids_cp_sharded.shape[1],
+                    )
+                    mtp_loss_mask[:, :copied_length] = source_mtp_loss_mask[
+                        :, :copied_length
+                    ]
+                    mtp_loss_mask = mtp_loss_mask * attention_mask.to(
+                        dtype=mtp_loss_mask.dtype
+                    )
+                position_ids = None
+            else:
+                token_identity = None
+                if routed_experts is not None and r3_trace_verify_forward_enabled():
+                    token_identity = _make_r3_trace_token_identity(
+                        input_ids, seq_lengths
+                    )
+
+                # Pack sequences on main's per-sequence zigzag CP layout.
+                (
+                    input_ids,
+                    local_input_ids,
+                    packed_seq_params,
+                    cu_seqlens,
+                    cu_seqlens_padded,
+                ) = _pack_sequences_for_megatron(
+                    input_ids,
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+                if model_slices_context_parallel_inputs:
+                    packed_seq_params = PackedSeqParams(
+                        cu_seqlens_q=cu_seqlens,
+                        cu_seqlens_kv=cu_seqlens,
+                        cu_seqlens_q_padded=cu_seqlens_padded,
+                        cu_seqlens_kv_padded=cu_seqlens_padded,
+                        max_seqlen_q=int(
+                            (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1])
+                            .max()
+                            .item()
+                        ),
+                        max_seqlen_kv=int(
+                            (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1])
+                            .max()
+                            .item()
+                        ),
+                        # TE's default inference excludes the final boundary, so
+                        # it misses trailing-only padding for a single sequence.
+                        # CP zigzag can move that padding to a rank-local seam.
+                        pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
+                        qkv_format="thd",
+                        total_tokens=input_ids.shape[1],
+                    )
+                    # This field is the model-forward input. For this capability
+                    # the model needs the full THD row so it can insert media
+                    # before selecting its CP-owned embeddings.
+                    input_ids_cp_sharded = input_ids
+                else:
+                    input_ids_cp_sharded = local_input_ids
+                # routed_experts and the R3 trace token identity ride the SAME
+                # per-seq zigzag CP sharding as input_ids, re-derived from
+                # cu_seqlens_padded.
+                if routed_experts is not None:
+                    (
+                        routed_experts,
+                        routed_experts_cp_sharded,
+                        _token_identity_packed,
+                        token_identity_cp_sharded,
+                    ) = _shard_routed_experts_for_cp(
+                        routed_experts,
+                        token_identity,
+                        seq_lengths,
+                        cu_seqlens,
+                        cu_seqlens_padded,
+                        get_context_parallel_rank(),
+                        get_context_parallel_world_size(),
+                    )
+                    if model_slices_context_parallel_inputs:
+                        cp_partition_indices = get_packed_seq_cp_partition_indices(
+                            packed_seq_params,
+                            total_tokens=input_ids.shape[1],
+                            cp_size=get_context_parallel_world_size(),
+                            cp_rank=get_context_parallel_rank(),
+                            # Megatron's CP helper operates on CUDA sequence
+                            # metadata and also constructs CUDA indices
+                            # internally.  Build the indices there, then copy
+                            # only the small index vector to the routes' device.
+                            device=input_ids.device,
+                        )
+                        routed_experts_cp_sharded = routed_experts.index_select(
+                            1,
+                            cp_partition_indices.to(device=routed_experts.device),
+                        ).contiguous()
+                        if _token_identity_packed is not None:
+                            token_identity_cp_sharded = (
+                                _token_identity_packed.index_select(
+                                    1,
+                                    cp_partition_indices.to(
+                                        device=_token_identity_packed.device
+                                    ),
+                                ).contiguous()
+                            )
+                    # routed_experts may deliberately still be on CPU here.
+                    # Transfer only the compact tensor consumed by this CP rank.
+                    routed_experts_cp_sharded = routed_experts_cp_sharded.to(
+                        device=input_ids.device
+                    )
+                if (
+                    routed_experts_cp_sharded is not None
+                    and routed_experts_cp_sharded.dim() != 4
+                ):
+                    raise ValueError(
+                        "CP-sharded routed_experts must have shape [1, tokens, "
+                        "num_moe_layers, topk] after Megatron packing; got "
+                        f"{tuple(routed_experts_cp_sharded.shape)}"
+                    )
+                verified_token_count = _verify_r3_trace_cp_token_alignment(
+                    source_input_ids=data_dict["input_ids"],
+                    source_routed_experts=data_dict.get("routed_experts"),
+                    input_ids_cp_sharded=(
+                        local_input_ids
+                        if model_slices_context_parallel_inputs
+                        else input_ids_cp_sharded
+                    ),
+                    routed_experts_cp_sharded=routed_experts_cp_sharded,
+                    token_identity_cp_sharded=token_identity_cp_sharded,
+                )
+                trace_cp_routed_experts(
+                    routed_experts_cp_sharded=routed_experts_cp_sharded,
+                    token_identity_cp_sharded=token_identity_cp_sharded,
+                    input_ids_cp_sharded=(
+                        local_input_ids
+                        if model_slices_context_parallel_inputs
+                        else input_ids_cp_sharded
+                    ),
+                    cp_token_identity_verified_count=verified_token_count,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+
+                # Pack pre-computed mtp_loss_mask the same way as input_ids
+                if "mtp_loss_mask" in data_dict:
+                    (
+                        packed_mtp_loss_mask,
+                        local_mtp_loss_mask,
+                        _,
+                        _,
+                        _,
+                    ) = _pack_sequences_for_megatron(
+                        data_dict["mtp_loss_mask"],
+                        seq_lengths,
+                        pad_individual_seqs_to_multiple_of,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
+                    # Mirror the input_ids layout choice above. A model that
+                    # slices CP itself receives the full THD row so it can insert
+                    # media before selecting its CP-owned embeddings, so its MTP
+                    # mask has to stay unsharded to line up with the labels.
+                    # Every other model consumes the CP-local shard.
+                    mtp_loss_mask = (
+                        packed_mtp_loss_mask
+                        if model_slices_context_parallel_inputs
+                        else local_mtp_loss_mask
+                    )
+
+                # Pack the media-token validity mask the same way as input_ids.
+                # The mask answers a per-token question, so it only means
+                # anything while it sits in the same layout as the tokens the
+                # model will compare it against. Packing is what destroys the
+                # per-sample rows it was built from, so it has to travel through
+                # the identical transform rather than be rebuilt afterwards.
+                if "media_token_validity_mask" in data_dict:
+                    (
+                        packed_media_mask,
+                        local_media_mask,
+                        _,
+                        _,
+                        _,
+                    ) = _pack_sequences_for_megatron(
+                        # Pack in the token dtype: padding is filled with 0,
+                        # which is a valid token id but not a valid bool. Read
+                        # the dtype off the unpacked ids, since the local
+                        # input_ids is already the packed tensor here.
+                        data_dict["media_token_validity_mask"].to(
+                            data_dict["input_ids"].dtype
+                        ),
+                        seq_lengths,
+                        pad_individual_seqs_to_multiple_of,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
+                    # Mirror the input_ids layout choice above, for the same
+                    # reason the MTP mask does: a model that slices CP itself
+                    # merges media against the full THD row.
+                    media_token_validity_mask = (
+                        packed_media_mask
+                        if model_slices_context_parallel_inputs
+                        else local_media_mask
+                    ).bool()
+
+                # For packed sequences, position_ids and attention_mask are typically None
+                # The PackedSeqParams handles all necessary sequence information
+                position_ids = None
+                attention_mask = None
+        else:
+            if routed_experts is not None:
+                if "input_lengths" not in data_dict:
+                    raise ValueError(
+                        "routed_experts requires input_lengths when sequence packing "
+                        "is disabled so padding rows can be repaired before router "
+                        "replay."
+                    )
+                routed_experts = _fill_routed_experts_padding(
+                    routed_experts,
+                    data_dict["input_lengths"],
+                )
+                routed_experts_cp_sharded = routed_experts
+                if r3_trace_verify_forward_enabled():
+                    token_identity_cp_sharded = _make_r3_trace_token_identity(
+                        input_ids,
+                        data_dict["input_lengths"],
+                    )
+            input_ids_cp_sharded = input_ids
+            verified_token_count = _verify_r3_trace_cp_token_alignment(
+                source_input_ids=data_dict["input_ids"],
+                source_routed_experts=data_dict.get("routed_experts"),
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+            )
+            trace_cp_routed_experts(
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                cp_token_identity_verified_count=verified_token_count,
+                cp_rank=get_context_parallel_rank(),
+                cp_size=get_context_parallel_world_size(),
+            )
+            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+                data=input_ids,
+                eod_token=0,  # used for loss_mask, which we don't use
+                pad_token=0,  # used for loss_mask, which we don't use
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
+            )
+            if "mtp_loss_mask" in data_dict:
+                mtp_loss_mask = data_dict["mtp_loss_mask"]
+            # Unpacked: rows still are samples, so the mask is already in the
+            # layout the model will see.
+            if "media_token_validity_mask" in data_dict:
+                media_token_validity_mask = data_dict[
+                    "media_token_validity_mask"
+                ].bool()
+    return ProcessedInputs(
+        input_ids=input_ids,
+        input_ids_cp_sharded=input_ids_cp_sharded,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        packed_seq_params=packed_seq_params,
+        cu_seqlens_padded=cu_seqlens_padded,
+        mtp_loss_mask=mtp_loss_mask,
+        routed_experts=routed_experts,
+        routed_experts_cp_sharded=routed_experts_cp_sharded,
+        media_token_validity_mask=media_token_validity_mask,
+    )
+
+
+def _make_r3_trace_token_identity(
+    input_ids: torch.Tensor,
+    seq_lengths: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build debug-only ``[batch_idx, token_pos, valid]`` token identities."""
+    batch_size, seq_len = input_ids.shape[:2]
+    batch_idx = torch.arange(
+        batch_size,
+        dtype=torch.int32,
+        device=input_ids.device,
+    ).view(batch_size, 1, 1)
+    token_pos = torch.arange(
+        seq_len,
+        dtype=torch.int32,
+        device=input_ids.device,
+    ).view(1, seq_len, 1)
+    if seq_lengths is None:
+        valid = torch.ones(
+            batch_size,
+            seq_len,
+            1,
+            dtype=torch.int32,
+            device=input_ids.device,
+        )
+    else:
+        valid = (
+            token_pos.expand(batch_size, seq_len, 1)
+            < seq_lengths.to(device=input_ids.device, dtype=torch.int32).view(
+                batch_size,
+                1,
+                1,
+            )
+        ).to(dtype=torch.int32)
+    return torch.cat(
+        (
+            batch_idx.expand(batch_size, seq_len, 1),
+            token_pos.expand(batch_size, seq_len, 1),
+            valid,
+        ),
+        dim=-1,
+    )
+
+
+def _verify_r3_trace_cp_token_alignment(
+    *,
+    source_input_ids: torch.Tensor,
+    source_routed_experts: Optional[torch.Tensor],
+    input_ids_cp_sharded: torch.Tensor,
+    routed_experts_cp_sharded: Optional[torch.Tensor],
+    token_identity_cp_sharded: Optional[torch.Tensor],
+) -> Optional[int]:
+    """Verify debug identities line up with CP-local tokens and routed experts."""
+    if not r3_trace_verify_forward_enabled() or token_identity_cp_sharded is None:
+        return None
+    if source_routed_experts is None or routed_experts_cp_sharded is None:
+        raise RuntimeError(
+            "R3 forward verifier expected routed_experts and token identity tensors "
+            "to be present together."
+        )
+    if token_identity_cp_sharded.shape[-1] != 3:
+        raise RuntimeError(
+            "R3 token identity must have trailing [batch_idx, token_pos, valid] "
+            f"dimension; got {tuple(token_identity_cp_sharded.shape)}"
+        )
+
+    flat_identity = token_identity_cp_sharded.reshape(-1, 3).to(dtype=torch.long)
+    flat_tokens = input_ids_cp_sharded.reshape(-1)
+    flat_routed = routed_experts_cp_sharded.reshape(
+        -1,
+        *routed_experts_cp_sharded.shape[2:],
+    )
+    if (
+        flat_identity.shape[0] != flat_tokens.shape[0]
+        or flat_identity.shape[0] != flat_routed.shape[0]
+    ):
+        raise RuntimeError(
+            "R3 token identity, input_ids, and routed_experts CP slices have "
+            "different token counts: "
+            f"identity={flat_identity.shape[0]} tokens={flat_tokens.shape[0]} "
+            f"routed={flat_routed.shape[0]}"
+        )
+
+    valid_mask = flat_identity[:, 2] == 1
+    checked = int(valid_mask.sum().item())
+    if checked == 0:
+        return 0
+
+    source_rows = flat_identity[valid_mask, 0]
+    source_cols = flat_identity[valid_mask, 1]
+    expected_tokens = source_input_ids[source_rows, source_cols].to(
+        device=flat_tokens.device,
+        dtype=flat_tokens.dtype,
+    )
+    actual_tokens = flat_tokens[valid_mask]
+    if not bool(torch.equal(actual_tokens, expected_tokens)):
+        raise RuntimeError(
+            "R3 CP token identity verifier found input_ids that do not match "
+            "their source [batch_idx, token_pos] identities."
+        )
+
+    routed_source_rows = source_rows.to(device=source_routed_experts.device)
+    routed_source_cols = source_cols.to(device=source_routed_experts.device)
+    expected_routed = source_routed_experts[routed_source_rows, routed_source_cols].to(
+        device=flat_routed.device,
+        dtype=flat_routed.dtype,
+    )
+    actual_routed = flat_routed[valid_mask]
+    if not bool(torch.equal(actual_routed, expected_routed)):
+        raise RuntimeError(
+            "R3 CP token identity verifier found routed_experts that do not match "
+            "their source [batch_idx, token_pos] identities."
+        )
+
+    return checked
+
+
+def _fill_routed_experts_padding(
+    routed_experts: torch.Tensor,
+    seq_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Replace materialized jagged padding with a valid dummy top-k route."""
+    if routed_experts.dim() != 4:
+        raise ValueError(
+            "routed_experts must have shape [batch, seq, num_moe_layers, topk]; "
+            f"got {tuple(routed_experts.shape)}"
+        )
+    if seq_lengths.shape != (routed_experts.shape[0],):
+        raise ValueError(
+            "seq_lengths must have one entry per routed_experts row; "
+            f"got {tuple(seq_lengths.shape)} for batch={routed_experts.shape[0]}"
+        )
+
+    seq_lengths = seq_lengths.to(device=routed_experts.device, dtype=torch.long)
+    seq_positions = torch.arange(
+        routed_experts.shape[1],
+        device=routed_experts.device,
+    ).unsqueeze(0)
+    padding_mask = seq_positions >= seq_lengths.unsqueeze(1)
+    if not bool(padding_mask.any().item()):
+        return routed_experts
+
+    repaired = routed_experts.clone()
+    default_route = torch.arange(
+        routed_experts.shape[-1],
+        dtype=routed_experts.dtype,
+        device=routed_experts.device,
+    ).view(1, 1, 1, routed_experts.shape[-1])
+    default_routes = default_route.expand_as(repaired)
+    repaired[padding_mask] = default_routes[padding_mask]
+    return repaired
+
+
+def process_global_batch(
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    dp_group: torch.distributed.ProcessGroup,
+    *,
+    batch_idx: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Process a global batch and compute normalization factors.
+
+    Args:
+        data: Full dataset to extract a batch from
+        loss_fn: Loss function (used to check loss type for token-level validation)
+        dp_group: Data parallel process group for all-reduce
+        batch_idx: Index of batch to extract
+        batch_size: Size of batch to extract
+
+    Returns:
+        Dictionary containing:
+        - batch: The extracted batch
+        - global_valid_seqs: Number of valid sequences across all ranks
+        - global_valid_toks: Number of valid tokens across all ranks
+    """
+    batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
+
+    assert "sample_mask" in batch, "sample_mask must be present in the data!"
+
+    # Get the normalization factor for the loss
+    local_valid_seqs = torch.sum(batch["sample_mask"])
+
+    if "token_mask" not in batch:
+        local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
+    else:
+        local_valid_toks = torch.sum(
+            batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
+        )
+
+    to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    torch.distributed.all_reduce(to_reduce, group=dp_group)
+    global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+
+    if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
+        assert "token_mask" in batch, (
+            "token_mask must be present in the data when using token-level loss"
+        )
+
+    return {
+        "batch": batch,
+        "global_valid_seqs": global_valid_seqs,
+        "global_valid_toks": global_valid_toks,
+    }
+
+
+def _prepare_vlm_batch_for_megatron(
+    input_ids: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    pad_individual_seqs_to_multiple_of: int,
+    pad_full_seq_to: Optional[int] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    PackedSeqParams,
+    Optional[torch.Tensor],
+    torch.Tensor,
+]:
+    """Prepare a [B, max_seq] batch for a model that does its own packing + CP sharding.
+
+    Used with mbridge VLM wrappers (e.g. Qwen3VL). The model's forward calls
+    preprocess_packed_seqs internally, which re-packs + CP-shards from
+    attention_mask. So NeMo-RL must NOT pre-pack / CP-shard; it only:
+      * pads each sequence (along dim 1) to pad_individual_seqs_to_multiple_of,
+      * builds a bool attention_mask describing real token validity,
+      * builds cu_seqlens_padded describing full (pre-shard) packed layout,
+      * hands everything to the model as [B, max_seq].
+
+    When ``pad_full_seq_to`` is set (PP>1 requires a constant total packed
+    length across microbatches), the last sequence's effective length is
+    extended so ``sum(padded_lens) == pad_full_seq_to``. These extra positions
+    are treated as "valid" by the model (so mbridge's internal packing stays
+    consistent) but should be masked out at the loss layer via token_mask.
+
+    Returns:
+        - input_ids: packed [1, T] view for downstream logprob/loss target slicing
+        - input_ids_cp_sharded: [B, padded_max_seq] for the model forward
+        - attention_mask: [B, padded_max_seq] bool (True for valid tokens)
+        - packed_seq_params: PackedSeqParams(qkv_format="thd", cu_seqlens_*=padded)
+        - cu_seqlens: None (unpadded cu_seqlens unused in this path)
+        - cu_seqlens_padded: [B+1] int32 matching packed_seq_params
+    """
+    batch_size, _ = input_ids.shape
+    device = input_ids.device
+    align = max(1, pad_individual_seqs_to_multiple_of)
+
+    # One CPU-GPU sync per call via .tolist(); per-seq arithmetic runs on CPU
+    # ints (fast) instead of .item() in a loop (which sync'd per seq).
+    if torch.is_tensor(seq_lengths):
+        lengths_list = seq_lengths.tolist()
+    else:
+        lengths_list = list(seq_lengths)
+    padded_lens = [_round_up_to_multiple(L, align) for L in lengths_list]
+
+    # PP>1: force sum(padded_lens) to a fixed value so every microbatch produces
+    # the same decoder-side packed length. We mirror _pack_sequences_for_megatron
+    # by absorbing the deficit into the LAST sequence's effective length. The
+    # extra positions look valid to the model but are zero-ed out at the loss
+    # layer via token_mask (consistent with the non-VLM path).
+    if pad_full_seq_to is not None and batch_size > 0:
+        natural_sum = sum(padded_lens)
+        deficit = pad_full_seq_to - natural_sum
+        assert deficit >= 0, (
+            f"pad_full_seq_to ({pad_full_seq_to}) < natural padded sum "
+            f"({natural_sum}); increase pad_full_seq_to."
+        )
+        assert deficit % align == 0, (
+            f"pad_full_seq_to deficit ({deficit}) must be a multiple of "
+            f"pad_individual_seqs_to_multiple_of ({align})."
+        )
+        if deficit > 0:
+            lengths_list[-1] += deficit
+            padded_lens[-1] += deficit
+
+    padded_max = max(padded_lens) if padded_lens else 0
+
+    # Row-pad input_ids to padded_max so all sequences live in one rectangular tensor.
+    if input_ids.shape[1] < padded_max:
+        pad_amt = padded_max - input_ids.shape[1]
+        input_ids_2d = torch.nn.functional.pad(input_ids, (0, pad_amt), value=0)
+    elif input_ids.shape[1] > padded_max:
+        input_ids_2d = input_ids[:, :padded_max].contiguous()
+    else:
+        input_ids_2d = input_ids
+
+    # Vectorised attention_mask: positions < padded length, broadcast over batch.
+    # We use padded_lens (not raw lengths) so mbridge's preprocess_packed_seqs,
+    # which recomputes seqlens from attention_mask.sum, sees the same packed
+    # total as our cu_seqlens_padded. Otherwise a mismatch between raw length
+    # and align-padded length leads to GDN's cu_seqlens vs total_seq_len check
+    # firing. Tokens in the padded tail are masked out at the loss layer.
+    padded_lens_tensor = torch.tensor(padded_lens, dtype=torch.long, device=device)
+    positions = torch.arange(padded_max, device=device)
+    attention_mask = positions.unsqueeze(0) < padded_lens_tensor.unsqueeze(1)
+
+    # Build cu_seqlens on CPU then H2D once.
+    cu_vals = [0]
+    for p in padded_lens:
+        cu_vals.append(cu_vals[-1] + p)
+    cu_seqlens_padded = torch.tensor(cu_vals, dtype=torch.int32, device=device)
+
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=padded_max,
+        max_seqlen_kv=padded_max,
+    )
+
+    # Packed (unsharded) view for downstream logprob / loss code that slices
+    # per-sequence targets via cu_seqlens_padded.
+    packed_segments = [input_ids_2d[i, :p] for i, p in enumerate(padded_lens)]
+    packed_input_ids = (
+        torch.cat(packed_segments, dim=0).unsqueeze(0)
+        if packed_segments
+        else input_ids_2d.new_zeros((1, 0))
+    )
+
+    # input_ids_cp_sharded keeps the [B, max_seq] layout: the model (mbridge
+    # Qwen3VL) runs its own preprocess_packed_seqs to pack + CP-shard.
+    # input_ids is the packed (but not CP-sharded) view for target/logprob
+    # post-processing, which uses cu_seqlens_padded to slice per sequence.
+    return (
+        packed_input_ids,
+        input_ids_2d,
+        attention_mask,
+        packed_seq_params,
+        None,
+        cu_seqlens_padded,
+    )
+
+
+def _pack_sequences_for_megatron(
+    input_ids: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    pad_individual_seqs_to_multiple_of: int = 1,
+    pad_packed_seq_to_multiple_of: int = 1,
+    pad_packed_seq_to: Optional[int] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+) -> tuple[torch.Tensor, PackedSeqParams, torch.Tensor, Optional[torch.Tensor]]:
+    """Pack sequences for Megatron model processing with optional context parallelism.
+
+    Args:
+        input_ids: Input token IDs [batch_size, seq_length]
+        seq_lengths: Actual sequence lengths for each sample [batch_size]
+        pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
+        pad_packed_seq_to_multiple_of: Pad packed sequences to a multiple of this value
+        pad_packed_seq_to: Pad packed sequences to this value (before CP)
+            - The three parameters above can be calculated using _get_pack_sequence_parameters_for_megatron, we do not recommend users to set these parameters manually.
+        cp_size: Context parallelism size
+
+    Returns:
+        Tuple of:
+        - packed_input_ids: Packed input tensor [1, T]
+        - input_ids_cp_sharded: Sharded input tensor [cp_size, T // cp_size]
+        - packed_seq_params: PackedSeqParams object
+        - cu_seqlens: Cumulative sequence lengths
+        - cu_seqlens_padded: Padded cumulative sequence lengths
+    """
+    batch_size = input_ids.shape[0]
+
+    # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
+    needs_padding = (
+        pad_individual_seqs_to_multiple_of > 1
+        or pad_packed_seq_to_multiple_of > 1
+        or pad_packed_seq_to is not None
+    )
+
+    cu_seqlens = [0]
+    cu_seqlens_padded = [0] if needs_padding else None
+    valid_tokens = []
+
+    if pad_packed_seq_to is not None:
+        assert pad_packed_seq_to % pad_packed_seq_to_multiple_of == 0, (
+            f"pad_packed_seq_to ({pad_packed_seq_to}) is not a multiple of pad_packed_seq_to_multiple_of ({pad_packed_seq_to_multiple_of})."
+        )
+
+    pad_factor = pad_individual_seqs_to_multiple_of
+
+    for b in range(batch_size):
+        seq_len = (
+            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
+        )
+
+        # Extract valid tokens for this sequence
+        valid_tokens.append(input_ids[b, :seq_len])
+
+        # Update cumulative sequence lengths
+        cu_seqlens.append(cu_seqlens[-1] + seq_len)
+
+        # For context parallelism, track padded sequence lengths
+        if needs_padding:
+            # Pad sequence length to multiple of (cp_size * 2)
+            padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+            cu_seqlens_padded.append(cu_seqlens_padded[-1] + padded_seq_len)
+
+    # Convert to tensors
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=input_ids.device)
+    if needs_padding:
+        cu_seqlens_padded = torch.tensor(
+            cu_seqlens_padded, dtype=torch.int32, device=input_ids.device
+        )
+        if pad_packed_seq_to is not None:
+            cu_seqlens_padded[-1] = pad_packed_seq_to
+        elif pad_packed_seq_to_multiple_of > 1:
+            cu_seqlens_padded[-1] = _round_up_to_multiple(
+                cu_seqlens_padded[-1], pad_packed_seq_to_multiple_of
+            )
+
+    # Calculate max sequence length (padded if using CP)
+    if needs_padding:
+        seq_lens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        max_seqlen = seq_lens_padded.max().item()
+    else:
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+    # Concatenate all valid tokens
+    # If using individual padding, we need to pad individual sequences
+    # CP will always need padding (of at least cp_size * 2)
+    running_seq_len = 0
+    if pad_factor > 1:
+        all_input_ids = []
+        padded_tokens = []
+        for b in range(batch_size):
+            seq_len = (
+                seq_lengths[b].item()
+                if torch.is_tensor(seq_lengths[b])
+                else seq_lengths[b]
+            )
+            # if last element, pad to the max sequence length
+            if b == batch_size - 1 and needs_padding:
+                if pad_packed_seq_to is not None:
+                    padded_seq_len = pad_packed_seq_to - running_seq_len
+                elif pad_packed_seq_to_multiple_of > 1:
+                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+                    padded_seq_len = (
+                        _round_up_to_multiple(
+                            running_seq_len + padded_seq_len,
+                            pad_packed_seq_to_multiple_of,
+                        )
+                        - running_seq_len
+                    )
+                else:
+                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+            else:
+                padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+
+            running_seq_len += padded_seq_len
+
+            # Pad this sequence to the required length
+            seq_tokens = input_ids[b, :seq_len]
+            if padded_seq_len > seq_len:
+                # Pad with zeros (or use a padding token if available)
+                seq_tokens = torch.nn.functional.pad(
+                    seq_tokens, (0, padded_seq_len - seq_len), value=0
+                )
+            all_input_ids.append(seq_tokens)
+
+            if cp_size > 1:
+                seq_tokens = _get_tokens_on_this_cp_rank(
+                    seq_tokens, cp_rank, cp_size, seq_dim=0
+                )
+
+            padded_tokens.append(seq_tokens)
+
+        # Concatenate all padded tokens
+        # For 'thd' format, the shape should be [1, T] where T is total tokens
+        packed_input_ids = torch.cat(padded_tokens, dim=0).unsqueeze(0)
+        all_input_ids = torch.cat(all_input_ids, dim=0).unsqueeze(0)
+    else:
+        # No individual padding, just concatenate valid tokens
+        # For 'thd' format, the shape should be [1, T] where T is total tokens
+        packed_input_ids = torch.cat(valid_tokens, dim=0).unsqueeze(0)
+        all_input_ids = packed_input_ids
+        if needs_padding:
+            if pad_packed_seq_to is not None:
+                pad_len = pad_packed_seq_to - packed_input_ids.shape[1]
+            elif pad_packed_seq_to_multiple_of > 1:
+                current_seq_len = packed_input_ids.shape[1]
+                pad_this_seq_to = _round_up_to_multiple(
+                    current_seq_len, pad_packed_seq_to_multiple_of
+                )
+                pad_len = pad_this_seq_to - current_seq_len
+            else:
+                pad_len = 0
+            if pad_len > 0:
+                packed_input_ids = torch.nn.functional.pad(
+                    packed_input_ids, (0, pad_len), value=0
+                )
+                all_input_ids = torch.nn.functional.pad(
+                    all_input_ids, (0, pad_len), value=0
+                )
+
+    if cu_seqlens_padded is None:
+        cu_seqlens_padded = cu_seqlens.clone()
+
+    # total_tokens is required for PackedSeqParams.__post_init__ to build
+    # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen),
+        max_seqlen_kv=int(max_seqlen),
+        qkv_format="thd",
+        total_tokens=packed_input_ids.shape[1],
+    )
+
+    return (
+        all_input_ids.contiguous(),
+        packed_input_ids.contiguous(),
+        packed_seq_params,
+        cu_seqlens,
+        cu_seqlens_padded,
+    )
+
+
+def _shard_routed_experts_for_cp(
+    routed_experts: Optional[torch.Tensor],  # [B, S, L, K] or None
+    token_identity: Optional[
+        torch.Tensor
+    ],  # [B, S, 3] or None (R3 forward verifier, debug)
+    seq_lengths: torch.Tensor,  # [B]
+    cu_seqlens: torch.Tensor,  # [B+1] valid cumulative (from _pack_sequences_for_megatron)
+    cu_seqlens_padded: Optional[
+        torch.Tensor
+    ],  # [B+1] padded cumulative (None when no padding)
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """CP-shard routed_experts / token_identity onto main's per-seq packed layout.
+
+    Mirrors _pack_sequences_for_megatron's per-sequence zigzag for input_ids: each
+    sequence is padded to its padded length (from cu_seqlens_padded, so boundaries are
+    IDENTICAL to input_ids) then sharded with _get_tokens_on_this_cp_rank(seq_dim=0).
+    routed_experts pad rows use arange(topk) (a valid top-k route; mcore
+    _validate_replay_tensor rejects 0/dup/-1). token_identity pads with 0 (verifier skips).
+    No roll (these are per-token, not next-token targets).
+    Returns (routed_packed, routed_cp_sharded, identity_packed, identity_cp_sharded),
+    each [1, T(/cp), ...] or None.
+
+    This additive helper is the only routed_experts-specific CP code path.
+    """
+    batch_size = seq_lengths.shape[0]
+
+    all_routed = [] if routed_experts is not None else None
+    cp_routed = [] if routed_experts is not None else None
+    all_identity = [] if token_identity is not None else None
+    cp_identity = [] if token_identity is not None else None
+    topk = routed_experts.shape[-1] if routed_experts is not None else None
+
+    for b in range(batch_size):
+        seq_len = int(seq_lengths[b])
+        if cu_seqlens_padded is not None:
+            padded_len = int(cu_seqlens_padded[b + 1] - cu_seqlens_padded[b])
+        else:
+            padded_len = int(cu_seqlens[b + 1] - cu_seqlens[b])
+
+        if routed_experts is not None:
+            # [seq_len, num_moe_layers, topk] padded to the SAME padded_len boundary as
+            # input_ids so the routes ride the same per-seq zigzag.
+            re = routed_experts[b, :seq_len]
+            if padded_len > seq_len:
+                # mcore _validate_replay_tensor rejects zero/duplicate/-1 routes,
+                # so pad each row with a valid top-k route arange(topk).
+                default_route = torch.arange(
+                    topk,
+                    dtype=re.dtype,
+                    device=re.device,
+                ).view(1, 1, topk)
+                pad_rows = default_route.expand(
+                    padded_len - seq_len,
+                    re.shape[1],
+                    topk,
+                )
+                re = torch.cat((re, pad_rows), dim=0)
+            all_routed.append(re)
+            re_cp = (
+                _get_tokens_on_this_cp_rank(re, cp_rank, cp_size, seq_dim=0)
+                if cp_size > 1
+                else re
+            )
+            cp_routed.append(re_cp)
+
+        if token_identity is not None:
+            # [seq_len, 3] padded to the SAME padded_len boundary
+            id = token_identity[b, :seq_len]
+            if padded_len > seq_len:
+                # pad rows with valid=0 so the verifier skips them
+                id = torch.nn.functional.pad(
+                    id,
+                    (0, 0, 0, padded_len - seq_len),
+                    value=0,
+                )
+            all_identity.append(id)
+            id_cp = (
+                _get_tokens_on_this_cp_rank(id, cp_rank, cp_size, seq_dim=0)
+                if cp_size > 1
+                else id
+            )
+            cp_identity.append(id_cp)
+
+    routed_packed = (
+        torch.cat(all_routed, dim=0).unsqueeze(0)
+        if routed_experts is not None
+        else None
+    )
+    routed_cp_sharded = (
+        torch.cat(cp_routed, dim=0).unsqueeze(0) if routed_experts is not None else None
+    )
+    identity_packed = (
+        torch.cat(all_identity, dim=0).unsqueeze(0)
+        if token_identity is not None
+        else None
+    )
+    identity_cp_sharded = (
+        torch.cat(cp_identity, dim=0).unsqueeze(0)
+        if token_identity is not None
+        else None
+    )
+    return routed_packed, routed_cp_sharded, identity_packed, identity_cp_sharded
+
+
+def _get_pack_sequence_parameters_for_megatron(
+    megatron_cfg: dict,
+    pad_individual_seqs_to_multiple_of: int,
+    max_seq_len_in_batch: int,
+):
+    """Get pack sequence parameters for Megatron model processing with optional context parallelism.
+
+    Args:
+        megatron_cfg: Megatron configuration
+        pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
+        max_seq_len_in_batch: Maximum sequence length in batch
+
+    Returns:
+        Tuple of:
+        - pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
+        - pad_packed_seq_to_multiple_of: Pad packed sequences to a multiple of this value
+        - pad_packed_seq_to: Pad packed sequences to this value (before CP)
+    """
+    tp_size = megatron_cfg["tensor_model_parallel_size"]
+    sp = megatron_cfg["sequence_parallel"]
+    pp_size = megatron_cfg["pipeline_model_parallel_size"]
+    cp_size = megatron_cfg["context_parallel_size"]
+    fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
+    use_fp8 = fp8_cfg.get("enabled", False)
+
+    # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
+    minimum_pad_factor = 1
+    if cp_size > 1:
+        minimum_pad_factor *= cp_size * 2
+    if tp_size > 1 and sp:
+        minimum_pad_factor *= tp_size
+    assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
+        f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
+        f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
+        f"    - If CP is enabled, the minimum pad factor is `cp_size * 2`.\n"
+        f"    - If TP+SP is enabled, the minimum pad factor is `tp_size`.\n"
+        f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
+    )
+
+    # packed sequence length, after sharding to TP and CP domains, needs to be divisible
+    # by a recipe-dependent divisor:
+    #   blockwise FP8 : 128  (cublas block size)
+    #   MXFP8         :  32  (MXFP8 block size)
+    #   other FP8     :  16
+    #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
+    #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
+    # When multiple constraints apply, take the max (128 is a multiple of 32/16).
+    divisor = 1
+    if use_fp8:
+        if fp8_cfg["fp8_recipe"] == "blockwise":
+            divisor = max(divisor, 128)
+        elif fp8_cfg["fp8_recipe"] == "mxfp8":
+            divisor = max(divisor, 32)
+        else:
+            divisor = max(divisor, 16)
+    if (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        divisor = max(divisor, 128)
+    if divisor > 1:
+        pad_packed_seq_to_multiple_of = divisor
+        if cp_size > 1:
+            pad_packed_seq_to_multiple_of *= cp_size * 2
+        if tp_size > 1 and sp:
+            pad_packed_seq_to_multiple_of *= tp_size
+    else:
+        pad_packed_seq_to_multiple_of = 1
+
+    # when PP is used, all sequences must have the same length, so we need to pad the packed sequence to the max sequence length in the batch.
+    if pp_size > 1:
+        pad_packed_seq_to = max_seq_len_in_batch
+    else:
+        pad_packed_seq_to = None
+
+    # make sure the pad_packed_seq_to is a multiple of the pad_packed_seq_to_multiple_of
+    if pad_packed_seq_to is not None:
+        pad_packed_seq_to = _round_up_to_multiple(
+            pad_packed_seq_to, pad_packed_seq_to_multiple_of
+        )
+
+    return (
+        pad_individual_seqs_to_multiple_of,
+        pad_packed_seq_to_multiple_of,
+        pad_packed_seq_to,
+    )
+
+
+def _unpack_sequences_from_megatron(
+    output_tensor: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor],
+    original_batch_size: int,
+    original_seq_length: int,
+) -> torch.Tensor:
+    """Unpack sequences from Megatron output format.
+
+    Args:
+        output_tensor: Packed output tensor [1, T, vocab_size]
+        seq_lengths: Actual sequence lengths for each sample
+        cu_seqlens: Cumulative sequence lengths
+        cu_seqlens_padded: Padded cumulative sequence lengths (if CP was used)
+        original_batch_size: Original batch size
+        original_seq_length: Original maximum sequence length
+
+    Returns:
+        Unpacked output tensor [batch_size, seq_length, vocab_size]
+    """
+    # Remove the batch dimension to get [T, vocab_size]
+    output_tensor = output_tensor.squeeze(0)
+
+    # Create a padded output tensor with original shape
+    vocab_size = output_tensor.shape[-1]
+    unpacked_output = torch.zeros(
+        (original_batch_size, original_seq_length, vocab_size),
+        dtype=output_tensor.dtype,
+        device=output_tensor.device,
+    )
+
+    # Get context parallel size to determine which cu_seqlens to use
+    cp_size = get_context_parallel_world_size()
+
+    # Fill in the unpacked output tensor with valid tokens
+    for b in range(original_batch_size):
+        # Get actual sequence length for this sample
+        seq_len = (
+            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
+        )
+
+        if cp_size > 1 and cu_seqlens_padded is not None:
+            # When using CP, we need to account for padding
+            # Calculate the padded sequence boundaries
+            pad_factor = cp_size * 2
+            padded_seq_len = ((seq_len + pad_factor - 1) // pad_factor) * pad_factor
+            start_idx = cu_seqlens_padded[b].item()
+
+            # Only copy the valid tokens (not the padding)
+            unpacked_output[b, :seq_len] = output_tensor[
+                start_idx : start_idx + seq_len
+            ]
+        else:
+            # No CP, use regular cu_seqlens
+            start_idx = cu_seqlens[b].item()
+            end_idx = cu_seqlens[b + 1].item()
+
+            # Copy the valid tokens to the unpacked tensor
+            unpacked_output[b, :seq_len] = output_tensor[start_idx:end_idx]
+
+    return unpacked_output
+
+
+def get_and_validate_seqlen(data: BatchedDataDict[Any]):
+    # dim 1 is always assumed to be the sequence dim, sanity check this here
+    sequence_dim = 1
+    seq_dim_size = data["input_ids"].shape[sequence_dim]
+    for k, v in data.items():
+        if torch.is_tensor(v) and len(v.shape) > 1:
+            assert v.shape[sequence_dim] == seq_dim_size, (
+                f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape} for key {k}"
+            )
+    return sequence_dim, seq_dim_size

@@ -1,0 +1,3711 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import os
+import tempfile
+import threading
+import time
+import unittest.mock as mock
+from types import SimpleNamespace
+
+import pytest
+import ray
+import torch
+
+# Set up Ray temp directory before any Ray operations
+# Try multiple approaches to ensure Ray uses a writable directory
+_temp_dir = tempfile.mkdtemp(prefix="ray_async_test_")
+os.environ["RAY_TEMP_DIR"] = _temp_dir
+os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
+os.environ["TMPDIR"] = _temp_dir  # System temp dir
+
+import nemo_rl.algorithms.async_utils.trajectory_collector as trajectory_collector_mod
+from nemo_rl.algorithms.async_utils import (
+    AsyncTrajectoryCollector,
+    ReplayBuffer,
+)
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
+from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    _stamped_task_indices,
+    _unanimous_task_index,
+)
+from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+    GRPOConfig,
+    MasterConfig,
+    _startup_pipeline_ready,
+    add_grpo_token_loss_masks_and_generation_logprobs,
+    extract_initial_prompt_messages,
+)
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.interfaces import (
+    EnvironmentInterface,
+    EnvironmentReturn,
+)
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    PENDING_PROMPTS_KEY,
+    RETAINED_TASK_INDICES_KEY,
+    TARGET_WEIGHT_VERSION_KEY,
+)
+from nemo_rl.experience.rollouts import EffortLevelsConfig
+
+
+@ray.remote(num_cpus=0)
+class MockEnvironment(EnvironmentInterface):
+    """Mock environment for testing async utilities."""
+
+    def __init__(self, rewards: list[float]):
+        self.rewards = rewards
+        self._calls = 0
+
+    def step(
+        self, messages: list[LLMMessageLogType], env_info: list[dict]
+    ) -> EnvironmentReturn:
+        self._calls += 1
+        return (
+            [{"role": "environment", "content": "observation"}] * len(messages),
+            [{}] * len(messages),
+            [[]] * len(messages),
+            self.rewards,
+            [True] * len(messages),
+            [None] * len(messages),
+        )
+
+    def get_calls(self):
+        return self._calls
+
+    def reset_calls(self):
+        self._calls = 0
+        return True
+
+    def global_post_process_and_metrics(
+        self, batch: BatchedDataDict
+    ) -> tuple[BatchedDataDict, dict]:
+        return batch, {}
+
+
+class MockGenerationInterface:
+    """Mock generation interface for testing."""
+
+    def __init__(self):
+        self.prepare_calls = 0
+        self.finish_calls = 0
+
+    def prepare_for_generation(self, **kwargs):
+        self.prepare_calls += 1
+
+    def finish_generation(self):
+        self.finish_calls += 1
+
+
+class TestReplayBufferImplCheckpointing:
+    """Direct implementation tests for checkpoint coverage.
+
+    Ray actor execution is not reliably attributed to source coverage, so these
+    tests cover the checkpoint/restore helpers on the local implementation class.
+    """
+
+    def _state(
+        self,
+        trajectory_versions: list[int],
+        target_weight_versions: list[int],
+        last_target_weight_already_generated: int,
+        max_size: int = 10,
+    ) -> dict:
+        return {
+            "trajectories": [
+                {"batch": {"data": f"traj_{idx}"}, "rollout_metrics": {}}
+                for idx in range(len(trajectory_versions))
+            ],
+            "trajectory_versions": trajectory_versions,
+            "target_weight_versions": target_weight_versions,
+            "last_target_weight_already_generated": (
+                last_target_weight_already_generated
+            ),
+            "max_size": max_size,
+        }
+
+    def test_local_restore_prepares_current_step_for_gap_fill(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        state = self._state(
+            trajectory_versions=[0, 1, 1, 2],
+            target_weight_versions=[1, 2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 1, 2]
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2, 3]
+        assert buffer.get_last_target_weight_already_generated() == 1
+        assert buffer.has_complete_batch(2, 2)
+        assert not buffer.has_complete_batch(3, 2)
+        assert buffer.get_trajectories_needed(2, 2) == 0
+        assert buffer.get_trajectories_needed(3, 2) == 1
+
+    @pytest.mark.parametrize(
+        ("drop_incomplete_targets_on_restore", "expected_targets", "expected_needed"),
+        [
+            (True, [2, 2], 2),
+            (False, [2, 2, 3], 1),
+        ],
+    )
+    def test_local_restore_can_drop_incomplete_frontier(
+        self,
+        drop_incomplete_targets_on_restore,
+        expected_targets,
+        expected_needed,
+    ):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
+        )
+        state = self._state(
+            trajectory_versions=[1, 1, 2],
+            target_weight_versions=[2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
+        assert buffer.get_trajectories_needed(3, 2) == expected_needed
+
+    def test_local_restore_empty_state_resets_generation_watermark(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        state = self._state(
+            trajectory_versions=[],
+            target_weight_versions=[],
+            last_target_weight_already_generated=7,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_last_target_weight_already_generated() == 4
+        assert buffer.get_trajectories_needed(5, 2) == 2
+
+    def test_local_restore_removes_stale_trajectories(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        state = self._state(
+            trajectory_versions=[0, 1, 4],
+            target_weight_versions=[5, 5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [4]
+        assert buffer.get_debug_info()["target_weight_versions"] == [5]
+        assert not buffer.has_complete_batch(5, 2)
+        assert buffer.get_trajectories_needed(5, 2) == 1
+
+    @pytest.mark.parametrize(
+        ("drop_incomplete_targets_on_restore", "expected_targets", "expected_needed"),
+        [
+            (True, [], 2),
+            (False, [5], 1),
+        ],
+    )
+    def test_local_restore_drops_target_made_incomplete_by_stale_filter(
+        self,
+        drop_incomplete_targets_on_restore,
+        expected_targets,
+        expected_needed,
+    ):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=drop_incomplete_targets_on_restore,
+        )
+        state = self._state(
+            trajectory_versions=[4, 1],
+            target_weight_versions=[5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
+        assert buffer.size() == len(expected_targets)
+        assert buffer.get_trajectories_needed(5, 2) == expected_needed
+
+    def test_local_restore_truncates_after_resume_cleanup(self):
+        buffer = ReplayBufferImpl(max_size=2, drop_incomplete_targets_on_restore=False)
+        state = self._state(
+            trajectory_versions=[0, 1, 2, 3],
+            target_weight_versions=[1, 2, 3, 4],
+            last_target_weight_already_generated=4,
+            max_size=4,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=1,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 2]
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 3]
+
+    def test_local_restore_without_current_step_rechecks_after_stale_removal(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        state = self._state(
+            trajectory_versions=[0, 4, 4],
+            target_weight_versions=[5, 5, 6],
+            last_target_weight_already_generated=6,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            max_age_steps=1,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_last_target_weight_already_generated() == -1
+
+    def test_local_sample_evicts_stale_restored_trajectories(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        assert (
+            buffer.add(
+                {"batch": {"data": "stale"}, "rollout_metrics": {}},
+                weight_version=0,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+        assert (
+            buffer.add(
+                {"batch": {"data": "valid"}, "rollout_metrics": {}},
+                weight_version=4,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+
+        sample_result = buffer.sample(
+            num_prompt_groups=1,
+            current_weight_version=5,
+            max_age_steps=1,
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "valid"
+        assert buffer.size() == 0
+
+    def test_local_debug_info_reports_starvation_diagnostics(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        assert (
+            buffer.add(
+                {
+                    "batch": {"data": "a"},
+                    "rollout_metrics": {
+                        "trajectory_duration_s": 10.0,
+                        "max_gen_tokens_per_turn/max": 100,
+                        "turns_per_sample/max": 3.0,
+                    },
+                },
+                weight_version=0,
+                target_weight_version=1,
+            )
+            == "success"
+        )
+        assert (
+            buffer.add(
+                {
+                    "batch": {"data": "b"},
+                    "rollout_metrics": {
+                        "trajectory_duration_s": 20.0,
+                        "max_gen_tokens_per_turn": 200,
+                        "turns_per_sample/mean": 4.0,
+                    },
+                },
+                weight_version=0,
+                target_weight_version=1,
+            )
+            == "success"
+        )
+
+        diagnostics = buffer.get_debug_info()["starvation_diagnostics"]
+
+        duration = diagnostics["trajectory_duration_s"]
+        assert duration["mean"] == 15.0
+        assert duration["median"] == 15.0
+        assert duration["max"] == 20.0
+        assert duration["p95"] == 20.0
+
+        gen = diagnostics["max_gen_tokens_per_turn_in_buffer"]
+        assert gen["mean"] == 150.0
+        assert gen["median"] == 150.0
+        assert gen["max"] == 200
+        assert gen["p95"] == 200.0
+
+        turns = diagnostics["turns_per_sample_in_buffer"]
+        assert turns["mean"] == 3.5
+        assert turns["median"] == 3.5
+        assert turns["max"] == 4.0
+        assert turns["p95"] == 4.0
+        assert diagnostics["num_trajectories_sampled"] == 2
+
+    def test_local_load_state_dict_validates_checkpoint_shape(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+
+        with pytest.raises(ValueError, match="Checkpoint missing required keys"):
+            buffer.load_state_dict(
+                {
+                    "trajectories": [],
+                    "trajectory_versions": [],
+                }
+            )
+
+        with pytest.raises(ValueError, match="inconsistent replay buffer lengths"):
+            buffer.load_state_dict(
+                {
+                    "trajectories": [{"batch": {"data": "test"}}],
+                    "trajectory_versions": [0, 1],
+                    "target_weight_versions": [1],
+                    "last_target_weight_already_generated": 1,
+                }
+            )
+
+    def test_local_actor_side_checkpoint_preserves_compact_media_and_resume_metadata(
+        self, tmp_path
+    ):
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        compact_media_row = PackedTensor(
+            torch.tensor([[1.0, 2.0]]), dim_to_pack=0
+        ).enable_deduplication()
+        compact_media = PackedTensor.concat([compact_media_row] * 2)
+        source = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        assert (
+            source.add(
+                {
+                    "batch": {"pixel_values": compact_media},
+                    "rollout_metrics": {},
+                    "_ng_task_index": 7,
+                },
+                weight_version=4,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+        assert (
+            source.add(
+                {
+                    "batch": {"data": "stale"},
+                    "rollout_metrics": {},
+                    "_ng_task_index": 41,
+                },
+                weight_version=0,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+
+        assert source.save_to_path(str(checkpoint_path)) == 2
+
+        restored = ReplayBufferImpl(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        metadata = restored.load_from_path(
+            str(checkpoint_path),
+            num_prompts_per_step=1,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        # Metadata accounts for every saved task index, including trajectories
+        # discarded during resume cleanup, so an index is never reused. The
+        # retained list reflects only post-filter survivors, so a frontier
+        # resume regenerates the dropped stale group instead of skipping it.
+        assert metadata == {
+            "num_trajectories": 2,
+            "next_ng_task_index": 42,
+            RETAINED_TASK_INDICES_KEY: [7],
+        }
+        assert restored.size() == 1
+        restored_state = restored.state_dict()
+        restored_media = restored_state["trajectories"][0]["batch"]["pixel_values"]
+        assert len(restored_media) == 2
+        assert len(restored_media.tensors) == 1
+        torch.testing.assert_close(
+            restored_media.as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
+
+
+def test_local_consumed_target_needs_no_trajectories():
+    """A target the trainer already sampled must never look short to the collector.
+
+    ``_calculate_target_weights`` includes the current weight version, so the
+    collector can read ``last_target_weight_already_generated`` just before the
+    trainer's ``sample()`` and ask for that target's shortfall just after it. The
+    buffer answers that race atomically with 0 instead of a full regeneration.
+    """
+    buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+    for idx in range(2):
+        buffer.add(
+            {"batch": {"data": f"traj_{idx}"}, "rollout_metrics": {}},
+            weight_version=3,
+            target_weight_version=3,
+        )
+    assert buffer.get_trajectories_needed(3, 2, 2) == 0
+
+    sampled = buffer.sample(num_prompt_groups=2, current_weight_version=3, max_age_steps=2)
+
+    assert sampled is not None and len(sampled["trajectories"]) == 2
+    assert buffer.get_last_target_weight_already_generated() == 3
+    assert buffer.size() == 0
+    # Consumed targets: nothing to gap-fill even though the buffer is now empty.
+    assert buffer.get_trajectories_needed(3, 2, 2) == 0
+    assert buffer.get_trajectories_needed(2, 2, 2) == 0
+    # The next target is still short by a full step.
+    assert buffer.get_trajectories_needed(4, 2, 2) == 2
+    assert not buffer.has_complete_batch(4, 2, 2)
+
+
+class TestReplayBuffer:
+    """Test cases for ReplayBuffer."""
+
+    def test_replay_buffer_initialization(self):
+        """Test ReplayBuffer initialization."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        size = ray.get(buffer.size.remote())
+        assert size == 0
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["total_trajectories"] == 0
+        assert debug_info["max_size"] == 10
+        assert debug_info["trajectory_versions"] == []
+        assert debug_info["target_weight_versions"] == []
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_push_and_size(self):
+        """Test pushing trajectories to buffer."""
+        buffer = ReplayBuffer.remote(
+            max_size=3, drop_incomplete_targets_on_restore=False
+        )
+
+        # Create mock trajectories
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        # Push trajectories
+        status1 = ray.get(
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+        )
+        assert status1 == "success"
+
+        status2 = ray.get(
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
+        )
+        assert status2 == "success"
+
+        # Check size
+        size = ray.get(buffer.size.remote())
+        assert size == 2
+
+        # Check debug info
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["total_trajectories"] == 2
+        assert debug_info["trajectory_versions"] == [0, 1]
+        assert debug_info["target_weight_versions"] == [1, 2]
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_max_size_limit(self):
+        """Test that buffer respects max size limit."""
+        buffer = ReplayBuffer.remote(
+            max_size=2, drop_incomplete_targets_on_restore=False
+        )
+
+        # Fill buffer to capacity
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+        trajectory3 = {"batch": {"data": "test3"}, "rollout_metrics": {"reward": 3.0}}
+
+        # Push first two trajectories
+        status1 = ray.get(
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+        )
+        status2 = ray.get(
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
+        )
+        assert status1 == "success"
+        assert status2 == "success"
+
+        # Try to push third trajectory (should return "full")
+        status3 = ray.get(
+            buffer.add.remote(trajectory3, weight_version=2, target_weight_version=3)
+        )
+        assert status3 == "full"
+
+        # Size should still be 2
+        size = ray.get(buffer.size.remote())
+        assert size == 2
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_sampling_basic(self):
+        """Test basic trajectory sampling."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        # Push trajectories with different weight versions
+        trajectories = []
+        for i in range(3):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            trajectories.append(trajectory)
+            ray.get(
+                buffer.add.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        # Sample trajectories intended for current step 2
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=2,
+                max_age_steps=2,
+            )
+        )
+
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert "avg_trajectory_age" in sample_result
+
+        # The trajectory should be intended for step 2 (target_weight_version=2)
+        # But we pushed with target_weight_version=i+1, so trajectory at i=1 has target=2
+        sampled_trajectory = sample_result["trajectories"][0]
+        assert sampled_trajectory["batch"]["data"] == "test1"
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 2
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_sampling_insufficient_trajectories(self):
+        """Test sampling when insufficient trajectories are available."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        # Push only one trajectory
+        trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
+        ray.get(
+            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
+        )
+
+        # Try to sample more trajectories than available for current step
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,  # Request 2 but only 1 available
+                current_weight_version=1,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is None  # Should return None when insufficient
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_watermark_advances_only_after_consumption(self):
+        """Test buffering alone does not mark a target as consumed."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {}}
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=4, target_weight_version=5)
+        )
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=5,
+                max_age_steps=1,
+            )
+        )
+        assert sample_result is None
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=4, target_weight_version=5)
+        )
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=5,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 5
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_starvation_diagnostics_nemo_gym_turn_keys(self):
+        """NeMo Gym uses turns_per_sample/* in rollout_metrics; diagnostics must read them."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        t1 = {
+            "batch": {"data": "a"},
+            "rollout_metrics": {
+                "trajectory_duration_s": 10.0,
+                "max_gen_tokens_per_turn/max": 100,
+                "turns_per_sample/max": 3.0,
+                "turns_per_sample/mean": 2.5,
+            },
+        }
+        t2 = {
+            "batch": {"data": "b"},
+            "rollout_metrics": {
+                "trajectory_duration_s": 20.0,
+                "max_gen_tokens_per_turn/max": 200,
+                "turns_per_sample/max": 5.0,
+                "turns_per_sample/mean": 4.0,
+            },
+        }
+        ray.get(buffer.add.remote(t1, weight_version=0, target_weight_version=1))
+        ray.get(buffer.add.remote(t2, weight_version=0, target_weight_version=1))
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        diag = debug_info["starvation_diagnostics"]["turns_per_sample_in_buffer"]
+        assert diag["max"] == 5.0
+        assert diag["mean"] == 4.0
+        assert diag["median"] == 4.0
+        assert diag["p95"] == 5.0
+        gen = debug_info["starvation_diagnostics"]["max_gen_tokens_per_turn_in_buffer"]
+        assert gen["max"] == 200
+        assert gen["mean"] == 150
+        assert gen["median"] == 150
+        assert gen["p95"] == 200
+        ray.kill(buffer)
+
+    def test_replay_buffer_age_filtering(self):
+        """Test that old trajectories are evicted."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        # Push trajectories with different ages
+        old_trajectory = {"batch": {"data": "old"}, "rollout_metrics": {"reward": 1.0}}
+        recent_trajectory = {
+            "batch": {"data": "recent"},
+            "rollout_metrics": {"reward": 2.0},
+        }
+
+        ray.get(
+            buffer.add.remote(old_trajectory, weight_version=0, target_weight_version=1)
+        )
+        ray.get(
+            buffer.add.remote(
+                recent_trajectory, weight_version=2, target_weight_version=3
+            )
+        )
+
+        assert ray.get(buffer.size.remote()) == 2
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=3,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "recent"
+        assert ray.get(buffer.size.remote()) == 0
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_target_weight_matching(self):
+        """Test that sampling only returns trajectories intended for current step."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        # Push trajectories intended for different target steps
+        trajectory1 = {
+            "batch": {"data": "for_step_1"},
+            "rollout_metrics": {"reward": 1.0},
+        }
+        trajectory2 = {
+            "batch": {"data": "for_step_2"},
+            "rollout_metrics": {"reward": 2.0},
+        }
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+        )
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
+        )
+
+        # Sample for current step 1 - should only get trajectory intended for step 1
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=1,
+                max_age_steps=2,
+            )
+        )
+
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "for_step_1"
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_get_existing_target_weights(self):
+        """Test getting existing target weight versions."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        # Initially empty
+        existing_weights = ray.get(buffer.get_existing_target_weights.remote())
+        assert existing_weights == set()
+
+        # Push trajectories with different target weights
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+        )
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=3)
+        )
+
+        existing_weights = ray.get(buffer.get_existing_target_weights.remote())
+        assert existing_weights == {1, 3}
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_clear(self):
+        """Test clearing the buffer."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        # Push some trajectories
+        trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
+        ray.get(
+            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
+        )
+
+        # Verify buffer has content
+        size = ray.get(buffer.size.remote())
+        assert size == 1
+
+        # Clear buffer
+        ray.get(buffer.clear.remote())
+
+        # Verify buffer is empty
+        size = ray.get(buffer.size.remote())
+        assert size == 0
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["total_trajectories"] == 0
+        assert debug_info["trajectory_versions"] == []
+        assert debug_info["target_weight_versions"] == []
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_state_dict(self):
+        """Test state_dict serialization for checkpointing."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=5, target_weight_version=6)
+        )
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=6, target_weight_version=7)
+        )
+
+        state = ray.get(buffer.state_dict.remote())
+
+        assert state["trajectories"][0]["batch"]["data"] == "test1"
+        assert state["trajectories"][1]["batch"]["data"] == "test2"
+        assert state["trajectory_versions"] == [5, 6]
+        assert state["target_weight_versions"] == [6, 7]
+        assert state["last_target_weight_already_generated"] == -1
+        assert state["max_size"] == 10
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict(self):
+        """Test load_state_dict restoration from checkpoint."""
+        buffer1 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer1.add.remote(trajectory1, weight_version=5, target_weight_version=6)
+        )
+        ray.get(
+            buffer1.add.remote(trajectory2, weight_version=6, target_weight_version=7)
+        )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        assert ray.get(buffer2.size.remote()) == 0
+
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        assert ray.get(buffer2.size.remote()) == 2
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [5, 6]
+        assert debug_info["target_weight_versions"] == [6, 7]
+        assert ray.get(buffer2.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_state_dict_round_trip_sampling(self):
+        """Test save/restore preserves sampling behavior."""
+        buffer1 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        for i in range(3):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            ray.get(
+                buffer1.add.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        sample_result = ray.get(
+            buffer2.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=2,
+                max_age_steps=2,
+            )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "test1"
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_load_state_dict_max_size_change(self):
+        """Test load_state_dict truncates after resume cleanup."""
+        buffer1 = ReplayBuffer.remote(
+            max_size=5, drop_incomplete_targets_on_restore=False
+        )
+
+        for i in range(4):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            ray.get(
+                buffer1.add.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(
+            max_size=2, drop_incomplete_targets_on_restore=False
+        )
+        ray.get(
+            buffer2.load_state_dict.remote(
+                state,
+                num_prompts_per_step=1,
+                current_training_step=2,
+            )
+        )
+
+        assert ray.get(buffer2.size.remote()) == 2
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [1, 2]
+        assert debug_info["target_weight_versions"] == [2, 3]
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_load_empty_state_resets_generation_watermark(self):
+        """Test empty restore can generate from the current step."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        state = {
+            "trajectories": [],
+            "trajectory_versions": [],
+            "target_weight_versions": [],
+            "last_target_weight_already_generated": 7,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=5,
+            )
+        )
+
+        assert ray.get(buffer.size.remote()) == 0
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 4
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 2)) == 2
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_restore_removes_stale_trajectories(self):
+        """Test stale restored trajectories do not make a step look complete."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "stale_a"}},
+                {"batch": {"data": "stale_b"}},
+                {"batch": {"data": "valid_a"}},
+            ],
+            "trajectory_versions": [0, 1, 4],
+            "target_weight_versions": [5, 5, 5],
+            "last_target_weight_already_generated": 5,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=5,
+                max_age_steps=1,
+            )
+        )
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [4]
+        assert debug_info["target_weight_versions"] == [5]
+        assert not ray.get(buffer.has_complete_batch.remote(5, 2))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 2)) == 1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_readiness_ignores_stale_trajectories(self):
+        """Test readiness helpers match sample's age-window filtering."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        for version in [0, 1, 4]:
+            ray.get(
+                buffer.add.remote(
+                    {"batch": {"data": f"version_{version}"}},
+                    weight_version=version,
+                    target_weight_version=5,
+                )
+            )
+
+        assert ray.get(buffer.has_complete_batch.remote(5, 3))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 3)) == 0
+
+        assert not ray.get(buffer.has_complete_batch.remote(5, 3, 1))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 3, 1)) == 2
+
+        assert (
+            ray.get(
+                buffer.sample.remote(
+                    num_prompt_groups=3,
+                    current_weight_version=5,
+                    max_age_steps=1,
+                )
+            )
+            is None
+        )
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict_missing_keys(self):
+        """Test load_state_dict raises for missing required keys."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        incomplete_state = {
+            "trajectories": [],
+            "trajectory_versions": [],
+        }
+
+        with pytest.raises(ValueError, match="Checkpoint missing required keys"):
+            ray.get(buffer.load_state_dict.remote(incomplete_state))
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict_inconsistent_lengths(self):
+        """Test load_state_dict raises for inconsistent parallel lists."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        bad_state = {
+            "trajectories": [{"batch": {"data": "test"}}],
+            "trajectory_versions": [0, 1],
+            "target_weight_versions": [1],
+            "last_target_weight_already_generated": 1,
+        }
+
+        with pytest.raises(ValueError, match="inconsistent replay buffer lengths"):
+            ray.get(buffer.load_state_dict.remote(bad_state))
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_restore_for_training_step_gap_fill_accounting(self):
+        """Test resume cleanup keeps incomplete future targets for gap filling."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "past"}},
+                {"batch": {"data": "step2_a"}},
+                {"batch": {"data": "step2_b"}},
+                {"batch": {"data": "step3_a"}},
+            ],
+            "trajectory_versions": [0, 1, 1, 2],
+            "target_weight_versions": [1, 2, 2, 3],
+            "last_target_weight_already_generated": 3,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=2,
+            )
+        )
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [1, 1, 2]
+        assert debug_info["target_weight_versions"] == [2, 2, 3]
+        assert ray.get(buffer.has_complete_batch.remote(2, 2))
+        assert not ray.get(buffer.has_complete_batch.remote(3, 2))
+        assert ray.get(buffer.get_trajectories_needed.remote(2, 2)) == 0
+        assert ray.get(buffer.get_trajectories_needed.remote(3, 2)) == 1
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_remove_incomplete_resets_watermark_before_first_remaining_target(
+        self,
+    ):
+        """Test fallback cleanup does not skip gaps after removing partial targets."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "step5_a"}},
+                {"batch": {"data": "step5_b"}},
+                {"batch": {"data": "step6_a"}},
+                {"batch": {"data": "step8_a"}},
+                {"batch": {"data": "step8_b"}},
+            ],
+            "trajectory_versions": [4, 4, 5, 7, 7],
+            "target_weight_versions": [5, 5, 6, 8, 8],
+            "last_target_weight_already_generated": 8,
+            "max_size": 10,
+        }
+
+        ray.get(buffer.load_state_dict.remote(state, num_prompts_per_step=2))
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["target_weight_versions"] == [5, 5, 8, 8]
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 4
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_checkpoint_with_torch_save(self, tmp_path):
+        """Actor-side compact replay checkpoint survives a config flag flip."""
+        buffer1 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        pixel_row = PackedTensor(
+            torch.tensor([[1.0, 2.0]]), dim_to_pack=0
+        ).enable_deduplication()
+
+        trajectory = {
+            "batch": {
+                "token_ids": torch.tensor([1, 2, 3]),
+                "rewards": torch.tensor([0.5]),
+                "pixel_values": PackedTensor.concat([pixel_row] * 2),
+            },
+            "rollout_metrics": {"reward": 1.0, "length": 10},
+            "timestamp": 12345.0,
+            "_ng_task_index": 11,
+        }
+        ray.get(
+            buffer1.add.remote(trajectory, weight_version=5, target_weight_version=6)
+        )
+
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        assert ray.get(buffer1.save_to_path.remote(str(checkpoint_path))) == 1
+
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        restore_metadata = ray.get(buffer2.load_from_path.remote(str(checkpoint_path)))
+
+        assert restore_metadata == {
+            "num_trajectories": 1,
+            "next_ng_task_index": 12,
+            RETAINED_TASK_INDICES_KEY: [11],
+        }
+        assert ray.get(buffer2.size.remote()) == 1
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [5]
+        assert debug_info["target_weight_versions"] == [6]
+        restored_state = ray.get(buffer2.state_dict.remote())
+        restored_media = restored_state["trajectories"][0]["batch"]["pixel_values"]
+        assert restored_media.deduplication_enabled
+        assert len(restored_media) == 2
+        assert len(restored_media.tensors) == 1
+        torch.testing.assert_close(
+            restored_media.as_tensor(),
+            torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
+
+        ray.kill(buffer2)
+
+    def test_restore_preserves_complete_current_target_without_lookahead(self):
+        """A restored buffer preserves target N while target N+1 remains absent.
+
+        This is the precondition for the async resume deadlock that PR #2651's
+        replay-buffer checkpointing exposed in Async GRPO or Async PPO:
+
+          1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
+          2. Training consumes all target-N trajectories and triggers a refit.
+          3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
+          4. Training waits for target N+1, which nobody generates — stall forever.
+
+        The startup pipeline barrier requires target N+1 to be complete *or*
+        actively claimed by the collector before training may begin.  This test
+        constructs the precondition state — current step complete, lookahead
+        absent — and documents the buffer readiness values the barrier branches on.
+        """
+        num_prompts = 8
+        resume_step = 30
+        max_age = 1
+
+        # Build a pre-checkpoint buffer: 8 trajectories for target 30, none for 31.
+        buffer1 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
+        for _ in range(num_prompts):
+            ray.get(
+                buffer1.add.remote(
+                    {"batch": {"data": "x"}, "rollout_metrics": {}},
+                    weight_version=resume_step - 1,
+                    target_weight_version=resume_step,
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        # Restore at step 30, simulating a checkpoint resume.
+        buffer2 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
+        ray.get(
+            buffer2.load_state_dict.remote(
+                state,
+                num_prompts_per_step=num_prompts,
+                current_training_step=resume_step,
+                max_age_steps=max_age,
+            )
+        )
+
+        # Step 30 is complete — this is what makes the broken startup return early.
+        assert ray.get(
+            buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
+        ), "target step must be complete after restore"
+
+        # Step 31 is absent — startup may proceed only after collector status
+        # reports that this target has been claimed.
+        assert not ray.get(
+            buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
+        ), "lookahead step must be absent from the restored buffer"
+
+        ray.kill(buffer2)
+
+
+class TestAsyncTrajectoryCollector:
+    """Test cases for AsyncTrajectoryCollector."""
+
+    def create_local_collector(
+        self,
+        replay_buffer=None,
+        next_nemo_gym_task_index: int = 0,
+        max_generation_failures: int = 0,
+        pending_batch=None,
+        ordinals_frontier_aligned: bool = True,
+        resume_frontier_ordinal=None,
+        resume_covered_task_indices=None,
+    ):
+        """Create a non-Ray collector instance for unit-testing local state."""
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        task_to_env = {}
+        master_config = self.create_mock_config()
+        master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
+        if replay_buffer is None:
+            replay_buffer = mock.MagicMock()
+            replay_buffer.get_held_task_indices.remote.return_value = []
+
+        return collector_cls(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=replay_buffer,
+            start_step=0,
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
+            pending_batch=pending_batch,
+            ordinals_frontier_aligned=ordinals_frontier_aligned,
+            resume_frontier_ordinal=resume_frontier_ordinal,
+            resume_covered_task_indices=resume_covered_task_indices,
+        )
+
+    def _prime_collection_loop(self, collector):
+        """Unblock every wait-event so _collection_loop() runs to completion."""
+        for attr in (
+            "_manual_pause_cleared",
+            "_refit_pause_cleared",
+            "_generation_limit_cleared",
+        ):
+            ev = threading.Event()
+            ev.set()
+            setattr(collector, attr, ev)
+        collector._should_pause_for_generation_limits = lambda: False
+        collector.running = True
+
+    def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}, {"b": 1}]
+
+        collector._collection_loop()
+
+        assert processed == [{"b": 0}, {"b": 1}]
+        assert collector.data_exhausted is True
+        assert collector.collection_failed is False
+        status = collector.get_status()
+        assert status["data_exhausted"] is True
+        assert status["errored"] is False
+        assert status["running"] is False
+
+    @pytest.mark.asyncio
+    async def test_drain_payload_metrics_returns_collector_interval(self, monkeypatch):
+        collector = self.create_local_collector()
+        collector.master_config.grpo.debug_payload_metrics = True
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector."
+            "drain_multimodal_payload_metrics",
+            lambda: {
+                "payload_bytes/nemo_gym_return/serialized": 180,
+                "payload_bytes/nemo_gym_return/serialized_mean_per_call": 90,
+                "payload_bytes/nemo_gym_return/physical_media": 30,
+                "payload_bytes/nemo_gym_return/logical_media": 150,
+                "payload_counts/nemo_gym_return/calls": 2,
+                "payload_ratio/nemo_gym_return/physical_to_logical": 0.2,
+            },
+        )
+
+        metrics = await collector.drain_payload_metrics()
+
+        assert metrics["payload_counts/nemo_gym_return/calls"] == 2
+        assert metrics["payload_bytes/nemo_gym_return/serialized_mean_per_call"] == 90
+        assert metrics["payload_bytes/nemo_gym_return/physical_media"] == 30
+        assert metrics["payload_bytes/nemo_gym_return/logical_media"] == 150
+        assert metrics["payload_ratio/nemo_gym_return/physical_to_logical"] == 0.2
+
+    def test_collection_loop_marks_errored_on_crash(self):
+        """A crash sets errored (not data_exhausted) so driver guards fail fast."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+
+        def _boom(batch):
+            raise RuntimeError("collection blew up")
+
+        collector._process_batch = _boom
+        collector.dataloader = [{"b": 0}]
+
+        collector._collection_loop()
+
+        assert collector.collection_failed is True
+        assert collector.data_exhausted is False
+        status = collector.get_status()
+        assert status["errored"] is True
+        assert status["error"] == "RuntimeError: collection blew up"
+        assert status["data_exhausted"] is False
+        assert status["running"] is False
+
+    def test_collection_loop_no_exhaustion_on_manual_stop(self):
+        """Breaking out (running=False) must not set data_exhausted/errored."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+
+        def _stop_after_first(batch):
+            collector.running = False
+
+        collector._process_batch = _stop_after_first
+        collector.dataloader = [{"b": 0}, {"b": 1}, {"b": 2}]
+
+        collector._collection_loop()
+
+        assert collector.data_exhausted is False
+        assert collector.collection_failed is False
+
+    def test_collection_loop_consumes_carryover_before_next_pull(self):
+        """A gap-fill remainder is processed ahead of the next dataloader batch."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        first, second, tail = {"b": 0}, {"b": 1}, {"tail": True}
+        processed = []
+
+        def _process(batch):
+            processed.append(batch)
+            return tail if batch is first else None
+
+        collector._process_batch = _process
+        collector.dataloader = [first, second]
+
+        collector._collection_loop()
+
+        assert processed == [first, tail, second]
+        assert collector._pending_batch is None
+        assert collector.data_exhausted is True
+
+    def test_collection_loop_retries_unconsumed_batch(self):
+        """A batch nothing consumed (no target free) is retried, not discarded."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        batch = {"b": 0}
+        processed = []
+
+        def _process(current):
+            processed.append(current)
+            # First attempt: nothing consumed. Second attempt: consumed.
+            return current if len(processed) == 1 else None
+
+        collector._process_batch = _process
+        collector.dataloader = [batch]
+
+        collector._collection_loop()
+
+        assert processed == [batch, batch]
+        assert collector.data_exhausted is True
+
+    def test_collection_loop_starts_from_restored_pending_batch(self):
+        """A pending remainder restored from a checkpoint is processed first."""
+        restored = {"restored": True}
+        collector = self.create_local_collector(pending_batch=restored)
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}]
+
+        collector._collection_loop()
+
+        assert processed == [restored, {"b": 0}]
+
+    def test_process_batch_carries_over_gap_fill_tail(self, monkeypatch):
+        """When the target needs fewer prompts than the batch, the tail survives."""
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector._refit_pause_cleared.set()
+        collector._get_next_target_for_generation = lambda version: 1
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.ray",
+            mock.MagicMock(get=lambda ref: ref),
+        )
+        worker_calls = []
+
+        async def _fake_worker(**kwargs):
+            worker_calls.append(kwargs)
+
+        collector._run_rollout_batch_worker = _fake_worker
+
+        batch = self.create_mock_batch(size=4)
+        leftover = collector._process_batch(batch)
+        collector.wait_for_pending_generations()
+
+        assert leftover is not None
+        assert leftover.size == 2
+        assert [log[0]["content"] for log in leftover["message_log"]] == [
+            "Test prompt 2",
+            "Test prompt 3",
+        ]
+        assert len(worker_calls) == 1
+        # 2 prompts x 3 generations reached the rollout worker.
+        assert worker_calls[0]["repeated_batch"].size == 6
+
+    def test_process_batch_returns_whole_batch_when_no_target_free(self):
+        """No reservable target: the untouched batch comes back for retry."""
+        collector = self.create_local_collector()
+        collector._get_next_target_for_generation = lambda version: None
+
+        batch = self.create_mock_batch(size=2)
+        assert collector._process_batch(batch) is batch
+
+    class _FakeStatefulLoader:
+        """List-backed stand-in for StatefulDataLoader with a position cursor."""
+
+        def __init__(self, batches, start: int = 0):
+            self._batches = batches
+            self._pos = start
+
+        def state_dict(self) -> dict:
+            return {"pos": self._pos}
+
+        def __iter__(self):
+            while self._pos < len(self._batches):
+                batch = self._batches[self._pos]
+                self._pos += 1
+                yield batch
+
+    def _run_loop_collecting(self, collector, loader):
+        """Drive _collection_loop to exhaustion, returning processed batches."""
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = loader
+        collector._collection_loop()
+        return processed
+
+    @staticmethod
+    def _ordinals(batches) -> list[int]:
+        return [
+            row[NEMO_GYM_TASK_INDEX_KEY]
+            for batch in batches
+            for row in batch["extra_env_info"]
+        ]
+
+    def test_collection_loop_stamps_ordinals_and_records_snapshots(self):
+        """Fresh batches get stream-position ordinals; the ring keys on them."""
+        collector = self.create_local_collector()
+        loader = self._FakeStatefulLoader(
+            [self.create_mock_batch(2), self.create_mock_batch(2)]
+        )
+
+        processed = self._run_loop_collecting(collector, loader)
+
+        assert self._ordinals(processed) == [0, 1, 2, 3]
+        assert [
+            (base, state["pos"]) for base, state in collector._dataloader_snapshots
+        ] == [(0, 0), (2, 1)]
+        assert collector._next_nemo_gym_task_index == 4
+
+    def test_get_checkpoint_dataloader_state_selects_frontier_snapshot(self):
+        """The snapshot just at/below the frontier wins; misaligned falls back."""
+        collector = self.create_local_collector()
+        collector._dataloader_snapshots.extend(
+            [(0, {"pos": 0}), (4, {"pos": 1}), (8, {"pos": 2})]
+        )
+
+        snapshot = collector.get_checkpoint_dataloader_state(5)
+        assert snapshot["frontier_aligned"] is True
+        assert snapshot["base_ordinal"] == 4
+        assert snapshot["dataloader_state"] == {"pos": 1}
+
+        assert collector.get_checkpoint_dataloader_state(3)["base_ordinal"] == 0
+        assert collector.get_checkpoint_dataloader_state(11)["base_ordinal"] == 8
+
+        collector._ordinals_frontier_aligned = False
+        fallback = collector.get_checkpoint_dataloader_state(5)
+        assert fallback["frontier_aligned"] is False
+        assert fallback["base_ordinal"] is None
+
+    def test_checkpoint_falls_back_when_ring_has_no_snapshot_at_frontier(self):
+        """Aligned ordinals but an evicted/empty ring still degrade cleanly."""
+        collector = self.create_local_collector()
+        assert collector._ordinals_frontier_aligned is True
+
+        # Empty ring: nothing to select from.
+        empty = collector.get_checkpoint_dataloader_state(5)
+        assert empty["frontier_aligned"] is False
+        assert empty["base_ordinal"] is None
+
+        # Every retained base sits above the frontier (older entries evicted).
+        collector._dataloader_snapshots.extend([(8, {"pos": 2}), (12, {"pos": 3})])
+        evicted = collector.get_checkpoint_dataloader_state(5)
+        assert evicted["frontier_aligned"] is False
+        assert evicted["base_ordinal"] is None
+
+    def test_get_checkpoint_state_omits_pending_on_frontier_snapshots(
+        self, monkeypatch
+    ):
+        """One call returns the cursor/pending pair; pending only on fallback."""
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
+        collector = self.create_local_collector(next_nemo_gym_task_index=4)
+        collector._dataloader_snapshots.append((0, {"pos": 0}))
+        collector._pending_batch = self.create_mock_batch(2)
+
+        aligned = collector.get_checkpoint_state(4)
+        assert aligned["dataloader"]["frontier_aligned"] is True
+        assert aligned["dataloader"]["frontier_ordinal"] == 4
+        assert aligned["rollouts"] == {NEXT_NEMO_GYM_TASK_INDEX_KEY: 4}
+
+        collector._ordinals_frontier_aligned = False
+        fallback = collector.get_checkpoint_state(4)
+        assert fallback["dataloader"]["frontier_aligned"] is False
+        assert fallback["rollouts"][NEXT_NEMO_GYM_TASK_INDEX_KEY] == 4
+        assert fallback["rollouts"][PENDING_PROMPTS_KEY] is collector._pending_batch
+
+    def test_stamped_task_indices_extraction(self):
+        stamped = BatchedDataDict[DatumSpec](
+            {
+                "extra_env_info": [
+                    {NEMO_GYM_TASK_INDEX_KEY: 5},
+                    {NEMO_GYM_TASK_INDEX_KEY: 6},
+                ]
+            }
+        )
+        unstamped = BatchedDataDict[DatumSpec]({"extra_env_info": [{}, {}]})
+        no_rows = BatchedDataDict[DatumSpec]({"value": [1]})
+
+        assert _stamped_task_indices(stamped) == [5, 6]
+        assert _stamped_task_indices(unstamped) == []
+        assert _stamped_task_indices(no_rows) == []
+
+    def test_checkpoint_cut_lowered_by_outstanding_ordinals(self, monkeypatch):
+        """A target refilled past another target's in-flight groups must not
+        strand them: 24 prompts in 8-batches, target 0 lost {3..7} to a
+        tolerated failure and was refilled with {16..20}; training it moved
+        the frontier to 21 while target 1's {8..15} are still generating.
+        The checkpoint must cut at 8 — not 21 — or those never-failed
+        prompts sit below the resume base and are silently lost.
+        """
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
+        collector = self.create_local_collector()
+        collector._dataloader_snapshots.extend(
+            [(0, {"pos": 0}), (8, {"pos": 1}), (16, {"pos": 2})]
+        )
+        collector._outstanding_task_indices = set(range(8, 16))
+
+        poisoned = collector.get_checkpoint_state(21)
+        assert poisoned["dataloader"]["frontier_ordinal"] == 8
+        assert poisoned["dataloader"]["base_ordinal"] == 8
+        assert poisoned["dataloader"]["frontier_aligned"] is True
+
+        # Healthy path: outstanding work at/above the frontier changes nothing.
+        collector._outstanding_task_indices = {21, 22, 23}
+        healthy = collector.get_checkpoint_state(21)
+        assert healthy["dataloader"]["frontier_ordinal"] == 21
+        assert healthy["dataloader"]["base_ordinal"] == 16
+
+        # No outstanding work at all: also unchanged.
+        collector._outstanding_task_indices = set()
+        idle = collector.get_checkpoint_state(21)
+        assert idle["dataloader"]["frontier_ordinal"] == 21
+
+        # Buffered-but-untrained groups below the frontier lower the cut
+        # too: their only record is the buffer, which a
+        # load_replay_buffer=false resume discards. Here target 1's {8..12}
+        # completed (left the outstanding set) while {13..15} still run.
+        collector._outstanding_task_indices = {13, 14, 15}
+        collector.replay_buffer.get_held_task_indices.remote.return_value = [
+            8,
+            9,
+            10,
+            11,
+            12,
+        ]
+        partially_buffered = collector.get_checkpoint_state(21)
+        assert partially_buffered["dataloader"]["frontier_ordinal"] == 8
+        assert partially_buffered["dataloader"]["base_ordinal"] == 8
+
+        # Healthy buffer contents (at/above the frontier) change nothing.
+        collector._outstanding_task_indices = set()
+        collector.replay_buffer.get_held_task_indices.remote.return_value = [
+            21,
+            22,
+            23,
+        ]
+        healthy_buffered = collector.get_checkpoint_state(21)
+        assert healthy_buffered["dataloader"]["frontier_ordinal"] == 21
+
+    def test_failure_interleaving_resume_regenerates_stranded_window(self):
+        """Resume from a lowered cut regenerates exactly what was lost.
+
+        Cut = 8; the checkpoint covers retained groups {11, 12} AND the
+        already-trained refill {16..20} (persisted as trained-above-cut by
+        the driver). The resumed stream must contain the stranded prompts
+        {8, 9, 10, 13, 14, 15} and continue at 21+ — the trained refill is
+        dropped by the filter, never re-trained.
+        """
+        batches = [self.create_mock_batch(8) for _ in range(3)]
+        phase_a = self.create_local_collector()
+        self._run_loop_collecting(phase_a, self._FakeStatefulLoader(batches))
+
+        resumed = self.create_local_collector(
+            next_nemo_gym_task_index=8,
+            resume_frontier_ordinal=8,
+            # retained ∪ trained-above-cut, as async_grpo_train unions them
+            resume_covered_task_indices=[11, 12, 16, 17, 18, 19, 20],
+        )
+        stream = self._run_loop_collecting(
+            resumed, self._FakeStatefulLoader(batches, start=1)
+        )
+
+        assert self._ordinals(stream) == [8, 9, 10, 13, 14, 15, 21, 22, 23]
+
+    def test_lowered_cut_resume_without_buffer_regenerates_buffered_window(self):
+        """load_replay_buffer=false on a cut-lowered checkpoint.
+
+        Cut = 8 (lowered to the buffered-untrained minimum), no retained set
+        (the buffer was discarded), covered = trained {16..20} only. The
+        whole [8, 16) window must regenerate — including {8..12}, whose
+        finished rollouts were thrown away with the buffer.
+        """
+        batches = [self.create_mock_batch(8) for _ in range(3)]
+        phase_a = self.create_local_collector()
+        self._run_loop_collecting(phase_a, self._FakeStatefulLoader(batches))
+
+        resumed = self.create_local_collector(
+            next_nemo_gym_task_index=8,
+            resume_frontier_ordinal=8,
+            resume_covered_task_indices=[16, 17, 18, 19, 20],
+        )
+        stream = self._run_loop_collecting(
+            resumed, self._FakeStatefulLoader(batches, start=1)
+        )
+
+        assert self._ordinals(stream) == list(range(8, 16)) + [21, 22, 23]
+
+    def test_process_batch_tracks_dispatched_outstanding(self, monkeypatch):
+        """Dispatch adds stamped group ordinals; a failed start removes them."""
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector._refit_pause_cleared.set()
+        collector._get_next_target_for_generation = lambda version: 1
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector.ray",
+            mock.MagicMock(get=lambda ref: ref),
+        )
+        worker_calls = []
+
+        async def _fake_worker(**kwargs):
+            worker_calls.append(kwargs)
+
+        collector._run_rollout_batch_worker = _fake_worker
+
+        batch = self.create_mock_batch(size=4)
+        collector._stamp_task_indices(batch)
+        collector._process_batch(batch)
+        collector.wait_for_pending_generations()
+
+        # The fake worker bypasses the real finally-discard, so the dispatch
+        # registration is observable here.
+        assert collector._outstanding_task_indices == {0, 1}
+        assert worker_calls[0]["dispatched_task_indices"] == [0, 1]
+
+        # A worker that fails to start must roll its registration back.
+        collector._outstanding_task_indices = set()
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.async_utils.trajectory_collector._threading.Thread",
+            mock.MagicMock(side_effect=RuntimeError("no threads")),
+        )
+        remainder = collector._process_batch(batch)
+        assert remainder is batch  # nothing consumed
+        assert collector._outstanding_task_indices == set()
+
+    def test_worker_clears_outstanding_on_success_and_tolerated_failure(
+        self, monkeypatch
+    ):
+        """Buffered groups leave the outstanding set; a tolerated failure's
+        remainder leaves it at worker exit instead of pinning the cut."""
+
+        class _ReadyResult:
+            def __await__(self):
+                async def _resolve():
+                    return "success"
+
+                return _resolve().__await__()
+
+        class _AddRemote:
+            def remote(self, *args):
+                return _ReadyResult()
+
+        class _ReplayBuffer:
+            add = _AddRemote()
+
+        def _fake_rollouts_factory(fail_after):
+            async def fake_rollouts(**kwargs):
+                for group_index in range(2):
+                    if group_index == fail_after:
+                        raise RuntimeError("worker died mid-batch")
+                    yield trajectory_collector_mod.RolloutGroupResult(
+                        group_index=group_index,
+                        final_batch=BatchedDataDict({"value": torch.tensor([1])}),
+                        rollout_metrics={},
+                    )
+
+            return fake_rollouts
+
+        for fail_after, description in ((None, "success"), (1, "tolerated failure")):
+            collector = self.create_local_collector(
+                replay_buffer=_ReplayBuffer(), max_generation_failures=5
+            )
+            collector.running = True
+            collector._generating_targets.add(3)
+            collector._outstanding_task_indices = {5, 6}
+            monkeypatch.setattr(
+                trajectory_collector_mod,
+                "run_async_multi_turn_rollout_groups",
+                _fake_rollouts_factory(fail_after),
+            )
+
+            # Stamp the input at ordinals 5-6 so group_input_task_indices
+            # carries them. This asserts only the end state (either discard
+            # mechanism suffices); the per-group discard itself is pinned by
+            # test_buffered_groups_clear_outstanding_before_worker_exit.
+            input_batch = self.create_mock_batch(size=2)
+            collector._next_nemo_gym_task_index = 5
+            collector._stamp_task_indices(input_batch)
+
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=input_batch.repeat_interleave(1),
+                    generation_weight_version=2,
+                    target_weight_version=3,
+                    num_generations=1,
+                    use_nemo_gym=False,
+                    dispatched_task_indices=[5, 6],
+                )
+            )
+
+            assert collector._outstanding_task_indices == set(), description
+            assert collector.collection_failed is False, description
+
+    class _AwaitableStatus:
+        """Awaitable stand-in for a Ray ObjectRef returned by ``add.remote``."""
+
+        def __init__(self, status="success"):
+            self._status = status
+
+        def __await__(self):
+            async def _resolve():
+                return self._status
+
+            return _resolve().__await__()
+
+    class _FakeReplayBuffer:
+        """Replay buffer whose ``add`` always succeeds immediately."""
+
+        def __init__(self, outer):
+            self._outer = outer
+
+        @property
+        def get_held_task_indices(self):
+            class _HeldRemote:
+                @staticmethod
+                def remote():
+                    return []
+
+            return _HeldRemote
+
+        @property
+        def add(self):
+            outer = self._outer
+
+            class _AddRemote:
+                @staticmethod
+                def remote(*args):
+                    return outer._AwaitableStatus()
+
+            return _AddRemote
+
+    def _fake_two_group_rollouts(self):
+        async def fake_rollouts(**kwargs):
+            for group_index in range(2):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=group_index,
+                    final_batch=BatchedDataDict({"value": torch.tensor([1])}),
+                    rollout_metrics={},
+                )
+
+        return fake_rollouts
+
+    def test_buffered_groups_clear_outstanding_before_worker_exit(self, monkeypatch):
+        """The window where every group has buffered but the worker has not
+        yet reached its ``finally``.
+
+        If only the worker-exit sweep cleared the set, a checkpoint taken in
+        this window during a perfectly healthy run would still see the just-
+        buffered ordinals outstanding and lower the cut below the frontier.
+        Driving ``_collect_rollout_batch`` directly bypasses the worker-exit
+        sweep, so only the per-group discard can empty the set here.
+        """
+        collector = self.create_local_collector(
+            replay_buffer=self._FakeReplayBuffer(self)
+        )
+        collector.running = True
+        collector._outstanding_task_indices = {5, 6}
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout_groups",
+            self._fake_two_group_rollouts(),
+        )
+
+        input_batch = self.create_mock_batch(size=2)
+        collector._next_nemo_gym_task_index = 5
+        collector._stamp_task_indices(input_batch)
+
+        asyncio.run(
+            collector._collect_rollout_batch(
+                repeated_batch=input_batch.repeat_interleave(1),
+                generation_weight_version=2,
+                target_weight_version=3,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector._outstanding_task_indices == set()
+
+        # The healthy consequence: a frontier that just advanced past the
+        # buffered ordinals is not lowered.
+        collector._dataloader_snapshots.append((0, {"pos": 0}))
+        assert collector.get_checkpoint_state(7)["dataloader"]["frontier_ordinal"] == 7
+
+    def test_worker_sweeps_outstanding_when_stopped_mid_flight(self, monkeypatch):
+        """A worker that fails after ``running`` went False must not leak.
+
+        The failure handler returns early when the collector is shutting
+        down; the sweep lives in ``finally`` so the ordinals still clear. A
+        leak here is silent — it pins every later checkpoint's cut and shows
+        up only as mass regeneration on the next resume.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        collector._generating_targets.add(3)
+        collector._outstanding_task_indices = {5, 6}
+
+        async def _stop_and_fail(**kwargs):
+            collector.running = False
+            raise RuntimeError("collector shut down mid-batch")
+
+        collector._collect_rollout_batch = _stop_and_fail
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=self.create_mock_batch(size=2),
+                generation_weight_version=2,
+                target_weight_version=3,
+                num_generations=1,
+                use_nemo_gym=False,
+                dispatched_task_indices=[5, 6],
+            )
+        )
+
+        assert collector._outstanding_task_indices == set()
+        assert 3 not in collector._generating_targets
+
+    def test_healthy_dispatch_leaves_cut_at_frontier_without_warning(
+        self, monkeypatch, capsys
+    ):
+        """End-to-end healthy path: dispatch through ``_process_batch``, let
+        the real worker buffer both groups, and check the cut is untouched.
+
+        The frontier can only reach 2 once ordinals 0-1 are buffered, and the
+        next dispatch's ordinals sit at/above it — so the cut equals the
+        frontier and nothing is logged.
+        """
+        replay_buffer = self._FakeReplayBuffer(self)
+        replay_buffer.get_trajectories_needed = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector._refit_pause_cleared.set()
+        collector._get_next_target_for_generation = lambda version: 1
+        collector._dataloader_snapshots.append((0, {"pos": 0}))
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout_groups",
+            self._fake_two_group_rollouts(),
+        )
+
+        batch = self.create_mock_batch(size=2)
+        collector._stamp_task_indices(batch)
+        assert collector._process_batch(batch) is None
+        collector.wait_for_pending_generations()
+
+        # Both groups buffered, so nothing pins the cut down.
+        assert collector._outstanding_task_indices == set()
+        capsys.readouterr()
+        state = collector.get_checkpoint_state(2)
+        assert state["dataloader"]["frontier_ordinal"] == 2
+        assert "cut lowered" not in capsys.readouterr().out
+
+    def test_stamping_falls_back_when_rows_cannot_carry_ordinals(self):
+        """Un-stampable batches disable frontier alignment instead of crashing."""
+        collector = self.create_local_collector()
+        batch = self.create_mock_batch(2)
+        batch["extra_env_info"] = [None, None]
+
+        assert collector._stamp_task_indices(batch) is False
+        assert collector._ordinals_frontier_aligned is False
+        assert collector.get_checkpoint_dataloader_state(0)["frontier_aligned"] is False
+
+    def test_frontier_restore_regenerates_exactly_the_uncovered_prompts(self):
+        """Save/restore round trip: no prompt skipped, none duplicated.
+
+        Phase A yields ordinals 0-11 and checkpoints at trained frontier 5
+        with groups {6, 7, 10} retained in the buffer. Phase B rewinds the
+        loader to the saved snapshot and must re-process exactly the ordinals
+        that are neither trained (< 5) nor retained — then drop the filter.
+        """
+        batches = [self.create_mock_batch(4) for _ in range(4)]
+
+        phase_a = self.create_local_collector()
+        loader_a = self._FakeStatefulLoader(batches[:3])
+        self._run_loop_collecting(phase_a, loader_a)
+
+        snapshot = phase_a.get_checkpoint_dataloader_state(5)
+        assert snapshot["frontier_aligned"] is True
+        assert snapshot["base_ordinal"] == 4
+
+        phase_b = self.create_local_collector(
+            next_nemo_gym_task_index=snapshot["base_ordinal"],
+            resume_frontier_ordinal=5,
+            resume_covered_task_indices=[6, 7, 10],
+        )
+        loader_b = self._FakeStatefulLoader(
+            batches, start=snapshot["dataloader_state"]["pos"]
+        )
+
+        processed = self._run_loop_collecting(phase_b, loader_b)
+
+        assert self._ordinals(processed) == [5, 8, 9, 11, 12, 13, 14, 15]
+        # The filter shuts off once the covered window has been re-yielded.
+        assert phase_b._resume_frontier_ordinal is None
+
+    def test_legacy_resume_skips_prompts_that_frontier_resume_regenerates(self):
+        """The measured failure mode in miniature, as an A/B.
+
+        16 prompts stream through in 4 batches. A checkpoint lands with
+        prompts 0-4 trained (frontier=5), groups {6, 7, 10} retained in the
+        buffer, prompts {5, 8, 9, 11} in flight, and the live cursor at
+        batch 3. The legacy resume (still in-tree as the fallback for
+        pre-frontier checkpoints) restores the live cursor and loses every
+        yielded-but-unbuffered prompt; the frontier resume regenerates all of
+        them with no duplicates.
+        """
+
+        def batch_for(prompt_ids):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "task_name": ["test"] * len(prompt_ids),
+                    "message_log": [
+                        [{"role": "user", "content": f"prompt-{i}"}] for i in prompt_ids
+                    ],
+                    "extra_env_info": [{"prompt_id": i} for i in prompt_ids],
+                    "loss_multiplier": torch.ones(len(prompt_ids)),
+                }
+            )
+
+        def resume_stream(collector, loader):
+            self._prime_collection_loop(collector)
+            seen = []
+            collector._process_batch = lambda batch: seen.extend(
+                row["prompt_id"] for row in batch["extra_env_info"]
+            )
+            collector.dataloader = loader
+            collector._collection_loop()
+            return seen
+
+        all_prompts = set(range(16))
+        batches = [batch_for(range(i, i + 4)) for i in range(0, 16, 4)]
+        trained_before_save = set(range(5))  # consumed_samples = 5
+        retained = {6, 7, 10}  # completed groups in replay_buffer.pt
+        live_cursor_pos = 3  # batches 0-2 yielded at save time
+
+        phase_a = self.create_local_collector()
+        resume_stream(phase_a, self._FakeStatefulLoader(batches))
+        snapshot = phase_a.get_checkpoint_dataloader_state(5)
+
+        # Legacy semantics: live cursor restored, no rewind, no filter.
+        legacy_stream = resume_stream(
+            self.create_local_collector(),
+            self._FakeStatefulLoader(batches, start=live_cursor_pos),
+        )
+        legacy_skipped = all_prompts - (
+            trained_before_save | retained | set(legacy_stream)
+        )
+        assert sorted(legacy_skipped) == [5, 8, 9, 11]
+
+        # Frontier semantics: rewind to the saved snapshot, drop covered rows.
+        frontier = self.create_local_collector(
+            next_nemo_gym_task_index=snapshot["base_ordinal"],
+            resume_frontier_ordinal=5,
+            resume_covered_task_indices=sorted(retained),
+        )
+        frontier_stream = resume_stream(
+            frontier,
+            self._FakeStatefulLoader(
+                batches, start=snapshot["dataloader_state"]["pos"]
+            ),
+        )
+
+        assert frontier_stream == [5, 8, 9, 11, 12, 13, 14, 15]
+        frontier_skipped = all_prompts - (
+            trained_before_save | retained | set(frontier_stream)
+        )
+        duplicates = (trained_before_save | retained) & set(frontier_stream)
+        assert not frontier_skipped
+        assert not duplicates
+
+    def test_unanimous_task_index(self):
+        unanimous = [{NEMO_GYM_TASK_INDEX_KEY: 7}] * 3
+        mixed = [{NEMO_GYM_TASK_INDEX_KEY: 7}, {NEMO_GYM_TASK_INDEX_KEY: 8}]
+        unstamped = [{}, {}]
+
+        assert _unanimous_task_index(unanimous) == 7
+        assert _unanimous_task_index(mixed) is None
+        assert _unanimous_task_index(unstamped) is None
+        assert _unanimous_task_index([]) is None
+
+    def test_rollouts_state_roundtrips_pending_batch(self, tmp_path):
+        """The pending remainder survives torch.save/load and collector restore."""
+        collector = self.create_local_collector()
+        assert PENDING_PROMPTS_KEY not in collector.get_rollouts_state()
+
+        pending = self.create_mock_batch(size=2)
+        collector._pending_batch = pending
+        state = collector.get_rollouts_state()
+        assert state[PENDING_PROMPTS_KEY] is pending
+
+        path = tmp_path / "rollouts.pt"
+        torch.save(state, path)
+        loaded = torch.load(path, weights_only=False)
+
+        restored = self.create_local_collector(
+            pending_batch=loaded[PENDING_PROMPTS_KEY]
+        )
+        assert restored._pending_batch.size == 2
+        assert [
+            log[0]["content"] for log in restored._pending_batch["message_log"]
+        ] == ["Test prompt 0", "Test prompt 1"]
+        status = collector.get_status()
+        assert status["data_exhausted"] is False
+        assert status["errored"] is False
+
+    def create_mock_config(self) -> MasterConfig:
+        """Create a mock master config for testing."""
+        return MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=3,
+                max_rollout_turns=1,
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_trajectory_age_steps=2,
+                    max_generation_failures=0,
+                ),
+            ),
+            policy={
+                "max_total_sequence_length": 512,
+                "make_sequence_length_divisible_by": 1,
+            },
+            env={"should_use_nemo_gym": False},
+            logger={
+                "wandb_enabled": False,
+                "wandb": {"log_nemo_gym_full_result_tables": False},
+            },
+        )
+
+    def test_collector_selects_ppo_config(self):
+        """The shared collector derives PPO settings from its master config."""
+        from nemo_rl.algorithms.ppo import (
+            AsyncPPOConfig,
+            PPOConfig,
+        )
+        from nemo_rl.algorithms.ppo import (
+            MasterConfig as PPOMasterConfig,
+        )
+
+        async_config = AsyncPPOConfig(
+            max_trajectory_age_steps=3,
+            warmup_generation_lead_steps=5,
+        )
+        master_config = PPOMasterConfig.model_construct(
+            policy={"make_sequence_length_divisible_by": 1},
+            ppo=PPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=4,
+                max_rollout_turns=1,
+                async_ppo=async_config,
+            ),
+        )
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+        )
+
+        assert collector.algorithm_config is master_config.ppo
+        assert collector.async_config is async_config
+        assert collector.async_config.max_trajectory_age_steps == 3
+
+        collector.set_generation_window(
+            weight_version=2,
+            generation_lead_steps=3,
+            max_trajectory_age_steps=5,
+        )
+        assert collector.current_weight_version == 2
+        assert collector._generation_lead_steps == 3
+        assert collector._max_trajectory_age_steps == 5
+        # The window includes the current version so a short current target
+        # can be gap-filled (see _calculate_target_weights).
+        assert collector._calculate_target_weights(2) == [2, 3, 4, 5]
+
+    def test_collector_grpo_window_remains_fixed(self):
+        collector = self.create_local_collector()
+
+        assert collector.current_weight_version == 0
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(0) == [0, 1, 2]
+
+        collector.set_weight_version(5)
+
+        assert collector.current_weight_version == 5
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(5) == [5, 6, 7]
+
+    def test_collector_rejects_generation_lead_above_validity_age(self):
+        collector = self.create_local_collector()
+
+        with pytest.raises(ValueError, match="max_trajectory_age_steps"):
+            collector.set_generation_window(
+                weight_version=1,
+                generation_lead_steps=3,
+                max_trajectory_age_steps=2,
+            )
+
+    def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
+        """Create a mock batch for testing."""
+        message_logs = []
+        for i in range(size):
+            message_logs.append(
+                [
+                    {"role": "user", "content": f"Test prompt {i}"},
+                ]
+            )
+
+        return BatchedDataDict[DatumSpec](
+            {
+                "task_name": ["test"] * size,
+                "message_log": message_logs,
+                "extra_env_info": [{}] * size,
+                "loss_multiplier": torch.ones(size),
+            }
+        )
+
+    def test_async_trajectory_collector_initialization(self):
+        """Test AsyncTrajectoryCollector initialization."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Test basic functionality
+        weight_version = ray.get(collector.get_weight_version.remote())
+        assert weight_version == 0
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_async_trajectory_collector_weight_version_updates(self):
+        """Test weight version updates in trajectory collector."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Update weight version
+        ray.get(collector.set_weight_version.remote(5))
+        weight_version = ray.get(collector.get_weight_version.remote())
+        assert weight_version == 5
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_async_trajectory_collector_pause_resume(self):
+        """Test pause and resume functionality."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Test pause and resume (these should not raise errors)
+        ray.get(collector.pause.remote())
+        ray.get(collector.resume.remote())
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_async_trajectory_collector_prepare_for_refit(self):
+        """Test prepare for refit functionality."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Test prepare for refit (should complete without hanging)
+        ray.get(collector.prepare_for_refit.remote())
+        ray.get(collector.resume_after_refit.remote())
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
+        """Test resume after refit invalidates cache without in-flight updates."""
+        collector = self.create_local_collector()
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = True
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+
+    def test_resume_after_refit_skips_cache_invalidation_when_recompute_disabled(self):
+        """Test resume after refit skips cache invalidation when recompute is disabled."""
+        collector = self.create_local_collector()
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = False
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_not_called()
+
+    def test_dynamo_cache_invalidation_failure_is_fatal_and_unblocks_waiters(self):
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {"backend": "dynamo"}
+        collector.master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(
+            side_effect=RuntimeError("pause failed")
+        )
+        collector._refit_pause_cleared.clear()
+
+        with pytest.raises(RuntimeError, match="cache invalidation failed"):
+            collector.resume_after_refit()
+
+        assert collector._refit_pause_cleared.is_set()
+
+    def test_dynamo_prepare_for_refit_drains_pending_generations(self):
+        """Dynamo layerwise reload never overlaps an active generation."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "dynamo",
+            "dynamo_cfg": {},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        collector.wait_for_pending_generations.assert_called_once_with()
+
+    def test_calculate_target_weights(self):
+        """Test target weight calculation logic."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Test target weight calculation with different scenarios
+        # Note: We can't directly test the private method, but we can test its effects
+        # through the public interface behavior
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_release_target_is_idempotent(self):
+        """A batch worker can safely release its target exactly once."""
+        collector = self.create_local_collector()
+        target_weight = 5
+
+        collector._generating_targets.add(target_weight)
+        collector._release_target(target_weight)
+        collector._release_target(target_weight)
+
+        assert target_weight not in collector._generating_targets
+
+    def test_startup_barrier_clears_when_collector_reserves_lookahead(self):
+        """A real lookahead reservation opens the resume startup barrier."""
+        num_prompts = 2
+        resume_step = 30
+        max_age = 2
+
+        buffer1 = ReplayBuffer.remote(
+            max_size=20, drop_incomplete_targets_on_restore=False
+        )
+        buffer2 = None
+        try:
+            for _ in range(num_prompts):
+                ray.get(
+                    buffer1.add.remote(
+                        {"batch": {"data": "x"}, "rollout_metrics": {}},
+                        weight_version=resume_step - 1,
+                        target_weight_version=resume_step,
+                    )
+                )
+            state = ray.get(buffer1.state_dict.remote())
+            ray.kill(buffer1)
+            buffer1 = None
+
+            buffer2 = ReplayBuffer.remote(
+                max_size=20, drop_incomplete_targets_on_restore=False
+            )
+            ray.get(
+                buffer2.load_state_dict.remote(
+                    state,
+                    num_prompts_per_step=num_prompts,
+                    current_training_step=resume_step,
+                    max_age_steps=max_age,
+                )
+            )
+
+            collector = self.create_local_collector(replay_buffer=buffer2)
+            collector.initial_weight_version = resume_step
+            collector.current_weight_version = resume_step
+
+            def barrier_open() -> bool:
+                return _startup_pipeline_ready(
+                    buffer2,
+                    collector.get_status(),
+                    current_step_ready=True,
+                    step=resume_step,
+                    num_prompts_per_step=num_prompts,
+                    max_trajectory_age_steps=max_age,
+                    max_num_steps=resume_step + 100,
+                )
+
+            assert not barrier_open()
+            reserved = collector._get_next_target_for_generation(resume_step)
+            assert reserved == resume_step + 1
+            assert collector.get_status()["generating_targets"] == [resume_step + 1]
+            assert barrier_open()
+
+            collector._release_target(reserved)
+            assert not barrier_open()
+        finally:
+            if buffer1 is not None:
+                ray.kill(buffer1)
+            if buffer2 is not None:
+                ray.kill(buffer2)
+
+    def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
+        """Test start failures do not leave a target reserved forever."""
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.get_trajectories_needed = RemoteMethod(1)
+
+        class FakeBatch:
+            size = 1
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats, *, share_immutable_media=False):
+                assert not share_immutable_media
+                return self
+
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+            def is_alive(self):
+                return False
+
+        target_weight = 5
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading,
+            "Thread",
+            FailingThread,
+        )
+
+        collector._process_batch(FakeBatch())
+
+        assert target_weight not in collector._generating_targets
+
+    def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
+        """Gap-fill sends only the needed prompt groups to one batch worker."""
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                # Batch has 2 prompts, but only 1 more trajectory is needed.
+                self.get_trajectories_needed = RemoteMethod(1)
+
+        started = []
+
+        class RecordingThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                started.append(self)
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        target_weight = 7
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.master_config.grpo.deduplicate_multimodal_data = True
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        captured = {}
+
+        async def capture_batch(**kwargs):
+            captured.update(kwargs)
+            collector._release_target(target_weight)
+
+        collector._get_next_target_for_generation = reserve_target
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(self.create_mock_batch(size=2))
+
+        # Only one worker spawned even though the batch holds 2 prompts.
+        assert len(started) == 1
+        assert captured["repeated_batch"].size == 3
+        assert captured["use_nemo_gym"] is False
+        assert target_weight not in collector._generating_targets
+
+    def test_process_batch_batches_gym_and_stamps_task_indices(self, monkeypatch):
+        """Gym uses one worker while preserving one task index per prompt group."""
+
+        class RemoteMethod:
+            def remote(self, *args, **kwargs):
+                return 2
+
+        class FakeReplayBuffer:
+            get_trajectories_needed = RemoteMethod()
+
+        started_threads = []
+
+        class RecordingThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                started_threads.append(self)
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        target_weight = 9
+        collector = self.create_local_collector(
+            replay_buffer=FakeReplayBuffer(), next_nemo_gym_task_index=37
+        )
+        collector.running = True
+        captured = {}
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        async def capture_batch(**kwargs):
+            captured.update(kwargs)
+            collector._release_target(target_weight)
+
+        collector._get_next_target_for_generation = reserve_target
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: True
+        )
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        # Stamping happens at yield time in _collection_loop; _process_batch
+        # must preserve the ordinals through slicing and repetition.
+        batch = self.create_mock_batch(size=2)
+        assert collector._stamp_task_indices(batch) is True
+        collector._process_batch(batch)
+
+        assert len(started_threads) == 1
+        assert captured["use_nemo_gym"] is True
+        assert captured["num_generations"] == 3
+        assert captured["repeated_batch"].size == 6
+        assert [
+            row["_ng_task_index"]
+            for row in captured["repeated_batch"]["extra_env_info"]
+        ] == [37, 37, 37, 38, 38, 38]
+        assert collector.get_rollouts_state() == {"next_ng_task_index": 39}
+        assert target_weight not in collector._generating_targets
+
+    def test_process_batch_non_gym_uses_one_batched_worker(self, monkeypatch):
+        """Native collection repeats all prompts into one batch worker."""
+
+        class RemoteMethod:
+            def remote(self, *args, **kwargs):
+                return 2
+
+        class FakeReplayBuffer:
+            get_trajectories_needed = RemoteMethod()
+
+        started_threads = []
+
+        class RecordingThread:
+            def __init__(self, *, target, daemon):
+                assert daemon
+                self.target = target
+
+            def start(self):
+                started_threads.append(self)
+                self.target()
+
+            def is_alive(self):
+                return False
+
+        target_weight = 11
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        captured = {}
+
+        async def capture_batch(**kwargs):
+            captured.update(kwargs)
+            collector._release_target(target_weight)
+
+        collector._get_next_target_for_generation = reserve_target
+        collector._run_rollout_batch_worker = capture_batch
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: False
+        )
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(self.create_mock_batch(size=2))
+
+        assert len(started_threads) == 1
+        assert captured["repeated_batch"].size == 6
+        assert captured["num_generations"] == 3
+        assert captured["use_nemo_gym"] is False
+        assert all(
+            "_ng_task_index" not in row
+            for row in captured["repeated_batch"]["extra_env_info"]
+        )
+        assert collector.get_rollouts_state() == {"next_ng_task_index": 0}
+        assert target_weight not in collector._generating_targets
+
+    def test_native_batch_worker_enqueues_each_group(self, monkeypatch):
+        """The common worker enqueues every native group without Gym metadata."""
+
+        class _ReadyResult:
+            def __init__(self, value):
+                self.value = value
+
+            def __await__(self):
+                async def _resolve():
+                    return self.value
+
+                return _resolve().__await__()
+
+        class RemoteMethod:
+            def __init__(self):
+                self.calls = []
+
+            def remote(self, *args):
+                self.calls.append(args)
+                return _ReadyResult("success")
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.add = RemoteMethod()
+
+        replay_buffer = FakeReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        target_weight = 13
+        collector._generating_targets.add(target_weight)
+        batches = [
+            BatchedDataDict({"value": torch.tensor([1, 2, 3])}),
+            BatchedDataDict({"value": torch.tensor([4, 5, 6])}),
+        ]
+        rollout_metrics = [{"metric": 7.0}, {"metric": 8.0}]
+
+        async def fake_rollouts(**kwargs):
+            assert kwargs["input_batch"].size == 6
+            assert kwargs["num_generations"] == 3
+            for group_index in range(2):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=group_index,
+                    final_batch=batches[group_index],
+                    rollout_metrics=rollout_metrics[group_index],
+                )
+
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout_groups",
+            fake_rollouts,
+        )
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=self.create_mock_batch(size=2).repeat_interleave(3),
+                generation_weight_version=2,
+                target_weight_version=target_weight,
+                num_generations=3,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert len(replay_buffer.add.calls) == 2
+        for group_index, call in enumerate(replay_buffer.add.calls):
+            trajectory_group, generation_weight, target = call
+            assert trajectory_group["batch"] is batches[group_index]
+            assert (
+                trajectory_group["rollout_metrics"]["metric"]
+                == rollout_metrics[group_index]["metric"]
+            )
+            assert trajectory_group["rollout_metrics"]["trajectory_duration_s"] >= 0
+            assert "_ng_task_index" not in trajectory_group
+            assert (
+                trajectory_group["batch"][TARGET_WEIGHT_VERSION_KEY].tolist()
+                == [target_weight] * 3
+            )
+            assert generation_weight == 2
+            assert target == target_weight
+        assert target_weight not in collector._generating_targets
+
+    def test_unexpected_replay_buffer_status_fails_batch(self, monkeypatch):
+        """Unknown replay-buffer statuses fail instead of polling forever."""
+
+        class _ReadyResult:
+            def __await__(self):
+                async def _resolve():
+                    return "unexpected"
+
+                return _resolve().__await__()
+
+        class _AddRemote:
+            def remote(self, *args):
+                return _ReadyResult()
+
+        class _ReplayBuffer:
+            add = _AddRemote()
+
+        async def fake_rollouts(**kwargs):
+            yield trajectory_collector_mod.RolloutGroupResult(
+                group_index=0,
+                final_batch=BatchedDataDict({"value": torch.tensor([1, 2, 3])}),
+                rollout_metrics={},
+            )
+
+        collector = self.create_local_collector(replay_buffer=_ReplayBuffer())
+        collector.running = True
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout_groups",
+            fake_rollouts,
+        )
+
+        with pytest.raises(RuntimeError, match="failed to buffer prompt groups") as exc:
+            asyncio.run(
+                collector._collect_rollout_batch(
+                    repeated_batch=self.create_mock_batch(size=1).repeat_interleave(3),
+                    generation_weight_version=2,
+                    target_weight_version=3,
+                    num_generations=3,
+                    use_nemo_gym=False,
+                )
+            )
+
+        assert exc.value.__cause__ is not None
+        assert "unexpected add status" in str(exc.value.__cause__)
+
+    def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
+        self, monkeypatch
+    ):
+        """Retries preserve effort shaping and do not re-enqueue buffered groups."""
+
+        class _ReadyResult:
+            def __init__(self, value):
+                self.value = value
+
+            def __await__(self):
+                async def _resolve():
+                    return self.value
+
+                return _resolve().__await__()
+
+        class RemoteMethod:
+            def __init__(self):
+                self.task_indices = []
+
+            def remote(self, trajectory_group, *args):
+                self.task_indices.append(trajectory_group["_ng_task_index"])
+                return _ReadyResult("success")
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.add = RemoteMethod()
+
+        replay_buffer = FakeReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector.master_config.policy["generation"] = {
+            "stop_token_ids": [1],
+            "stop_strings": ["stop"],
+        }
+        collector.master_config.env["nemo_gym"] = {
+            "effort_levels": {
+                "low_weight": 0.1,
+                "low_penalty": 1.0,
+                "low_ub": 15_000,
+                "low_string": "{reasoning effort: efficient}",
+            }
+        }
+        target_weight = 15
+        collector._generating_targets.add(target_weight)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 8},
+                    {"_ng_task_index": 8},
+                ],
+                "loss_multiplier": torch.ones(4),
+            }
+        )
+        rollout_calls = 0
+        rollout_call_attempt_indices = []
+
+        def _rollout_result(task_index):
+            return SimpleNamespace(
+                task_index=task_index,
+                final_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+                rollout_metrics={"task_index": task_index},
+            )
+
+        async def fake_rollouts(**kwargs):
+            nonlocal rollout_calls
+            assert kwargs["generation_config"]["stop_token_ids"] is None
+            assert kwargs["generation_config"]["stop_strings"] is None
+            assert kwargs["log_full_result_tables"] is False
+            assert kwargs["effort_config"] == EffortLevelsConfig(
+                low_weight=0.1,
+                low_penalty=1.0,
+                low_ub=15_000,
+                low_string="{reasoning effort: efficient}",
+            )
+            rollout_call_attempt_indices.append(
+                [
+                    row["_ng_attempt_index"]
+                    for row in kwargs["input_batch"]["extra_env_info"]
+                ]
+            )
+            rollout_calls += 1
+            if rollout_calls == 1:
+                yield _rollout_result(7)
+                raise RuntimeError("transient stream failure")
+            # The retry submits only the still-pending group (task 8, both K rows);
+            # the buffered task 7 is never re-rolled, so Gym can only answer for 8.
+            submitted = [
+                row["_ng_task_index"]
+                for row in kwargs["input_batch"]["extra_env_info"]
+            ]
+            assert submitted == [8, 8], submitted
+            yield _rollout_result(8)
+
+        async def no_sleep(delay):
+            return None
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_rollouts)
+        monkeypatch.setattr(trajectory_collector_mod.asyncio, "sleep", no_sleep)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert rollout_calls == 2
+        # Attempt 2 carries only the pending group's two rows, stamped attempt 1.
+        assert rollout_call_attempt_indices == [[0, 0, 0, 0], [1, 1]]
+        assert replay_buffer.add.task_indices == [7, 8]
+        assert target_weight not in collector._generating_targets
+
+    def test_invalid_gym_batch_releases_target(self):
+        """Validation errors cannot leave a target reservation stuck."""
+        collector = self.create_local_collector()
+        collector.running = True
+        target_weight = 16
+        collector._generating_targets.add(target_weight)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [{"_ng_task_index": 7}, {}],
+                "loss_multiplier": torch.ones(2),
+            }
+        )
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert target_weight not in collector._generating_targets
+
+    def test_rollouts_state_retrieval(self):
+        collector = self.create_local_collector(next_nemo_gym_task_index=123)
+
+        assert collector.get_rollouts_state() == {"next_ng_task_index": 123}
+
+    def test_dataloader_state_retrieval(self):
+        """Test getting dataloader state for checkpointing."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Test getting dataloader state (should return empty dict when no dataloader)
+        state = ray.get(collector.get_dataloader_state.remote())
+        assert isinstance(state, dict)
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    @pytest.mark.parametrize("max_generation_failures", [0, 2])
+    def test_batch_worker_failure_surfaces_after_threshold(
+        self, monkeypatch, max_generation_failures
+    ):
+        """Consecutive batch-worker failures become sticky past the limit."""
+        collector = self.create_local_collector(
+            max_generation_failures=max_generation_failures
+        )
+        collector.running = True
+        target_weight = 7
+
+        outcomes = []
+        if max_generation_failures > 0:
+            outcomes.append(ValueError("pre-reset failure"))
+        outcomes.append(None)
+        outcomes.extend(
+            ValueError(f"backend failed {failure_index}")
+            for failure_index in range(max_generation_failures + 2)
+        )
+
+        async def collect_rollout_batch(**kwargs):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", collect_rollout_batch)
+
+        def run_worker(*, expect_generation_wake):
+            collector._generation_limit_cleared.clear()
+            collector._generating_targets.add(target_weight)
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=None,
+                    generation_weight_version=4,
+                    target_weight_version=target_weight,
+                    num_generations=1,
+                    use_nemo_gym=False,
+                )
+            )
+            assert target_weight not in collector._generating_targets
+            assert (
+                collector._generation_limit_cleared.is_set() is expect_generation_wake
+            )
+
+        collector.check_health()
+
+        if max_generation_failures > 0:
+            run_worker(expect_generation_wake=True)
+            assert collector._failure_count == 1
+            collector.check_health()
+
+        # A worker that finishes cleanly also wakes the loop: with zero-variance drops it
+        # can still leave its target short (see _run_rollout_batch_worker finally-block).
+        run_worker(expect_generation_wake=True)
+        assert collector._failure_count == 0
+        collector.check_health()
+
+        for failure_index in range(max_generation_failures + 1):
+            run_worker(expect_generation_wake=True)
+            if failure_index < max_generation_failures:
+                collector.check_health()
+
+        expected_count = max_generation_failures + 1
+        with pytest.raises(RuntimeError) as exc_info:
+            collector.check_health()
+
+        error_message = str(exc_info.value)
+        assert f"{expected_count} batch-worker failure(s)" in error_message
+        assert f"max_generation_failures={max_generation_failures}" in error_message
+        assert "native batch worker" in error_message
+        assert "generation_weight=4" in error_message
+        assert "target_weight=7" in error_message
+        assert (
+            f"ValueError('backend failed {max_generation_failures}')" in error_message
+        )
+        assert "Worker traceback:" in error_message
+        assert "Traceback (most recent call last):" in error_message
+
+        first_fatal_error = exc_info.value
+        run_worker(expect_generation_wake=True)
+        assert collector._failure_count == expected_count + 1
+
+        with pytest.raises(RuntimeError, match="target_weight=7") as repeated_exc_info:
+            collector.check_health()
+
+        assert repeated_exc_info.value is not first_fatal_error
+        assert str(repeated_exc_info.value) == error_message
+
+    def test_tolerated_worker_failure_wakes_gap_fill_pause(self, monkeypatch):
+        """A failed worker releases and wakes a max-age-one target for gap fill."""
+        collector = self.create_local_collector(max_generation_failures=3)
+        collector.master_config.grpo.async_grpo.max_trajectory_age_steps = 1
+        collector.current_weight_version = 4
+        collector.running = True
+        collector.dataloader = [{"batch": 0}]
+        target_weight = 5
+        collector._generating_targets.add(target_weight)
+        collector._last_limit_warning_version = collector.current_weight_version
+
+        release_target = collector._release_target
+
+        def release_before_wake(target_weight_version):
+            assert not collector._generation_limit_cleared.is_set()
+            release_target(target_weight_version)
+
+        monkeypatch.setattr(collector, "_release_target", release_before_wake)
+
+        monkeypatch.setattr(
+            collector,
+            "_should_pause_for_generation_limits",
+            lambda: target_weight in collector._generating_targets,
+        )
+
+        gap_fill_started = threading.Event()
+
+        def process_gap_fill(batch):
+            assert target_weight not in collector._generating_targets
+            gap_fill_started.set()
+
+        monkeypatch.setattr(collector, "_process_batch", process_gap_fill)
+
+        async def fail_rollout_batch(**kwargs):
+            raise ValueError("worker exhausted retries")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_rollout_batch)
+
+        collection_thread = threading.Thread(target=collector._collection_loop)
+        collection_thread.start()
+        deadline = time.monotonic() + 1
+        while collector._generation_limit_cleared.is_set():
+            assert time.monotonic() < deadline, "collection loop did not enter pause"
+            time.sleep(0.01)
+        assert not gap_fill_started.is_set()
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert gap_fill_started.wait(timeout=1)
+        collection_thread.join(timeout=1)
+        assert not collection_thread.is_alive()
+        assert collector._failure_count == 1
+        collector.check_health()
+
+    def test_worker_shutdown_error_is_not_counted(self, monkeypatch):
+        """An in-flight worker stopping after exhaustion is not a generation failure."""
+        collector = self.create_local_collector(max_generation_failures=0)
+        collector.running = False
+        collector.data_exhausted = True
+        target_weight = 7
+        collector._generating_targets.add(target_weight)
+        collector._inflight_threads.add(threading.current_thread())
+        collector._generation_limit_cleared.clear()
+
+        async def fail_during_shutdown(**kwargs):
+            raise RuntimeError("Trajectory collection stopped before enqueue completed")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_during_shutdown)
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert collector._failure_count == 0
+        assert collector._fatal_error_message is None
+        # The wake is unconditional (a spurious wake costs one pause re-check); the
+        # loop is not running here, so it is harmless.
+        assert collector._generation_limit_cleared.is_set()
+        assert target_weight not in collector._generating_targets
+        assert threading.current_thread() not in collector._inflight_threads
+        collector.check_health()
+
+
+class TestAsyncUtilsIntegration:
+    """Integration tests for async utilities working together."""
+
+    def create_mock_config(self) -> MasterConfig:
+        """Create a mock master config for testing."""
+        return MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=2,
+                max_rollout_turns=1,
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_trajectory_age_steps=1,
+                    max_generation_failures=0,
+                ),
+            ),
+            policy={
+                "max_total_sequence_length": 512,
+                "make_sequence_length_divisible_by": 1,
+            },
+        )
+
+    def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
+        """Create a mock batch for testing."""
+        message_logs = []
+        for i in range(size):
+            message_logs.append(
+                [
+                    {"role": "user", "content": f"Test prompt {i}"},
+                ]
+            )
+
+        return BatchedDataDict[DatumSpec](
+            {
+                "task_name": ["test"] * size,
+                "message_log": message_logs,
+                "extra_env_info": [{}] * size,
+                "loss_multiplier": torch.ones(size),
+            }
+        )
+
+    def test_buffer_and_collector_integration(self):
+        """Test that buffer and collector work together correctly."""
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Verify initial state
+        buffer_size = ray.get(buffer.size.remote())
+        assert buffer_size == 0
+
+        weight_version = ray.get(collector.get_weight_version.remote())
+        assert weight_version == 0
+
+        # Test weight version synchronization
+        ray.get(collector.set_weight_version.remote(3))
+        updated_version = ray.get(collector.get_weight_version.remote())
+        assert updated_version == 3
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_concurrent_operations(self):
+        """Test that concurrent operations don't cause race conditions."""
+        buffer = ReplayBuffer.remote(
+            max_size=5, drop_incomplete_targets_on_restore=False
+        )
+
+        # Push trajectories concurrently from multiple threads
+        def push_trajectory(buffer, trajectory_id):
+            trajectory = {
+                "batch": {"data": f"test{trajectory_id}"},
+                "rollout_metrics": {"reward": float(trajectory_id)},
+            }
+            return ray.get(
+                buffer.add.remote(
+                    trajectory,
+                    weight_version=trajectory_id,
+                    target_weight_version=trajectory_id + 1,
+                )
+            )
+
+        # Use threading to simulate concurrent pushes
+        threads = []
+        results = []
+
+        def worker(traj_id):
+            result = push_trajectory(buffer, traj_id)
+            results.append(result)
+
+        for i in range(3):
+            thread = threading.Thread(target=worker, args=(i,))
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        # All pushes should succeed
+        assert all(result == "success" for result in results)
+
+        # Buffer should have correct size
+        final_size = ray.get(buffer.size.remote())
+        assert final_size == 3
+
+        ray.kill(buffer)
+
+    def test_error_handling(self):
+        """Test error handling in async utilities."""
+        # Test with invalid buffer size
+        with pytest.raises(Exception):
+            buffer = ReplayBuffer.remote(
+                max_size=-1, drop_incomplete_targets_on_restore=False
+            )
+            ray.get(buffer.size.remote())
+
+        # Test buffer operations
+        buffer = ReplayBuffer.remote(
+            max_size=1, drop_incomplete_targets_on_restore=False
+        )
+
+        # Test sampling from empty buffer
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=0,
+                max_age_steps=1,
+            )
+        )
+        assert sample_result is None
+
+        ray.kill(buffer)
+
+
+class TestPromptExtraction:
+    """Test cases for prompt extraction logic used in async GRPO advantage calculation.
+
+    These tests verify that the length-based prompt extraction correctly handles
+    multi-turn conversation prompts where the original prompt itself contains
+    assistant messages (conversation history).
+    """
+
+    def test_prompt_extraction_with_multi_turn_history(self):
+        """Test that prompt extraction correctly handles prompts containing assistant messages.
+
+        This tests the fix for multi-turn conversation prompts where the original prompt
+        from the dataset itself contains assistant messages (conversation history).
+        The extraction should use the length field to identify original prompt messages,
+        not break at the first assistant message.
+        """
+        # Create a multi-turn prompt with assistant messages in the history
+        # Original prompt: user -> assistant -> user (3 messages, 15 tokens total)
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([6, 7, 8, 9, 10]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([11, 12, 13, 14, 15]),
+            },
+        ]
+
+        # Generated response (added after original prompt)
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([16, 17, 18]),
+        }
+
+        # Full message_log after generation
+        full_message_log = original_prompt_messages + [generated_message]
+
+        # Original prompt length = sum of token_ids in original prompt
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )  # 15
+
+        message_logs = [full_message_log]
+        original_prompt_lengths = torch.tensor([original_prompt_length])
+
+        result = extract_initial_prompt_messages(message_logs, original_prompt_lengths)
+        initial_prompt_log = result[0]
+
+        # Should extract all 3 original messages, NOT break at first assistant
+        assert len(initial_prompt_log) == 3, (
+            f"Expected 3 messages (user, assistant, user), got {len(initial_prompt_log)}. "
+            "The extraction should NOT break at the first assistant message when it's part of the original prompt."
+        )
+
+        assert initial_prompt_log[0]["role"] == "user"
+        assert initial_prompt_log[1]["role"] == "assistant"
+        assert initial_prompt_log[2]["role"] == "user"
+        assert generated_message not in initial_prompt_log
+
+    def test_prompt_extraction_with_single_turn(self):
+        """Test that prompt extraction works correctly for single-turn prompts (regression test)."""
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
+            },
+        ]
+
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([6, 7, 8]),
+        }
+
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+        initial_prompt_log = result[0]
+
+        assert len(initial_prompt_log) == 1
+        assert initial_prompt_log[0]["role"] == "user"
+        assert generated_message not in initial_prompt_log
+
+    def test_prompt_extraction_with_system_message(self):
+        """Test prompt extraction with system message included."""
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "You are a math tutor.",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([4, 5, 6, 7]),
+            },
+        ]
+
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([8, 9]),
+        }
+
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+        initial_prompt_log = result[0]
+
+        assert len(initial_prompt_log) == 2
+        assert initial_prompt_log[0]["role"] == "system"
+        assert initial_prompt_log[1]["role"] == "user"
+        assert generated_message not in initial_prompt_log
+
+    def test_prompt_extraction_complex_multi_turn(self):
+        """Test prompt extraction with complex multi-turn history (multiple assistant turns)."""
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "Math tutor",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {"role": "user", "content": "2+2?", "token_ids": torch.tensor([3, 4])},
+            {"role": "assistant", "content": "4", "token_ids": torch.tensor([5, 6])},
+            {"role": "user", "content": "3+3?", "token_ids": torch.tensor([7, 8])},
+            {"role": "assistant", "content": "6", "token_ids": torch.tensor([9, 10])},
+            {"role": "user", "content": "4+4?", "token_ids": torch.tensor([11, 12])},
+        ]
+
+        generated_message = {
+            "role": "assistant",
+            "content": "8",
+            "token_ids": torch.tensor([13, 14]),
+        }
+
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+        initial_prompt_log = result[0]
+
+        assert len(initial_prompt_log) == 6, (
+            f"Expected 6 messages, got {len(initial_prompt_log)}. "
+            "All history messages should be included in the prompt."
+        )
+
+        expected_roles = ["system", "user", "assistant", "user", "assistant", "user"]
+        actual_roles = [m["role"] for m in initial_prompt_log]
+        assert actual_roles == expected_roles
+        assert generated_message not in initial_prompt_log
+
+    def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
+        """Test that assistant messages in the original prompt are not trained on."""
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+        ]
+        generated_logprobs = torch.tensor([0.1, 0.2])
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([7, 8]),
+            "generation_logprobs": generated_logprobs,
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([full_message_log])
+
+        assert torch.equal(full_message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[2]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[3]["token_loss_mask"], torch.tensor([1, 1]))
+        assert torch.equal(
+            full_message_log[3]["generation_logprobs"], generated_logprobs
+        )
+
+    def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
+        """Test that only assistant messages with generation logprobs are trainable."""
+        message_log = [
+            {
+                "role": "assistant",
+                "content": "prompt history",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "next question",
+                "token_ids": torch.tensor([3, 4]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {
+                "role": "assistant",
+                "content": "generated response",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.5, 0.6]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(
+            message_log[0]["generation_logprobs"], torch.tensor([0.0, 0.0])
+        )
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
+
+
+def test_turn_count_fallback_priority():
+    """_rollout_metrics_turn_count_for_diagnostics honors the documented key priority."""
+    f = ReplayBufferImpl._rollout_metrics_turn_count_for_diagnostics
+    assert (
+        f(
+            {
+                "max_turns_per_sample": 7,
+                "avg_turns_per_sample": 1,
+                "turns_per_sample/max": 2,
+                "turns_per_sample/mean": 3,
+            }
+        )
+        == 7.0
+    )
+    assert f({"avg_turns_per_sample": 4, "turns_per_sample/max": 2}) == 4.0
+    assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
+    assert f({"turns_per_sample/mean": 6}) == 6.0
+    assert f({"reward": 1.0}) is None

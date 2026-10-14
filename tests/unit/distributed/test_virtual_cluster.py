@@ -1,0 +1,604 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import os
+import socket
+import subprocess
+from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
+
+import pytest
+import ray
+
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
+    DEFAULT_MASTER_PORT_RANGE_HIGH,
+    DEFAULT_MASTER_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
+    PY_EXECUTABLES,
+    RayVirtualCluster,
+    ResourceInsufficientError,
+    _bind_socket_in_range,
+    _get_free_consecutive_ports_local,
+    _get_free_port_local,
+    _get_node_ip_and_free_port,
+)
+from nemo_rl.utils.venvs import create_local_venv
+from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def test_get_node_ip_and_free_port_does_not_start_with_zero():
+    # This test covers a case where the hostname was an integer like "255"
+    # and socket returned an ip address equivalent to this hostname, i.e., "0.0.0.255".
+    # It's not possible to mock the way the hostname is actually set on other platforms,
+    # so we leave this test so we can ask users to run on their environment if needed.
+
+    node_ip, _ = ray.get(
+        _get_node_ip_and_free_port.options(
+            runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+        ).remote()
+    )
+    assert not node_ip.startswith("0."), "Node IP should not start with 0.*.*.*"
+
+
+def test_env_max_retries_invalid_value():
+    """Test that NRL_VIRTUAL_CLUSTER_MAX_RETRIES rejects invalid values (less than or equal to zero)."""
+
+    # Mock environment with invalid max_retries value
+    env_vars = {"NRL_VIRTUAL_CLUSTER_MAX_RETRIES": "0"}
+
+    with patch.dict(os.environ, env_vars, clear=True):
+        with pytest.raises(AssertionError):
+            cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
+            cluster._init_placement_groups()
+
+
+def test_env_max_retries_non_integer():
+    """Test that NRL_VIRTUAL_CLUSTER_MAX_RETRIES handles non-integer values properly."""
+
+    # Mock environment with non-integer max_retries value
+    env_vars = {"NRL_VIRTUAL_CLUSTER_MAX_RETRIES": "not_a_number"}
+
+    with patch.dict(os.environ, env_vars, clear=True):
+        with pytest.raises(ValueError):
+            cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
+            cluster._init_placement_groups()
+
+
+def test_env_max_retries_default_value():
+    """Test that default value for NRL_VIRTUAL_CLUSTER_MAX_RETRIES is used when not set."""
+
+    # Ensure environment variable is not set
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch(
+            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._init_placement_groups"
+        ) as mock_init,
+    ):
+        # Mock successful initialization
+        mock_init.return_value = [MagicMock()]
+
+        # Create cluster
+        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
+        cluster._init_placement_groups()
+
+        # Default value should be 6 (as seen in the code)
+        # We can't directly verify this, but we can check that initialization was attempted
+        assert mock_init.call_count == 1
+
+
+def test_env_max_retries_exhausted():
+    """Test that NRL_VIRTUAL_CLUSTER_MAX_RETRIES correctly handles the case where all retries fail."""
+
+    # Set specific retry count to 4
+    retry_count = 4
+    env_vars = {"NRL_VIRTUAL_CLUSTER_MAX_RETRIES": str(retry_count)}
+
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch(
+            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._create_placement_groups_internal"
+        ) as mock_init,
+        patch("time.sleep") as mock_sleep,
+    ):
+        # Make _init_placement_groups raise ResourceInsufficientError each time
+        mock_init.side_effect = ResourceInsufficientError("Not enough resources")
+
+        # Create cluster - should retry retry_count times and then fail
+        with pytest.raises(ResourceInsufficientError):
+            cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
+            cluster._init_placement_groups()
+
+        # Verify _init_placement_groups was called exactly retry_count times
+        assert mock_init.call_count == retry_count
+
+        # Verify time.sleep was called with exponentially increasing values
+        assert mock_sleep.call_count == retry_count
+        mock_sleep.assert_any_call(1)  # 2^0
+        mock_sleep.assert_any_call(2)  # 2^1
+        mock_sleep.assert_any_call(4)  # 2^2
+        mock_sleep.assert_any_call(8)  # 2^3
+
+
+def test_ray_reinit_on_cuda_devices_change():
+    """Test that Ray cluster is reinitialized when CUDA_VISIBLE_DEVICES changes."""
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.shutdown") as mock_ray_shutdown,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        # First call with CUDA_VISIBLE_DEVICES=0
+        mock_cluster_resources.return_value = {"GPU": 1, "nrl_tag_0": 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray()
+
+        assert mock_ray_init.call_count == 1
+        assert mock_ray_shutdown.call_count == 0
+        mock_ray_init.reset_mock()
+        mock_ray_shutdown.reset_mock()
+
+        # Second call with CUDA_VISIBLE_DEVICES=1
+        mock_cluster_resources.return_value = {"GPU": 1, "nrl_tag_0": 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}, clear=True):
+            init_ray()
+
+        # Ray should be shutdown and reinitialized since the tag doesn't match
+        assert (
+            mock_ray_init.call_count == 2
+        )  # Once for initial connect, once for reinit
+        assert mock_ray_shutdown.call_count == 1  # Should shutdown after tag mismatch
+
+        # Verify that the second init call included the new tag
+        second_init_call = mock_ray_init.call_args_list[1]
+        assert "resources" in second_init_call[1]
+        assert "nrl_tag_1" in second_init_call[1]["resources"]
+
+
+def test_ray_uses_same_cluster_for_permuted_cuda_devices():
+    """Test that Ray cluster is reused if CUDA_VISIBLE_DEVICES order changes but set of devices is the same."""
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.shutdown") as mock_ray_shutdown,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        # Expected sorted tag
+        expected_tag = "nrl_tag_0_2"
+
+        # First call with CUDA_VISIBLE_DEVICES="0,2"
+        mock_cluster_resources.return_value = {"GPU": 2, expected_tag: 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,2"}, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray()
+
+        assert mock_ray_init.call_count == 1
+        assert mock_ray_init.call_args_list[0][1]["address"] == "auto"
+        assert mock_ray_shutdown.call_count == 0
+        mock_ray_init.reset_mock()
+        mock_ray_shutdown.reset_mock()
+
+        # Second call with CUDA_VISIBLE_DEVICES="2,0"
+        mock_cluster_resources.return_value = {"GPU": 2, expected_tag: 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,0"}, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray()
+
+        assert mock_ray_init.call_count == 1
+        assert mock_ray_init.call_args_list[0][1]["address"] == "auto"
+        assert mock_ray_shutdown.call_count == 0
+
+
+def test_mcore_py_executable():
+    # The temporary directory is created within the project.
+    # For some reason, creating a virtual environment outside of the project
+    # doesn't work reliably.
+    with TemporaryDirectory(dir=TEST_ASSETS_DIR) as tempdir:
+        # Mock os.environ to set NEMO_RL_VENV_DIR for this test
+        with patch.dict(os.environ, {"NEMO_RL_VENV_DIR": tempdir}):
+            venv_python = create_local_venv(
+                py_executable=PY_EXECUTABLES.MCORE, venv_name="test_venv"
+            )
+            assert os.path.exists(venv_python)
+            assert venv_python == f"{tempdir}/test_venv/bin/python"
+
+            # Run a Python command to see if core dependencies were installed
+            result = subprocess.run(
+                [
+                    venv_python,
+                    "-c",
+                    # Importing nemo_rl must be first to ensure all of megatron is importable
+                    "import nemo_rl; print('nemo_rl is imported'); import transformer_engine.pytorch as te; print('te is imported'); import megatron.bridge; print('megatron-bridge is imported'); import megatron.core; print('megatron-core is imported'); import megatron.training; print('megatron-training is imported');",
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            # Verify the command executed successfully (return code 0)
+            assert result.returncode == 0, (
+                f"Failed to import mcore libraries: {result.stderr}"
+            )
+            assert "nemo_rl is imported" in result.stdout
+            assert "te is imported" in result.stdout
+            assert "megatron-bridge is imported" in result.stdout
+            assert "megatron-core is imported" in result.stdout
+            assert "megatron-training is imported" in result.stdout
+
+
+def test_create_sorted_bundle_indices_for_unified_pg():
+    """Test that sorted bundle indices are created for a unified placement group."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    cluster._init_placement_groups(strategy=None, use_unified_pg=True)
+    assert cluster._sorted_bundle_indices is not None
+    assert len(cluster._sorted_bundle_indices) == 2
+    assert 0 in cluster._sorted_bundle_indices
+    assert 1 in cluster._sorted_bundle_indices
+
+
+def test_not_create_sorted_bundle_indices_for_per_node_pg():
+    """Test that sorted bundle indices are not created for a per-node placement group."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    cluster._init_placement_groups(strategy=None, use_unified_pg=False)
+    assert cluster._sorted_bundle_indices is None
+
+
+class TestBindSocketInRange:
+    """Tests for _bind_socket_in_range()."""
+
+    def test_binds_port_within_range(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            port = _bind_socket_in_range(s, 11001, 11100)
+            assert 11001 <= port < 11100
+
+    def test_raises_after_max_retries_exhausted(self):
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError("Address already in use")
+        with pytest.raises(RuntimeError, match="Could not find a free port"):
+            _bind_socket_in_range(mock_sock, 11999, 12000, max_retries=10)
+        assert mock_sock.bind.call_count == 10
+
+    def test_retries_on_occupied_port(self):
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = [
+            OSError("Address already in use"),
+            OSError("Address already in use"),
+            OSError("Address already in use"),
+            None,
+        ]
+        port = _bind_socket_in_range(mock_sock, 12001, 12100, max_retries=50)
+        assert 12001 <= port < 12100
+        assert mock_sock.bind.call_count == 4
+
+    def test_single_port_range(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            port = _bind_socket_in_range(s, 12010, 12011)
+            assert port == 12010
+
+    def test_exhaustive_selection_skips_excluded_ports(self, monkeypatch):
+        mock_sock = MagicMock()
+        monkeypatch.setattr("random.shuffle", lambda candidates: None)
+
+        port = _bind_socket_in_range(
+            mock_sock,
+            12020,
+            12023,
+            max_retries=None,
+            excluded_ports={12020, 12021},
+        )
+
+        assert port == 12022
+        mock_sock.bind.assert_called_once_with(("", 12022))
+
+
+class TestGetFreePortLocal:
+    """Tests for _get_free_port_local()."""
+
+    def test_returns_port_in_default_range(self):
+        port = _get_free_port_local()
+        assert DEFAULT_MASTER_PORT_RANGE_LOW <= port < DEFAULT_MASTER_PORT_RANGE_HIGH
+
+    def test_returns_port_in_custom_range(self):
+        port = _get_free_port_local(port_range_low=13000, port_range_high=13100)
+        assert 13000 <= port < 13100
+
+    def test_port_is_reusable_after_return(self):
+        port = _get_free_port_local(port_range_low=13100, port_range_high=13200)
+        # The socket is closed after _get_free_port_local returns (context manager),
+        # so we should be able to bind to the same port again.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+
+    def test_multiple_calls_return_different_ports(self):
+        ports = {
+            _get_free_port_local(port_range_low=13200, port_range_high=14000)
+            for _ in range(10)
+        }
+        # With a range of 800 ports, 10 calls should very likely produce multiple unique ports
+        assert len(ports) > 1
+
+
+class TestGetFreeConsecutivePortsLocal:
+    """Tests for _get_free_consecutive_ports_local()."""
+
+    def test_single_port_in_range(self):
+        port = _get_free_consecutive_ports_local(14000, 14100, consecutive=1)
+        assert 14000 <= port < 14100
+
+    def test_returns_bindable_contiguous_block(self):
+        n = 5
+        base = _get_free_consecutive_ports_local(14100, 14300, consecutive=n)
+        assert 14100 <= base
+        assert base + n - 1 < 14300
+        # All n ports are simultaneously bindable.
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_start_port_below_low_is_clamped(self):
+        base = _get_free_consecutive_ports_local(
+            14300, 14400, consecutive=1, start_port=1000
+        )
+        assert base >= 14300
+
+    def test_cursor_advance_yields_non_overlapping_blocks(self):
+        n = 3
+        first = _get_free_consecutive_ports_local(14400, 14600, consecutive=n)
+        second = _get_free_consecutive_ports_local(
+            14400, 14600, consecutive=n, start_port=first + n
+        )
+        assert second >= first + n
+
+    def test_raises_when_range_exhausted(self):
+        # A 3-wide range cannot fit a block of 5.
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(14600, 14603, consecutive=5)
+
+    def test_port_is_reusable_after_return(self):
+        base = _get_free_consecutive_ports_local(14700, 14800, consecutive=2)
+        # Sockets are closed before return, so the block can be re-bound.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", base))
+
+    def test_raises_when_start_port_at_or_above_high(self):
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(
+                14850, 14900, consecutive=1, start_port=15000
+            )
+
+    def test_block_fits_exactly_against_high_boundary(self):
+        # high is exclusive: a block whose last port is high-1 must still fit.
+        n = 4
+        base = _get_free_consecutive_ports_local(14900, 14900 + n, consecutive=n)
+        assert base == 14900
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_rejects_non_positive_consecutive(self):
+        with pytest.raises(AssertionError, match="consecutive must be >= 1"):
+            _get_free_consecutive_ports_local(14950, 15000, consecutive=0)
+
+
+class TestRayVirtualClusterPortRange:
+    """Tests for port range propagation in RayVirtualCluster."""
+
+    def test_default_port_range(self):
+        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
+        assert cluster.port_range_low == DEFAULT_MASTER_PORT_RANGE_LOW
+        assert cluster.port_range_high == DEFAULT_MASTER_PORT_RANGE_HIGH
+
+    def test_custom_port_range(self):
+        cluster = RayVirtualCluster(
+            bundle_ct_per_node_list=[1],
+            port_range_low=20000,
+            port_range_high=25000,
+        )
+        assert cluster.port_range_low == 20000
+        assert cluster.port_range_high == 25000
+
+
+class TestVllmPortAssignment:
+    """Tests for VLLM_PORT env var calculation in BaseVllmGenerationWorker.configure_worker."""
+
+    @pytest.mark.parametrize(
+        "bundle_indices,expected_port",
+        [
+            # TP=1: single-bundle engines, engine_index = bundle index
+            ((0, [0]), 7000),
+            ((0, [1]), 7100),
+            ((0, [7]), 7700),
+            ((1, [0]), 7000),
+            ((1, [3]), 7300),
+            # TP=4: multi-bundle engine, engine_index = first_bundle // tp_size
+            ((0, [0, 1, 2, 3]), 7000),  # 0 // 4 = 0
+            ((0, [4, 5, 6, 7]), 7100),  # 4 // 4 = 1
+            # TP=2: multi-bundle engine
+            ((0, [0, 1]), 7000),  # 0 // 2 = 0
+            ((0, [2, 3]), 7100),  # 2 // 2 = 1
+            ((0, [6, 7]), 7300),  # 6 // 2 = 3
+            # TP=8: entire node is one engine
+            ((0, [0, 1, 2, 3, 4, 5, 6, 7]), 7000),  # 0 // 8 = 0
+        ],
+    )
+    def test_vllm_port_assignment(self, bundle_indices, expected_port):
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1, bundle_indices=bundle_indices
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices,expected_slot",
+        [
+            # expected_slot is the node-local engine index; the port is
+            # DEFAULT_VLLM_PORT_RANGE_LOW + slot * DEFAULT_VLLM_PORTS_PER_ENGINE.
+            # Deriving it from the constants keeps this test correct if the base
+            # of the vLLM port band changes.
+            #
+            # With 8 GPUs per node, engines that fit on one node give the same
+            # slot as the original index, since the bundle id modulo 8 is
+            # unchanged within a node.
+            (8, (0, [0]), 0),
+            (8, (0, [7]), 7),
+            (8, (0, [4, 5, 6, 7]), 1),  # (4 % 8) // 4
+            (8, (0, [0, 1, 2, 3, 4, 5, 6, 7]), 0),  # 8-GPU engine
+            # A model-parallel size larger than the per-node GPU count means the
+            # engine spans several nodes. Each engine's rank-0 process is on a
+            # different node, so they all use node-local slot 0. The original
+            # index would instead climb (the second engine gives 16 // 16 = 1,
+            # and so on).
+            (8, (0, list(range(16))), 0),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(16, 32))), 0),  # second such engine
+            (8, (0, list(range(32, 48))), 0),  # third such engine
+            (8, (0, list(range(32))), 0),  # DeepSeek-V3 generation TP=32
+            # 4 GPUs per node, for example GB200 NVL72.
+            (4, (0, [3]), 3),  # 3 % 4
+            (4, (0, [0, 1, 2, 3]), 0),  # 4-GPU engine
+            (4, (0, list(range(8, 16))), 0),  # 8-GPU engine across 2 nodes
+        ],
+    )
+    def test_vllm_port_assignment_respects_num_gpus_per_node(
+        self, num_gpus_per_node, bundle_indices, expected_slot
+    ):
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        expected_port = (
+            DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices",
+        [
+            (8, (0, list(range(16)))),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(32)))),  # DeepSeek-V3 generation TP=32, 4 nodes
+            (4, (0, list(range(8, 16)))),  # 8-GPU engine across 2 GB200 nodes
+        ],
+    )
+    def test_node_spanning_engines_keep_a_port_below_the_ephemeral_floor(
+        self, num_gpus_per_node, bundle_indices
+    ):
+        """Engines that span nodes must still get a port in the reserved band.
+
+        Leaving VLLM_PORT unset would send vLLM to kernel-assigned ephemeral
+        ports, reintroducing the TOCTOU contention the port layout exists to
+        avoid. The vLLM 0.25 TCPStore/MessageQueue collision within one engine's
+        window is handled by offsetting the TCPStore search instead (see
+        _patch_vllm_ray_executor_v2_tcpstore_port).
+        """
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        # Lowest observed ephemeral floor on some GB200 nodes.
+        EPHEMERAL_FLOOR = 9000
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        assert "VLLM_PORT" in env_vars
+        port = int(env_vars["VLLM_PORT"])
+        assert DEFAULT_VLLM_PORT_RANGE_LOW <= port < EPHEMERAL_FLOOR
+        # The TCPStore search is offset by 32 within the engine's window, so the
+        # whole window must stay below the ephemeral floor.
+        assert port + DEFAULT_VLLM_PORTS_PER_ENGINE <= EPHEMERAL_FLOOR
+
+    def test_no_vllm_port_without_bundle_indices(self):
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
+        assert "VLLM_PORT" not in env_vars
+
+
+def test_default_port_ranges_ordered_and_below_ephemeral_floor():
+    # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
+    EPHEMERAL_FLOOR = 9000
+    assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
+    assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
+    assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
+    # Ordered, non-overlapping bands: master < generation < gym < vllm.
+    assert DEFAULT_MASTER_PORT_RANGE_HIGH < DEFAULT_GENERATION_PORT_RANGE_LOW
+    assert DEFAULT_GENERATION_PORT_RANGE_HIGH < DEFAULT_GYM_PORT_RANGE_LOW
+    assert DEFAULT_GYM_PORT_RANGE_HIGH < DEFAULT_VLLM_PORT_RANGE_LOW
+    # Top vLLM engine (8 GPUs, TP=1) stays below the ephemeral floor.
+    assert (
+        DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
+        < EPHEMERAL_FLOOR
+    )
+    # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
+    # rollout backend runs at a time), stay above the 8-engine vLLM high-water
+    # mark and the Ray dashboard (8265), and sit below the ephemeral floor.
+    assert (
+        DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
+        < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    )
+    assert 8265 < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
+    assert (
+        DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
+    )
+    assert (
+        DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
+        < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH
+    )
+    assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
+    # Avoid privileged ports (<1024).
+    assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024

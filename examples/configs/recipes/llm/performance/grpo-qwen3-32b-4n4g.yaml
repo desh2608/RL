@@ -1,0 +1,18 @@
+defaults: ./grpo-qwen3-32b-4n8g.yaml
+loss_fn:
+  force_on_policy_ratio: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-4n4g
+policy:
+  train_global_batch_size: 2048
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+logger:
+  log_dir: logs/grpo-qwen3-32b-4n4g
+  wandb:
+    name: grpo-qwen3-32b-4n4g
+cluster:
+  gpus_per_node: 4

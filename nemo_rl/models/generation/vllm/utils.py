@@ -1,0 +1,669 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import is_dataclass, replace
+from typing import Any, Callable, Optional
+
+import torch
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    GenerationDatumSpec,
+)
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
+VLLM_LOGPROB_FLOOR = -9999.0
+
+
+def remap_multimodal_placeholders(
+    *,
+    template_token_ids: list[int],
+    final_token_ids: list[int],
+    mm_placeholders: Mapping[str, list[Any]],
+) -> dict[str, list[Any]]:
+    """Move vLLM multimodal ranges into the final prompt coordinates.
+
+    vLLM computes multimodal placeholder offsets while preprocessing the
+    chat-template token sequence. NeMo-RL can subsequently replace the
+    re-tokenized history with the exact model-generated token prefix. Locate
+    each unchanged media-token span in that final sequence so its associated
+    multimodal features remain aligned.
+
+    Ranges are matched in global prompt order because different media items can
+    accumulate different shifts. Coincident ranges resolve to the same offset:
+    Qwen2.5-Omni derives an audio range from its paired video range with an
+    identical ``(offset, length)``, so a span is only consumed once.
+
+    A span that cannot be located fails closed rather than submitting token IDs
+    with incorrect multimodal positions. Note that an *ambiguous* match is not
+    detected: media spans are bare runs of one repeated pad token, so if a run
+    is longer in ``final_token_ids`` than in the template, a later item can
+    match inside an earlier item's run. Locating spans by search is only
+    necessary because the splice boundary computed by ``replace_prefix_tokens``
+    is not threaded through to here; passing it would make the suffix region
+    pure arithmetic and remove that ambiguity entirely.
+
+    Args:
+        template_token_ids: The chat-template token sequence vLLM used to
+            compute ``mm_placeholders``.
+        final_token_ids: The exact-token prompt produced by
+            ``replace_prefix_tokens``, which will be submitted to the engine.
+        mm_placeholders: vLLM's per-modality placeholder ranges, in
+            ``template_token_ids`` coordinates.
+
+    Returns:
+        A new per-modality mapping with the same item ordering, whose ranges are
+        expressed in ``final_token_ids`` coordinates.
+
+    Raises:
+        ValueError: If an input range is out of bounds for
+            ``template_token_ids``, or if a media span cannot be relocated in
+            ``final_token_ids``.
+        TypeError: If a range is neither a mapping nor a dataclass instance.
+    """
+    if template_token_ids == final_token_ids or not mm_placeholders:
+        return {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+
+    entries: list[tuple[int, str, int, Any, int]] = []
+    remapped = {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+    for modality, ranges in mm_placeholders.items():
+        for item_index, placeholder_range in enumerate(ranges):
+            if isinstance(placeholder_range, Mapping):
+                offset = int(placeholder_range["offset"])
+                length = int(placeholder_range["length"])
+            else:
+                offset = int(placeholder_range.offset)
+                length = int(placeholder_range.length)
+
+            if offset < 0 or length <= 0 or offset + length > len(template_token_ids):
+                raise ValueError(
+                    f"Invalid {modality} placeholder range {item_index}: "
+                    f"offset={offset}, length={length}, "
+                    f"template_length={len(template_token_ids)}"
+                )
+            entries.append((offset, modality, item_index, placeholder_range, length))
+
+    search_start = 0
+    resolved: dict[tuple[int, int], int] = {}
+    for old_offset, modality, item_index, placeholder_range, length in sorted(
+        entries, key=lambda entry: entry[0]
+    ):
+        # Two modalities can describe the same span, so a resolved offset is
+        # reused instead of scanning past it. Only a newly located span
+        # advances the cursor.
+        new_offset = resolved.get((old_offset, length))
+        if new_offset is None:
+            expected = template_token_ids[old_offset : old_offset + length]
+            max_start = len(final_token_ids) - length
+            new_offset = next(
+                (
+                    candidate
+                    for candidate in range(search_start, max_start + 1)
+                    if final_token_ids[candidate] == expected[0]
+                    and final_token_ids[candidate : candidate + length] == expected
+                ),
+                None,
+            )
+            if new_offset is None:
+                raise ValueError(
+                    f"Could not locate {modality} placeholder range {item_index} "
+                    f"from template offset {old_offset} in the final exact-token prompt"
+                )
+            resolved[(old_offset, length)] = new_offset
+            search_start = new_offset + length
+
+        if isinstance(placeholder_range, Mapping):
+            updated_range = dict(placeholder_range)
+            updated_range["offset"] = new_offset
+        elif is_dataclass(placeholder_range):
+            updated_range = replace(placeholder_range, offset=new_offset)
+        else:
+            raise TypeError(
+                "Multimodal placeholder ranges must be mappings or dataclass "
+                f"instances, got {type(placeholder_range).__name__}"
+            )
+
+        remapped[modality][item_index] = updated_range
+
+    return remapped
+
+
+def _as_routed_experts_tensor(
+    value: Any, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Convert backend routed-expert ids to the metadata-selected carry dtype.
+
+    Do not reduce the full payload to validate its maximum value here. vLLM
+    0.25.1 can return torch.uint16 routes, for which Tensor.max is not
+    implemented, and an upcast would add a large temporary allocation. The
+    destination dtype is resolved from model expert-count metadata; downstream
+    alignment still validates payload rank, shape, and route completeness.
+    """
+    return torch.as_tensor(value, device=device).to(dtype=dtype)
+
+
+def format_prompt_for_vllm_generation(
+    data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None
+) -> list[dict[str, Any]]:
+    """Format a list of prompts for vllm generation (which requires a specific format for its own `generate` method).
+
+    See https://docs.vllm.ai/en/v0.9.1/features/multimodal_inputs.html for prompt format for multimodal inputs.
+    """
+    # Prepare prompts for vLLM (removing padding)
+    prompts = []
+
+    input_ids = data["input_ids"]
+    batch_size = input_ids.shape[0]
+    input_lengths = data["input_lengths"]
+
+    # if sample_idx is None, return list of all prompts for the entire batch
+    # else, return the prompt for the single sample specified by sample_idx
+    return_all = sample_idx is None
+    if sample_idx is None:
+        start_idx = 0
+        end_idx = batch_size
+    else:
+        start_idx = sample_idx
+        end_idx = sample_idx + 1
+
+    def _get_regular_prompt(index: int):
+        valid_length = input_lengths[index].item()
+        valid_ids = (
+            input_ids[index, :valid_length]
+            if valid_length > 0
+            else input_ids[index, :0]
+        )
+        token_ids = valid_ids.tolist()
+        return {"prompt_token_ids": token_ids}
+
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        multi_modal_data = {}
+        images = data.get("vllm_images", None)
+        if images is not None and len(images[index]) > 0:
+            multi_modal_data["image"] = (
+                images[index][0] if len(images[index]) == 1 else images[index]
+            )
+        audios = data.get("vllm_audios", None)
+        if audios is not None and len(audios[index]) > 0:
+            multi_modal_data["audio"] = (
+                audios[index][0] if len(audios[index]) == 1 else audios[index]
+            )
+        videos = data.get("vllm_videos", None)
+        if videos is not None and len(videos[index]) > 0:
+            multi_modal_data["video"] = (
+                videos[index][0] if len(videos[index]) == 1 else videos[index]
+            )
+        return multi_modal_data
+
+    # Native image, audio, and video side channels share this formatter path.
+    if "vllm_content" in data:
+        # VLM generation using content and multi_modal_data
+        for i in range(start_idx, end_idx):
+            msg = data["vllm_content"][i]
+            multi_modal_data = _get_multi_modal_data(i)
+            if not multi_modal_data:
+                prompts.append(_get_regular_prompt(i))
+                continue
+            # Raw processor content is valid only for the initial turn. Later
+            # turns use the updated pre-tokenized conversation plus the same
+            # native media, preventing vLLM from regenerating the stale prompt.
+            prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
+            prompt_dict["multi_modal_data"] = multi_modal_data
+            prompts.append(prompt_dict)
+    else:
+        # Regular LLM generation using token_ids (pre-tokenized).
+        # Note: eval.py uses raw prompt strings instead of token IDs because its
+        # collate function produces message_log dicts, not tokenized tensors.
+        # Both are valid vLLM input formats but may tokenize slightly differently.
+        for i in range(start_idx, end_idx):
+            # Use input_lengths to get only valid tokens (not padding)
+            prompts.append(_get_regular_prompt(i))
+
+    return prompts if return_all else prompts[0]
+
+
+def pad_and_align_routed_expert_indices(
+    request_output: Any,
+    completion_output: Any,
+    *,
+    valid_length: int,
+    padded_length: int,
+    device: torch.device,
+    require_complete_routed_experts: bool = False,
+    allow_missing_routed_experts_fallback: bool = True,
+    return_stats: bool = False,
+    routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], dict[str, int]]:
+    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` in ``routed_experts_dtype``."""
+    routed = getattr(completion_output, "routed_experts", None)
+    prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+
+    if prompt_routed is not None:
+        prompt_routed = _as_routed_experts_tensor(
+            prompt_routed, device=device, dtype=routed_experts_dtype
+        )
+    if routed is not None:
+        routed = _as_routed_experts_tensor(
+            routed, device=device, dtype=routed_experts_dtype
+        )
+
+    if prompt_routed is not None and routed is not None:
+        routed = torch.cat((prompt_routed, routed), dim=0)
+    elif prompt_routed is not None:
+        routed = prompt_routed
+
+    expected_routes = min(max(valid_length - 1, 0), padded_length)
+    stats = {
+        "actual_routes": 0,
+        "expected_routes": expected_routes,
+        "missing_routes": 0,
+        "surplus_routes": 0,
+    }
+
+    if routed is None:
+        return (None, stats) if return_stats else None
+    if routed.dim() != 3:
+        raise ValueError(
+            "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "
+            f"got {tuple(routed.shape)}"
+        )
+
+    stats["actual_routes"] = int(routed.shape[0])
+    stats["missing_routes"] = max(expected_routes - int(routed.shape[0]), 0)
+    stats["surplus_routes"] = max(int(routed.shape[0]) - (expected_routes + 1), 0)
+    if (
+        require_complete_routed_experts
+        and stats["missing_routes"] > 0
+        and not allow_missing_routed_experts_fallback
+    ):
+        # This has only been observed rarely with vLLM prefix caching plus
+        # chunked prefill: a small number of samples can omit routed-expert
+        # rows even though most requests are complete. Keep
+        # tools/model_diagnostics/6.vllm_routed_experts_completeness.py as a
+        # standalone reproducer for upstream vLLM bug reports.
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned incomplete routed_experts for router replay: "
+            f"routes={routed.shape[0]}, expected_at_least={expected_routes}, "
+            f"valid_length={valid_length}, padded_length={padded_length}, "
+            f"num_cached_tokens={num_cached_tokens}. This usually means the "
+            "generation backend did not return routed experts for every "
+            "non-final token in the prompt+response sequence."
+        )
+    max_allowed_routes = expected_routes + 1
+    if require_complete_routed_experts and routed.shape[0] > max_allowed_routes:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned too many routed_experts routes for router replay: "
+            f"routes={routed.shape[0]}, expected={expected_routes}, "
+            f"max_allowed={max_allowed_routes}, valid_length={valid_length}, "
+            f"padded_length={padded_length}, num_cached_tokens={num_cached_tokens}. "
+            "Router replay allows at most one surplus final-token route."
+        )
+
+    default_route = torch.arange(
+        routed.shape[2],
+        dtype=routed_experts_dtype,
+        device=device,
+    )
+    full = (
+        default_route.view(1, 1, -1)
+        .expand(padded_length, routed.shape[1], routed.shape[2])
+        .clone()
+    )
+    routes_to_copy = min(expected_routes, routed.shape[0])
+    if routes_to_copy > 0:
+        full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
+    if stats["missing_routes"] > 0:
+        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
+    return (full, stats) if return_stats else full
+
+
+def attach_routed_experts_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+    *,
+    device: torch.device,
+    logger: Any = None,
+    routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    routed_experts_ref_factory: Optional[
+        Callable[[torch.Tensor], dict[str, Any]]
+    ] = None,
+) -> Any:
+    """Attach aligned routed experts to OpenAI chat response choices."""
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    prompt_token_count = len(
+        getattr(final_request_output, "prompt_token_ids", []) or []
+    )
+
+    choices = list(getattr(response, "choices", []))
+    if routed_experts_ref_factory is not None and (
+        len(choices) != 1 or choices[0].index != 0
+    ):
+        raise RuntimeError(
+            "Ray-reference router replay currently requires exactly one chat "
+            "choice with index 0."
+        )
+    attached_choice_indices = set()
+    for choice in choices:
+        generation_details = outputs_by_index.get(choice.index)
+        if generation_details is None:
+            continue
+        attached_choice_indices.add(choice.index)
+
+        generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
+        routed_result = pad_and_align_routed_expert_indices(
+            final_request_output,
+            generation_details,
+            valid_length=prompt_token_count + generation_token_count,
+            padded_length=prompt_token_count + generation_token_count,
+            device=device,
+            require_complete_routed_experts=True,
+            return_stats=True,
+            routed_experts_dtype=routed_experts_dtype,
+        )
+        if not isinstance(routed_result, tuple):
+            raise RuntimeError(
+                "Expected routed_experts alignment to return stats for the "
+                "OpenAI-compatible chat endpoint."
+            )
+        routed_experts, r3_stats = routed_result
+        if routed_experts is None:
+            raise RuntimeError(
+                "vLLM was asked to return routed experts for the "
+                "OpenAI-compatible chat endpoint but the generation "
+                "output did not include routed_experts."
+            )
+        if r3_stats["missing_routes"] > 0 and logger is not None:
+            logger.warning(
+                "R3 router replay fallback: vLLM returned incomplete "
+                "routed_experts for chat choice_idx=%d, "
+                "missing_token_routes=%d, actual_routes=%d, "
+                "expected_routes=%d. Megatron will use its own router "
+                "for those missing token routes.",
+                choice.index,
+                r3_stats["missing_routes"],
+                r3_stats["actual_routes"],
+                r3_stats["expected_routes"],
+            )
+        if routed_experts_ref_factory is not None:
+            choice.message.routed_experts = routed_experts_ref_factory(routed_experts)
+        else:
+            # Base64 envelope instead of .tolist(): nested JSON int lists cost
+            # ~1s of CPU per serialize/parse hop at long context lengths and get
+            # re-validated at every gym HTTP hop; a single string passes through
+            # the gym chain opaquely.
+            choice.message.routed_experts = encode_routed_experts(
+                routed_experts.to(dtype=routed_experts_dtype)
+            )
+
+    if len(attached_choice_indices) != len(choices):
+        missing_choice_indices = sorted(
+            choice.index
+            for choice in choices
+            if choice.index not in attached_choice_indices
+        )
+        raise RuntimeError(
+            "vLLM was asked to return routed experts for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}."
+        )
+
+    return response
+
+
+def attach_token_information_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+) -> Any:
+    """Attach engine-native token information to OpenAI chat response choices."""
+    prompt_token_ids = getattr(final_request_output, "prompt_token_ids", None)
+    if prompt_token_ids is None:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but the final request output did "
+            "not include prompt_token_ids."
+        )
+
+    generation_outputs = list(getattr(final_request_output, "outputs", []))
+    generation_output_indices = [output.index for output in generation_outputs]
+    outputs_by_index = {output.index: output for output in generation_outputs}
+    if len(outputs_by_index) != len(generation_outputs):
+        raise RuntimeError(
+            "vLLM returned duplicate generation output indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choices = list(getattr(response, "choices", []))
+    choice_indices = [choice.index for choice in choices]
+    if len(set(choice_indices)) != len(choice_indices):
+        raise RuntimeError(
+            "vLLM returned duplicate response choice indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choice_index_set = set(choice_indices)
+    output_index_set = set(generation_output_indices)
+    missing_choice_indices = sorted(choice_index_set - output_index_set)
+    unexpected_output_indices = sorted(output_index_set - choice_index_set)
+    if missing_choice_indices or unexpected_output_indices:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}, "
+            f"unexpected_output_indices={unexpected_output_indices}."
+        )
+
+    for choice in choices:
+        generation_details = outputs_by_index[choice.index]
+        output_token_ids = getattr(generation_details, "token_ids", None)
+        if output_token_ids is None:
+            raise RuntimeError(
+                "vLLM was asked to return token information for the "
+                "OpenAI-compatible chat endpoint but generation output "
+                f"choice_idx={choice.index} did not include token_ids."
+            )
+        generation_token_ids = list(output_token_ids)
+
+        generation_logprob_details = getattr(generation_details, "logprobs", None)
+        if generation_logprob_details is None:
+            if generation_token_ids:
+                raise RuntimeError(
+                    "vLLM was asked to return token information for the "
+                    "OpenAI-compatible chat endpoint but generation output "
+                    f"choice_idx={choice.index} did not include logprobs."
+                )
+            generation_log_probs = []
+        else:
+            if len(generation_token_ids) != len(generation_logprob_details):
+                raise RuntimeError(
+                    "vLLM returned mismatched generation token IDs and log "
+                    "probabilities for the OpenAI-compatible chat endpoint: "
+                    f"choice_idx={choice.index}, "
+                    f"token_count={len(generation_token_ids)}, "
+                    f"logprob_count={len(generation_logprob_details)}."
+                )
+            generation_log_probs = []
+            for token_id, position_logprobs in zip(
+                generation_token_ids, generation_logprob_details
+            ):
+                selected_token_logprob = position_logprobs.get(token_id)
+                if selected_token_logprob is None:
+                    raise RuntimeError(
+                        "vLLM generation log probabilities did not include the "
+                        "selected token while attaching token information to "
+                        "the OpenAI-compatible chat response: "
+                        f"choice_idx={choice.index}, token_id={token_id}."
+                    )
+                generation_log_probs.append(
+                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+                )
+
+        choice.message.prompt_token_ids = list(prompt_token_ids)
+        choice.message.generation_token_ids = generation_token_ids
+        choice.message.generation_log_probs = generation_log_probs
+
+    return response
+
+
+def model_dump_chat_response_with_dynamic_message_fields(
+    response: Any,
+) -> dict[str, Any]:
+    """Dump a vLLM OpenAI chat response while preserving dynamic message fields."""
+    response_dict = response.model_dump()
+    for choice, choice_dict in zip(
+        getattr(response, "choices", []), response_dict.get("choices", [])
+    ):
+        message = getattr(choice, "message", None)
+        for field_name in (
+            "routed_experts",
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+        ):
+            field_value = getattr(message, field_name, None)
+            if field_value is not None:
+                choice_dict.setdefault("message", {})[field_name] = field_value
+    return response_dict
+
+
+def aggregate_spec_decode_counters(
+    worker_metrics: list[dict[str, float | list[float]]],
+) -> dict[str | tuple[str, int], float]:
+    """Aggregate speculative decoding counters from multiple workers.
+
+    Combines spec decode metrics collected from DP leader workers into
+    a single aggregated counter dictionary.
+
+    Args:
+        worker_metrics: List of metric dictionaries from each worker.
+            Each dict maps metric names to float values or lists of floats
+            (for per-position metrics).
+
+    Returns:
+        Dictionary mapping metric names to their aggregated float values.
+        Per-position metrics use (name, position) tuples as keys.
+
+    Example:
+        >>> metrics_from_workers = policy_generation.get_metrics()
+        >>> counters = aggregate_spec_decode_counters(metrics_from_workers)
+        >>> print(counters.get("vllm:spec_decode_num_drafts", 0))
+        1234.0
+    """
+    counters: dict[str | tuple[str, int], float] = defaultdict(float)
+
+    for report in worker_metrics:
+        for metric_name, value in report.items():
+            if "spec_decode" in metric_name:
+                if isinstance(value, list):
+                    # Per-position metrics (e.g., acceptance counts at each draft position)
+                    for position, pos_value in enumerate(value, 1):
+                        counters[metric_name, position] += pos_value
+                else:
+                    counters[metric_name] += value
+
+    return dict(counters)
+
+
+def compute_spec_decode_metrics(
+    start_counters: dict[str | tuple[str, int], float],
+    end_counters: dict[str | tuple[str, int], float],
+) -> dict[str, float]:
+    """Compute delta and derived metrics for speculative decoding.
+
+    Calculates the difference between two counter snapshots and derives
+    acceptance rate and acceptance length metrics for logging.
+
+    Args:
+        start_counters: Counter snapshot taken before generation.
+        end_counters: Counter snapshot taken after generation.
+
+    Returns:
+        Dictionary of metrics suitable for logging to wandb/tensorboard.
+        Keys are prefixed with "vllm/" for namespace consistency.
+        Includes:
+            - vllm/spec_num_drafts: Total number of draft batches
+            - vllm/spec_num_draft_tokens: Total draft tokens generated
+            - vllm/spec_num_accepted_tokens: Total tokens accepted
+            - vllm/spec_acceptance_length: Average accepted tokens per draft + 1
+            - vllm/spec_acceptance_rate: Ratio of accepted to draft tokens
+            - vllm/{metric}-{position}: Per-position acceptance counts
+            - vllm/spec_acceptance_rate-pos-{position}: Per-position acceptance rates
+    """
+    keys = set(start_counters) | set(end_counters)
+    delta = {k: end_counters.get(k, 0.0) - start_counters.get(k, 0.0) for k in keys}
+
+    num_drafts = delta.get("vllm:spec_decode_num_drafts", 0.0)
+    num_draft_tokens = delta.get("vllm:spec_decode_num_draft_tokens", 0.0)
+    num_accepted_tokens = delta.get("vllm:spec_decode_num_accepted_tokens", 0.0)
+
+    # acceptance_length = 1 + (accepted / drafts) represents average tokens
+    # generated per draft batch (1 target model token + accepted draft tokens)
+    acceptance_length = (
+        1.0 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else 1.0
+    )
+    acceptance_rate = (
+        num_accepted_tokens / num_draft_tokens if num_draft_tokens > 0 else 0.0
+    )
+
+    spec_metrics: dict[str, float] = {
+        "vllm/spec_num_drafts": num_drafts,
+        "vllm/spec_num_draft_tokens": num_draft_tokens,
+        "vllm/spec_num_accepted_tokens": num_accepted_tokens,
+        "vllm/spec_acceptance_length": acceptance_length,
+        "vllm/spec_acceptance_rate": acceptance_rate,
+    }
+
+    # Add per-position metrics for detailed analysis
+    for key, value in delta.items():
+        if isinstance(key, tuple):
+            metric_name, position = key
+            spec_metrics[f"vllm/{metric_name}-{position}"] = value
+            if num_drafts > 0:
+                spec_metrics[f"vllm/spec_acceptance_rate-pos-{position}"] = (
+                    value / num_drafts
+                )
+
+    return spec_metrics
+
+
+# TODO: Replace this hard-coded map with a generic plugin-registration
+# hook on ``VllmGeneration`` (e.g. a ``worker_cls_overrides`` registry populated
+# by ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
+# worker classes.
+GENERATION_WORKER_OVERRIDES = {
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker",
+    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker",
+}
+
+
+def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized vLLM generation worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+
+    Safe to call even when ModelOpt is not installed — returns ``default_cls``
+    unchanged whenever ``quant_cfg`` is ``None``, so the core generation path
+    stays import-free of ModelOpt.
+    """
+    if config.get("quant_cfg") is None:
+        return default_cls
+    return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)

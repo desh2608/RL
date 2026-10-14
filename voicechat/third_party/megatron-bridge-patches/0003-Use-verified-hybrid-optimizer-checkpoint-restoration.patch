@@ -1,0 +1,19 @@
+From 4c4fdd99be9beeb634e6df54d1135e486410caf7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 20 Sep 2026 01:18:59 -0700
+Subject: [PATCH 3/4] Use verified hybrid optimizer checkpoint restoration
+
+---
+ 3rdparty/Megatron-LM | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/3rdparty/Megatron-LM b/3rdparty/Megatron-LM
+index f2f0f7bf..468bbe29 160000
+--- a/3rdparty/Megatron-LM
++++ b/3rdparty/Megatron-LM
+@@ -1 +1 @@
+-Subproject commit f2f0f7bfd88fcb1243df55275988d6af52daea35
++Subproject commit 468bbe29451561d4f803f73ee648144ae782bf41
+-- 
+2.25.1
+

@@ -1,0 +1,94 @@
+From b35879d5e169b9a5affbe00a101b0f13302c5200 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 20 Sep 2026 02:38:32 -0700
+Subject: [PATCH 3/3] Preserve restored HDO step over nonpersistent DCP
+ template state
+
+---
+ megatron/core/optimizer/distrib_optimizer.py  |  5 +++
+ .../unit_tests/test_hdo_dp_reshardable_cpu.py | 32 +++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index e94a72df0..ac3513dd4 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -1212,6 +1212,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                 if not isinstance(v, torch.Tensor):
+                     continue
+                 if isinstance(self.optimizer, HybridDeviceOptimizer):
++                    if k == "step":
++                        # dp_reshardable carries the loading template's dummy
++                        # step as a LocalNonpersistentObject. Keep the real
++                        # checkpoint step already restored from param_groups.
++                        continue
+                     if k == "param":
+                         k = "master_param"
+                     self.optimizer.state[sharded_model_param][k] = v
+diff --git a/tests/unit_tests/test_hdo_dp_reshardable_cpu.py b/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+index 6ae6aa834..da4c38346 100644
+--- a/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
++++ b/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ """CPU numerical regression; also runnable directly without distributed fixtures."""
+ 
++import copy
+ import io
+ import unittest
+ from collections import defaultdict
+@@ -8,6 +9,8 @@ from types import SimpleNamespace
+ 
+ import torch
+ 
++from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject
++from megatron.core.dist_checkpointing.state_dict_utils import load_preprocess
+ from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+     HybridDeviceOptimizer,
+ )
+@@ -39,6 +42,13 @@ class TestHDODPReshardableCPU(unittest.TestCase):
+                 torch.save({0: {dtype: [[saved]]}}, checkpoint)
+                 checkpoint.seek(0)
+                 restored = torch.load(checkpoint, weights_only=True)
++                # Real DCP restores this from the local loading template, not
++                # the checkpoint: HDO dummy_step initialized it to one. The
++                # authoritative optimizer step comes separately from groups.
++                _, nonpersistent, _ = load_preprocess(
++                    {"step": LocalNonpersistentObject(torch.tensor(1.0))}
++                )
++                restored[0][dtype][0][0]["step"] = nonpersistent["step"]
+ 
+                 model_param = torch.nn.Parameter(reference_param.detach().to(dtype))
+                 shard_param = torch.nn.Parameter(model_param.detach().clone())
+@@ -107,6 +117,28 @@ class TestHDODPReshardableCPU(unittest.TestCase):
+                     )
+                 self.assertEqual(inner.state[inner_param]["step"].item(), 4)
+ 
++    def test_dummy_step_changes_next_adam_update_despite_correct_master_and_moments(self):
++        reference_param = torch.nn.Parameter(torch.tensor([1.000123, -2.000321]))
++        reference = torch.optim.AdamW([reference_param], lr=0.01, fused=True)
++        for gradient in ([0.2, -0.3], [0.4, 0.1], [-0.1, 0.5]):
++            reference_param.grad = torch.tensor(gradient)
++            reference.step()
++        wrong_param = torch.nn.Parameter(reference_param.detach().clone())
++        wrong = torch.optim.AdamW([wrong_param], lr=0.01, fused=True)
++        wrong.load_state_dict(copy.deepcopy(reference.state_dict()))
++        wrong.state[wrong_param]["step"].fill_(1)
++        for key in ("exp_avg", "exp_avg_sq"):
++            torch.testing.assert_close(
++                wrong.state[wrong_param][key], reference.state[reference_param][key],
++                rtol=0, atol=0,
++            )
++        for param, optimizer in ((reference_param, reference), (wrong_param, wrong)):
++            param.grad = torch.tensor([0.125, -0.25])
++            optimizer.step()
++        self.assertEqual(reference.state[reference_param]["step"].item(), 4)
++        self.assertEqual(wrong.state[wrong_param]["step"].item(), 2)
++        self.assertFalse(torch.equal(wrong_param, reference_param))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.25.1
+

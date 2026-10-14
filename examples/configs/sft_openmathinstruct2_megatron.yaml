@@ -1,0 +1,45 @@
+defaults: sft_openmathinstruct2.yaml
+sft:
+  val_micro_batch_size: 1
+policy:
+  train_micro_batch_size: 1
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+    enabled: true
+    optimizer:
+      adam_eps: 1.0e-08
+      clip_grad: 0
+      lr: 2.0e-05
+      min_lr: 2.0e-05
+      params_dtype: bfloat16
+      use_precision_aware_optimizer: false
+      weight_decay: 0.01
+    pipeline_dtype: bfloat16
+    scheduler:
+      end_weight_decay: 0.01
+      lr_warmup_init: 1.999999e-05
+      lr_warmup_iters: 1
+      start_weight_decay: 0.01
+    tensor_model_parallel_size: 4
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    peft:
+      lora_dtype: null
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: ${mul:16, ${policy.megatron_cfg.tensor_model_parallel_size}}
+  optimizer: null
+logger:
+  wandb:
+    project: sft-openmathinstruct-megatron
+    name: llama8b
+cluster:
+  num_nodes: 2
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

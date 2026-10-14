@@ -1,0 +1,511 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import tempfile
+
+import pytest
+from datasets import Dataset
+
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.datasets import load_response_dataset
+from nemo_rl.data.datasets.response_datasets import aime as aime_module
+from nemo_rl.data.datasets.response_datasets import gsm8k as gsm8k_module
+from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
+from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
+from nemo_rl.data.datasets.response_datasets.intent import (
+    IntentDataset,
+    _format_options,
+)
+from nemo_rl.data.processors import PROCESSOR_REGISTRY
+
+
+def create_sample_data(input_key, output_key, is_save_to_disk=False, file_ext=".json"):
+    data = [
+        {input_key: "Hello", output_key: "Hi there!"},
+        {input_key: "How are you?", output_key: "I'm good, thanks!"},
+    ]
+
+    # Create temporary dataset file
+    if is_save_to_disk:
+        data_path = tempfile.mktemp()
+        dataset = Dataset.from_list(data)
+        dataset.save_to_disk(data_path)
+    else:
+        # If file_ext is provided, use it. If not provided but is_save_to_disk is False, default to .json
+        if file_ext is None:
+            file_ext = ".json"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=file_ext, delete=False) as f:
+            data_path = f.name
+
+        if file_ext == ".json":
+            with open(data_path, "w") as f:
+                json.dump(data, f)
+        elif file_ext == ".parquet":
+            dataset = Dataset.from_list(data)
+            dataset.to_parquet(data_path)
+        elif file_ext == ".csv":
+            dataset = Dataset.from_list(data)
+            dataset.to_csv(data_path)
+
+    return data_path
+
+
+@pytest.fixture(scope="function")
+def tokenizer():
+    """Initialize tokenizer for the test model."""
+    tokenizer = get_tokenizer({"name": "Qwen/Qwen3-0.6B"})
+    return tokenizer
+
+
+def test_aime_defaults_to_one_copy_and_supports_explicit_repeat(monkeypatch):
+    source = Dataset.from_list(
+        [
+            {"problem": "problem 1", "answer": 1},
+            {"problem": "problem 2", "answer": 2},
+        ]
+    )
+    monkeypatch.setattr(aime_module, "load_dataset", lambda *args, **kwargs: source)
+
+    default_dataset = load_response_dataset(
+        {"dataset_name": "AIME2024", "processor": "math_hf_data_processor"}
+    )
+    repeated_dataset = load_response_dataset(
+        {
+            "dataset_name": "AIME2024",
+            "processor": "math_hf_data_processor",
+            "repeat": 3,
+        }
+    )
+
+    assert len(default_dataset.dataset) == 2
+    assert len(repeated_dataset.dataset) == 6
+    assert default_dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
+
+
+@pytest.mark.parametrize(
+    "input_key,output_key", [("input", "output"), ("question", "answer")]
+)
+@pytest.mark.parametrize(
+    "is_save_to_disk,file_ext",
+    [
+        (True, None),
+        (False, ".json"),
+        (False, ".parquet"),
+        (False, ".csv"),
+    ],
+)
+def test_response_dataset(input_key, output_key, is_save_to_disk, file_ext, tokenizer):
+    # load the dataset
+    data_path = create_sample_data(input_key, output_key, is_save_to_disk, file_ext)
+    data_config = {
+        "dataset_name": "ResponseDataset",
+        "data_path": data_path,
+        "input_key": input_key,
+        "output_key": output_key,
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the input and output keys
+    assert dataset.input_key == input_key
+    assert dataset.output_key == output_key
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the combined message
+    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+    combined_message = tokenizer.apply_chat_template(
+        first_example["messages"],
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+    assert combined_message == " Question: Hello Answer: Hi there!"
+
+
+def test_response_dataset_gsm8k_with_subset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "ResponseDataset",
+        "data_path": "openai/gsm8k",
+        "input_key": "question",
+        "output_key": "answer",
+        "subset": "main",
+        "split": "train",
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the input and output keys
+    assert dataset.input_key == "question"
+    assert dataset.output_key == "answer"
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][:20] == "Natalia sold clips t"
+    assert first_example["messages"][1]["role"] == "assistant"
+    assert first_example["messages"][1]["content"][:20] == "Natalia sold 48/2 = "
+
+
+def _patch_gsm8k_load_dataset(monkeypatch, captured):
+    def fake_load_dataset(path, name=None, **kwargs):
+        captured["path"] = path
+        captured["name"] = name
+        return {
+            "train": Dataset.from_list(
+                [{"question": "What is 2 + 2?", "answer": "2 + 2 = 4\n#### 4"}]
+            )
+        }
+
+    monkeypatch.setattr(gsm8k_module, "load_dataset", fake_load_dataset)
+
+
+def test_gsm8k_subset_selects_hf_config(monkeypatch):
+    """``openai/gsm8k`` ships both a "main" and a "socratic" config, so a
+    configured ``subset`` must reach ``load_dataset`` instead of being ignored."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    dataset = load_response_dataset(
+        {"dataset_name": "gsm8k", "subset": "socratic", "split": "train"}
+    )
+
+    assert captured == {"path": "openai/gsm8k", "name": "socratic"}
+    assert dataset.dataset[0]["messages"][1]["content"] == "4"
+
+
+def test_gsm8k_subset_none_falls_back_to_main(monkeypatch):
+    """`subset: null` is the documented config default, and openai/gsm8k has no
+    implicit default config, so None must resolve to "main"."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    load_response_dataset({"dataset_name": "gsm8k", "subset": None, "split": "train"})
+
+    assert captured["name"] == "main"
+
+
+def test_gsm8k_subset_defaults_to_main(monkeypatch):
+    """Unset ``subset`` keeps the previous behavior (the "main" config)."""
+    captured = {}
+    _patch_gsm8k_load_dataset(monkeypatch, captured)
+
+    load_response_dataset({"dataset_name": "gsm8k", "split": "train"})
+
+    assert captured["name"] == "main"
+
+
+def test_helpsteer3_dataset():
+    # load the dataset
+    data_config = {"dataset_name": "HelpSteer3"}
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 3
+    assert "context" in first_example
+    assert "response" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert len(first_example["context"]) == 7
+    assert first_example["response"][0]["role"] == "assistant"
+    assert first_example["response"][0]["content"][:20] == "Yes, you are correct"
+
+
+def test_open_assistant_dataset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "open_assistant",
+        "split_validation_size": 0.05,
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    first_val_example = dataset.val_dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][-1]["content"][:20] == "```\n    def forward("
+    assert len(first_example["messages"]) == 7
+    assert first_val_example["messages"][-1]["content"][:20] == "The colors you shoul"
+    assert len(first_val_example["messages"]) == 5
+
+
+@pytest.mark.parametrize(
+    "dataset_name",
+    [
+        "DAPOMath17K",
+        "DAPOMathAIME2024",
+        "DeepScaler",
+        "squad",
+        "AIME2024",
+        "AIME2025",
+        "AIME2026",
+    ],
+)
+def test_build_in_dataset(dataset_name, tokenizer):
+    # load the dataset
+    data_config = {"dataset_name": dataset_name}
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    if dataset_name == "DAPOMath17K":
+        assert first_example["messages"][1]["content"] == "34"
+    elif dataset_name == "DAPOMathAIME2024":
+        assert first_example["messages"][1]["content"] == "540"
+    elif dataset_name == "DeepScaler":
+        assert first_example["messages"][1]["content"] == "-\\frac{2}{3}"
+    elif dataset_name == "squad":
+        assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
+    elif dataset_name == "AIME2024":
+        assert first_example["messages"][1]["content"] == "204"
+        assert len(dataset.dataset) == 30
+    elif dataset_name == "AIME2025":
+        assert first_example["messages"][1]["content"] == "70"
+        assert len(dataset.dataset) == 30
+    elif dataset_name == "AIME2026":
+        assert first_example["messages"][1]["content"] == "277"
+        assert len(dataset.dataset) == 30
+
+    # check the combined message
+    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+    combined_message = tokenizer.apply_chat_template(
+        first_example["messages"],
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+
+    if dataset_name == "squad":
+        assert combined_message == (
+            "Context: "
+            + first_example["messages"][0]["content"]
+            + " Question: "
+            + first_example["messages"][1]["content"]
+            + " Answer: "
+            + first_example["messages"][2]["content"]
+        )
+    else:
+        assert combined_message == (
+            " Question: "
+            + first_example["messages"][0]["content"]
+            + " Answer: "
+            + first_example["messages"][1]["content"]
+        )
+
+
+@pytest.mark.parametrize(
+    "dataset_name,output_key",
+    [
+        ("OpenMathInstruct-2", "expected_answer"),
+        ("OpenMathInstruct-2", "generated_solution"),
+        ("NuminaMath-1.5", None),
+        ("OpenR1-Math-220k", None),
+        ("tulu3_sft_mixture", None),
+    ],
+)
+def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokenizer):
+    # load the dataset
+    data_config = {
+        "dataset_name": dataset_name,
+        "output_key": output_key,
+        "split_validation_size": 0.05,
+    }
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    first_val_example = dataset.val_dataset[0]
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    if dataset_name == "OpenMathInstruct-2":
+        if output_key == "expected_answer":
+            assert first_example["messages"][1]["content"] == "\\frac{8\\sqrt{3}}{3}"
+        elif output_key == "generated_solution":
+            assert (
+                first_example["messages"][1]["content"][:20] == "Let's denote the poi"
+            )
+    elif dataset_name == "NuminaMath-1.5":
+        # The default filters drop the non-verifiable sentinel answers, so no
+        # surviving row (train or val) may carry one.
+        for example in (first_example, first_val_example):
+            assert example["messages"][1]["content"].strip().lower() not in (
+                "proof",
+                "notfound",
+            )
+    elif dataset_name == "OpenR1-Math-220k":
+        assert first_example["messages"][1]["content"][:20] == " (n, k) = (5, 2) "
+    elif dataset_name == "tulu3_sft_mixture":
+        assert first_example["messages"][1]["content"][:20] == "I'm sorry, but I can"
+    else:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. Please add a test for this dataset."
+        )
+
+    # check the combined message
+    messages = [first_example["messages"], first_val_example["messages"]]
+    chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+    combined_message = tokenizer.apply_chat_template(
+        messages,
+        chat_template=chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+
+    for i in range(2):
+        assert combined_message[i] == (
+            " Question: "
+            + messages[i][0]["content"].strip()
+            + " Answer: "
+            + messages[i][1]["content"].strip()
+        )
+
+
+@pytest.mark.parametrize(
+    "dataset_name,format_func",
+    [
+        ("clevr-cogent", format_clevr_cogent_dataset),
+        ("geometry3k", format_geometry3k_dataset),
+        # ("refcoco", format_refcoco_dataset), # this needs download 13.5G image
+    ],
+)
+def test_vlm_dataset(dataset_name, format_func):
+    # load the dataset
+    data_config = {"dataset_name": dataset_name}
+    dataset = load_response_dataset(data_config)
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    first_example = format_func(first_example)
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][0]["type"] == "image"
+    assert first_example["messages"][0]["content"][1]["type"] == "text"
+    assert first_example["messages"][1]["role"] == "assistant"
+
+    if dataset_name == "clevr-cogent":
+        assert first_example["messages"][1]["content"] == "3"
+    elif dataset_name == "geometry3k":
+        assert first_example["messages"][1]["content"] == "3"
+    elif dataset_name == "refcoco":
+        assert first_example["messages"][1]["content"] == "[243, 469, 558, 746]"
+
+
+def test_dailyomni_dataset():
+    # load the dataset
+    dataset = load_response_dataset({"dataset_name": "daily-omni"})
+
+    # check the first example
+    first_example = dataset.dataset[0]
+    assert hasattr(dataset, "preprocessor") and dataset.preprocessor is not None
+    first_example = dataset.preprocessor(first_example)
+
+    # only contains messages and task_name
+    assert len(first_example.keys()) == 2
+    assert "messages" in first_example
+    assert "task_name" in first_example
+
+    # check the content
+    assert first_example["messages"][0]["role"] == "user"
+    assert first_example["messages"][0]["content"][0]["type"] == "video"
+    assert first_example["messages"][0]["content"][1]["type"] == "audio"
+    assert first_example["messages"][0]["content"][2]["type"] == "text"
+    assert first_example["messages"][1]["role"] == "assistant"
+
+    assert first_example["messages"][1]["content"] == "B"
+
+
+# ---------------------------------------------------------------------------
+# IntentTrain / IntentBench dataset (audio+video). The full content-shape
+# contract (one {type:video} + {type:audio} + text per prompt) is exercised
+# end to end by the nightly recipe
+# tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.sh
+# (the unit-level video+audio check needs ffmpeg to fabricate an mp4). The
+# tests below cover the loader contracts that do not require the ~16 GB
+# archives or ffmpeg.
+# ---------------------------------------------------------------------------
+
+
+def test_intent_invalid_split_raises():
+    with pytest.raises(ValueError, match="Invalid split"):
+        IntentDataset(split="test")
+
+
+def test_intent_rejects_system_prompt():
+    # The think/answer instruction is baked into the user prompt, so a system
+    # prompt is unsupported and must fail loudly (before any download).
+    with pytest.raises(ValueError, match="does not support a system prompt"):
+        IntentDataset(split="train", system_prompt_file="some_system_prompt.txt")
+
+
+def test_intent_rejects_prompt_file():
+    with pytest.raises(ValueError, match="does not support a prompt file"):
+        IntentDataset(split="train", prompt_file="some_prompt.txt")
+
+
+def test_intent_format_options():
+    # No options -> empty string (question stem only).
+    assert _format_options(None) == ""
+    assert _format_options([]) == ""
+    # List of options -> rendered under an "Options:" header.
+    rendered = _format_options(["A. yes", "B. no"])
+    assert rendered == " Options:\nA. yes\nB. no"
+    # String repr of a list (as some manifests store it) is parsed too.
+    assert _format_options("['A. yes', 'B. no']") == " Options:\nA. yes\nB. no"
+    # Unparseable string falls back to raw rendering (no crash).
+    assert _format_options("not a list") == " Options:\nnot a list"

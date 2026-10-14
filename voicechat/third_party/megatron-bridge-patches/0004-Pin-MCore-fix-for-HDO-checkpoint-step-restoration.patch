@@ -1,0 +1,19 @@
+From 47d780a296473cd58cf6a173089213cabd28084b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 20 Sep 2026 02:38:38 -0700
+Subject: [PATCH 4/4] Pin MCore fix for HDO checkpoint step restoration
+
+---
+ 3rdparty/Megatron-LM | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/3rdparty/Megatron-LM b/3rdparty/Megatron-LM
+index 468bbe29..b35879d5 160000
+--- a/3rdparty/Megatron-LM
++++ b/3rdparty/Megatron-LM
+@@ -1 +1 @@
+-Subproject commit 468bbe29451561d4f803f73ee648144ae782bf41
++Subproject commit b35879d5e169b9a5affbe00a101b0f13302c5200
+-- 
+2.25.1
+

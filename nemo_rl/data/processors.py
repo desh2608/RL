@@ -1,0 +1,978 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Contains data processors for evaluation."""
+
+import json
+import logging
+from typing import Any, Dict, cast
+
+import torch
+from transformers import AutoProcessor, PreTrainedTokenizerBase
+
+from nemo_rl.data.interfaces import (
+    DatumSpec,
+    LLMMessageLogType,
+    PreferenceDatumSpec,
+    TaskDataProcessFnCallable,
+    TaskDataSpec,
+    VLMMessageLogType,
+)
+from nemo_rl.data.llm_message_utils import get_formatted_message_log
+
+TokenizerType = PreTrainedTokenizerBase
+
+
+def helpsteer3_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a HelpSteer3 preference datum into a DatumSpec for GRPO training.
+
+    This function converts HelpSteer3 preference data to work with GRPO by:
+    1. Using the context as the prompt
+    2. Using the preferred completion as the target response
+    3. Creating a reward signal based on preference scores
+    """
+    # Extract context and completions from HelpSteer3 format
+    context = datum_dict["context"]
+    preferred_completion = datum_dict["response"]
+
+    # Build the conversation from context
+    message_log: LLMMessageLogType = []
+
+    # Add context messages
+    if isinstance(context, list):
+        for msg in context:
+            message_log.append(
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                }
+            )
+    else:
+        # If context is a string, treat it as a user message
+        message_log.append(
+            {
+                "role": "user",
+                "content": context,
+            }
+        )
+
+    # Add the preferred completion as the target
+    for completion_msg in preferred_completion:
+        message_log.append(
+            {
+                "role": completion_msg["role"],
+                "content": completion_msg["content"],
+            }
+        )
+
+    # Apply chat template and tokenize
+    formatted_conversation = tokenizer.apply_chat_template(
+        message_log,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=True,
+    )
+
+    # Tokenize the entire conversation
+    full_tokens = tokenizer(
+        formatted_conversation,
+        return_tensors="pt",
+        add_special_tokens=False,  # Already added by chat template
+    )["input_ids"][0]
+
+    # For simplicity, assign all tokens to the first message
+    # In a more sophisticated implementation, you might want to split tokens properly
+    message_log[0]["token_ids"] = full_tokens
+    message_log[0]["content"] = formatted_conversation
+
+    # Clear token_ids for other messages to avoid double counting
+    for i in range(1, len(message_log)):
+        message_log[i]["token_ids"] = tokenizer("", return_tensors="pt")["input_ids"][
+            0
+        ]  # Empty tensor
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    # Create ground truth from the preferred completion for environment evaluation
+    ground_truth = " ".join([msg["content"] for msg in preferred_completion])
+    extra_env_info = {"ground_truth": ground_truth}
+
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        # Truncate if too long
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(
+                    max_seq_length // len(message_log), len(chat_message["token_ids"])
+                )
+            ]
+        loss_multiplier = 0.0  # Reduce loss for truncated sequences
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
+def sft_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+    add_bos: bool = True,
+    add_eos: bool = True,
+    add_generation_prompt: bool = False,
+) -> DatumSpec:
+    """Process a datum dictionary for SFT training."""
+    # optional preprocessor
+    if datum_dict["task_name"] == "clevr-cogent":
+        from nemo_rl.data.datasets.response_datasets.clevr import (
+            format_clevr_cogent_dataset,
+        )
+
+        datum_dict = format_clevr_cogent_dataset(datum_dict)
+
+    message_log = get_formatted_message_log(
+        datum_dict["messages"],
+        tokenizer,
+        task_data_spec,
+        add_bos_token=add_bos,
+        add_eos_token=add_eos,
+        add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
+    )
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        # make smaller and mask out
+        for message in message_log:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": None,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    return output
+
+
+def preference_preprocessor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+) -> PreferenceDatumSpec:
+    """Process a datum dictionary for RM/DPO training.
+
+    Examples:
+        ```{doctest}
+        >>> from transformers import AutoTokenizer
+        >>> from nemo_rl.data.interfaces import TaskDataSpec
+        >>> from nemo_rl.data.processors import preference_preprocessor
+        >>>
+        >>> # Initialize tokenizer and task spec
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        >>> ## set a passthrough chat template for simplicity
+        >>> tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        >>> task_spec = TaskDataSpec(task_name="test_preference")
+        >>>
+        >>> datum = {
+        ...     "context": [{"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
+        ... }
+        >>>
+        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
+        >>> len(processed["message_log_chosen"])
+        2
+        >>> processed["message_log_chosen"][0]["content"]
+        '<|begin_of_text|>What is 2+2?'
+        >>> processed["message_log_chosen"][-1]["content"]
+        '4<|eot_id|>'
+        >>> processed["message_log_rejected"][-1]["content"]
+        '5<|eot_id|>'
+        >>>
+        >>> # context can also contain multiple turns
+        >>> datum = {
+        ...     "context": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
+        ... }
+        >>> processed = preference_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
+        >>> len(processed["message_log_chosen"])
+        4
+        >>> processed["message_log_chosen"][1]["content"]
+        'Sure!'
+        >>> processed["message_log_chosen"][-1]["content"]
+        '4<|eot_id|>'
+        >>> processed["message_log_rejected"][-1]["content"]
+        '5<|eot_id|>'
+
+        ```
+    """
+    assert len(datum_dict["completions"]) == 2, (
+        "RM/DPO training supports only two completions"
+    )
+    # Lower rank is preferred
+    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][0]
+        rejected_completion = datum_dict["completions"][1]
+    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][1]
+        rejected_completion = datum_dict["completions"][0]
+    else:
+        raise NotImplementedError(
+            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
+        )
+
+    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
+    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
+
+    message_log_chosen = get_formatted_message_log(
+        messages_chosen, tokenizer, task_data_spec
+    )
+    message_log_rejected = get_formatted_message_log(
+        messages_rejected, tokenizer, task_data_spec
+    )
+
+    length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
+    length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
+
+    loss_multiplier = 1.0
+    if max(length_chosen, length_rejected) > max_seq_length:
+        logging.warning(
+            f"Sequence length {max(length_chosen, length_rejected)} exceeds max_seq_length {max_seq_length}. Ignoring example."
+        )
+
+        # make smaller and mask out
+        for message in message_log_chosen:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log_chosen))
+            ]
+        for message in message_log_rejected:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log_rejected))
+            ]
+        loss_multiplier = 0.0
+
+        length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
+        length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
+
+        # safeguard against edge case where there are too many turns to fit within the max length
+        assert max(length_chosen, length_rejected) <= max_seq_length
+
+    output: PreferenceDatumSpec = {
+        "message_log_chosen": message_log_chosen,
+        "message_log_rejected": message_log_rejected,
+        "length_chosen": length_chosen,
+        "length_rejected": length_rejected,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    return output
+
+
+# Example of a generic math data processor
+def math_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for the Math Environment."""
+    problem = datum_dict["problem"]
+    solution = str(datum_dict["expected_answer"])
+    extra_env_info = {"ground_truth": solution}
+
+    message_log: LLMMessageLogType = []
+
+    # system prompt
+    if task_data_spec.system_prompt:
+        sys_prompt: dict[str, str | torch.Tensor] = {
+            "role": "system",
+            "content": task_data_spec.system_prompt,
+        }
+        sys = tokenizer.apply_chat_template(
+            [cast(dict[str, str], sys_prompt)],
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+        sys_prompt["token_ids"] = tokenizer(
+            sys, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        message_log.append(sys_prompt)
+
+    # user prompt
+    if task_data_spec.prompt:
+        problem = task_data_spec.prompt.format(problem)
+    user_message = {"role": "user", "content": problem}
+    message = tokenizer.apply_chat_template(
+        [user_message],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    user_message["token_ids"] = tokenizer(
+        message, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    user_message["content"] = message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        # make smaller and mask out
+        for indiv_message in message_log:
+            indiv_message["token_ids"] = indiv_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
+def math_hf_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
+    user_message = datum_dict["messages"]
+    problem = user_message[0]["content"]
+    extra_env_info = {"ground_truth": user_message[1]["content"]}
+
+    # merge system prompt and user prompt
+    message_list = []
+    if task_data_spec.system_prompt:
+        message_list.append(
+            {
+                "role": "system",
+                "content": task_data_spec.system_prompt,
+            }
+        )
+    formatted_content = (
+        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+    )
+    message_list.append({"role": "user", "content": formatted_content})
+
+    message: str = tokenizer.apply_chat_template(  # type: ignore
+        message_list,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+
+    token_ids = tokenizer(
+        message,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        # make smaller and mask out
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+    }
+    return output
+
+
+def vlm_hf_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    processor: AutoProcessor,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from response_datasets/<dataset_name>.py) into a DatumSpec for the VLM Environment."""
+    from nemo_rl.data.datasets.response_datasets.clevr import (
+        format_clevr_cogent_dataset,
+    )
+    from nemo_rl.data.datasets.response_datasets.geometry3k import (
+        format_geometry3k_dataset,
+    )
+    from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
+    from nemo_rl.data.multimodal_utils import (
+        PackedTensor,
+        get_dim_to_pack_along,
+        get_multimodal_default_settings_from_processor,
+        get_multimodal_keys_from_processor,
+        resolve_to_image,
+        uses_fixed_tile_image_processor,
+        uses_image_placeholder,
+    )
+
+    # depending on the task, format the data differently
+    if datum_dict["task_name"] == "clevr-cogent":
+        datum_dict = format_clevr_cogent_dataset(datum_dict)
+    elif datum_dict["task_name"] == "refcoco":
+        datum_dict = format_refcoco_dataset(datum_dict)
+    elif datum_dict["task_name"] == "geometry3k":
+        datum_dict = format_geometry3k_dataset(datum_dict)
+    elif datum_dict["task_name"] == "mmpr-tiny":
+        from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
+            format_mmpr_tiny_dataset,
+        )
+
+        datum_dict = format_mmpr_tiny_dataset(datum_dict)
+    elif datum_dict["task_name"] == "avqa":
+        pass  # AVQA data is already formatted by AVQADataset.format_data
+    elif datum_dict["task_name"] == "audiomcq":
+        pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
+    elif datum_dict["task_name"] == "mmau":
+        pass  # MMAU data is already formatted by MMAUDataset.format_data
+    elif datum_dict["task_name"] == "daily-omni":
+        pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
+    elif datum_dict["task_name"] in ("intent-train", "intent-bench"):
+        pass  # IntentDataset.format_data already produces the message structure
+    else:
+        raise ValueError(f"No data processor for task {datum_dict['task_name']}")
+
+    user_message = datum_dict["messages"]
+    problem = user_message[0]["content"]
+    extra_env_info = {"ground_truth": user_message[1]["content"]}
+    if "choices" in datum_dict:
+        extra_env_info["choices"] = datum_dict["choices"]
+
+    message_log: VLMMessageLogType = []
+    ### only one round of interaction is assumed, this can easily be extended to a conversational setting
+    user_message: dict[str, Any] = {"role": "user", "content": []}
+    #
+    images = []
+    audios = []
+    videos = []
+    load_video_kwargs: dict[str, Any] = {}
+    if isinstance(problem, list):
+        for content in problem:
+            # for image, video, audio, just append it
+            # for text, format the prompt to the problem
+            if content["type"] == "text":
+                user_message["content"].append(
+                    {
+                        "type": "text",
+                        "text": task_data_spec.prompt.format(content["text"])
+                        if task_data_spec.prompt
+                        else content["text"],
+                    }
+                )
+            elif content["type"] == "image":
+                user_message["content"].append(content)
+                images.append(content["image"])
+            elif content["type"] == "audio":
+                user_message["content"].append(content)
+                # Store as (audio_array, sample_rate) tuple for vLLM
+                audios.append(
+                    (content["audio"], processor.feature_extractor.sampling_rate)
+                )
+            elif content["type"] == "video":
+                from transformers.video_utils import load_video
+
+                if not load_video_kwargs:
+                    load_video_kwargs = get_multimodal_default_settings_from_processor(
+                        processor
+                    ).get("video", {})
+                video_value = content["video"]
+                if isinstance(video_value, str):
+                    video_value = load_video(
+                        video_value, backend="torchcodec", **load_video_kwargs
+                    )[0]
+                # Replace path with loaded frames so apply_chat_template can consume it
+                user_message["content"].append({"type": "video", "video": video_value})
+                videos.append(video_value)
+            else:
+                raise ValueError(f"Unsupported content type: {content['type']}")
+    else:
+        # conversation consists of a text-only message
+        user_message["content"] = task_data_spec.prompt.format(problem)
+
+    images = [resolve_to_image(image) for image in images]
+    # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
+    # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
+    # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
+    # so we must use processor(text=..., images=...) directly.
+    uses_placeholder = uses_image_placeholder(processor)
+
+    if uses_placeholder and images:
+        # Convert content list to <image> placeholder text format
+        image_token = getattr(processor, "image_token", "<image>")
+        text_parts = []
+        for content in user_message["content"]:
+            if content["type"] == "image":
+                text_parts.append(image_token)
+            elif content["type"] == "text":
+                text_parts.append(content["text"])
+        user_message_for_tokenize = {"role": "user", "content": "\n".join(text_parts)}
+    else:
+        user_message_for_tokenize = user_message
+
+    # get formatted user message
+    if hasattr(processor, "conversation_preprocessor"):
+        user_message_for_chat_template = processor.conversation_preprocessor(
+            user_message
+        )
+    else:
+        user_message_for_chat_template = user_message_for_tokenize
+
+    string_formatted_dialog = processor.apply_chat_template(
+        [user_message_for_chat_template],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    if uses_placeholder and images:
+        # Dynamic-resolution path: keep pixel_values in float32 to match vLLM's
+        # DynamicResolutionImageTiler bit-for-bit. vLLM stores/normalizes in
+        # float32 and only casts at the vision_model boundary; matching that
+        # rounding order tightens rollout/train logprob agreement. The model
+        # forward dispatches on imgs_sizes and handles the bf16 cast.
+        message = processor(
+            text=string_formatted_dialog,
+            images=images,
+            return_tensors="pt",
+        )
+    else:
+        message = processor.apply_chat_template(
+            [user_message_for_tokenize],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+    # add this for backward compatibility
+    user_message["token_ids"] = message["input_ids"][0]
+    # add all keys and values to the user message, and the list of keys
+    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
+    # Dynamic Nemotron Omni processors may omit imgs_sizes from older remote
+    # code. Backfill it for that contract, but never for legacy Nano V2 fixed
+    # tiles: adding dynamic metadata changes Megatron's vision-encoding path.
+    if (
+        uses_placeholder
+        and not uses_fixed_tile_image_processor(processor)
+        and "pixel_values" in message
+        and "imgs_sizes" not in message
+        and message["pixel_values"].ndim == 4
+    ):
+        pixel_values = message["pixel_values"]
+        num_tiles, _, height, width = pixel_values.shape
+        message["imgs_sizes"] = torch.tensor(
+            [[height, width]] * num_tiles, dtype=torch.long
+        )
+
+    # imgs_sizes is not always declared in model_input_names by bundled image
+    # processors, so append it explicitly when present. RADIO uses temporal
+    # patching even for still images and requires one num_frames=1 entry per
+    # image/tile.
+    if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
+        multimodal_keys.append("imgs_sizes")
+    if "imgs_sizes" in message and "num_frames" not in message:
+        message["num_frames"] = torch.ones(len(message["imgs_sizes"]), dtype=torch.long)
+    if "num_frames" in message and "num_frames" not in multimodal_keys:
+        multimodal_keys.append("num_frames")
+    for key in multimodal_keys:
+        if key in message:
+            user_message[key] = PackedTensor(
+                message[key],
+                dim_to_pack=get_dim_to_pack_along(processor, key),
+                pad_to_max_shape=uses_placeholder and key == "pixel_values",
+            )
+
+    # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
+    if "token_type_ids" in message:
+        user_message["token_type_ids"] = message["token_type_ids"][0]
+
+    # for qwen2.5-vl (transformers>=5.3), mm_token_type_ids tells the model which tokens are text/image/video for 3D RoPE
+    if "mm_token_type_ids" in message:
+        user_message["mm_token_type_ids"] = message["mm_token_type_ids"][0]
+
+    ### append to user message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        # Treat truncated messages as text only
+        vllm_kwargs = {
+            "vllm_content": None,
+            "vllm_images": [],
+            "vllm_audios": [],
+            "vllm_videos": [],
+        }
+
+        # make smaller and mask out
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+            for key, value in chat_message.items():
+                if isinstance(value, PackedTensor):
+                    chat_message[key] = PackedTensor.empty_like(value)
+        loss_multiplier = 0.0
+    else:
+        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
+        vllm_kwargs = {
+            "vllm_content": string_formatted_dialog,
+            "vllm_images": images,
+            "vllm_audios": audios,
+            "vllm_videos": videos,
+        }
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+        **vllm_kwargs,  # pyrefly: ignore[bad-unpacking]
+    }
+    return output
+
+
+def _construct_multichoice_prompt(
+    prompt: str, question: str, options: dict[str, str]
+) -> str:
+    """Construct prompt from question and options."""
+    output = prompt
+    output += f"\n\nQuestion: {question}\nOptions:\n"
+    output += "\n".join(
+        [
+            f"{letter}) {option}"
+            for letter, option in options.items()
+            if option is not None
+        ]
+    )
+    return output
+
+
+def multichoice_qa_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for multiple-choice problems."""
+    question = datum_dict["question"]
+    answer = str(datum_dict["answer"])
+    options = datum_dict["options"]
+    extra_env_info = {"ground_truth": answer}
+    if "subject" in datum_dict:
+        extra_env_info.update({"subject": datum_dict["subject"]})
+
+    message_log: LLMMessageLogType = []
+
+    # system prompt
+    if task_data_spec.system_prompt:
+        sys_prompt: dict[str, str | torch.Tensor] = {
+            "role": "system",
+            "content": task_data_spec.system_prompt,
+        }
+        sys = tokenizer.apply_chat_template(
+            [cast(dict[str, str], sys_prompt)],
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+        sys_prompt["token_ids"] = tokenizer(
+            sys, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        message_log.append(sys_prompt)
+
+    # user prompt
+    if task_data_spec.prompt:
+        question = _construct_multichoice_prompt(
+            task_data_spec.prompt, question, options
+        )
+    user_message = {"role": "user", "content": question}
+    message = tokenizer.apply_chat_template(
+        [user_message],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    user_message["token_ids"] = tokenizer(
+        message, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    user_message["content"] = message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
+def _gym_row_has_video_media(extra_env_info: dict[str, Any]) -> bool:
+    """Return whether a Gym row carries cached frames or native video media."""
+    params = extra_env_info.get("responses_create_params")
+    if not isinstance(params, dict):
+        return False
+    messages = params.get("input")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("_is_video_frame"):
+                return True
+            if part.get("type") in ("input_video", "video", "video_url"):
+                return True
+    return False
+
+
+def nemo_gym_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec | None,
+    tokenizer: TokenizerType | None,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for Nemo Gym.
+
+    NeMo-Gym builds the real cumulative prompt server-side. Both LLM and VLM
+    rows therefore use a placeholder here; VLM inputs are processed once after
+    the complete rollout has been collected.
+    """
+    extra_env_info = json.loads(datum_dict["extra_env_info"])
+    if (
+        task_data_spec is not None
+        and task_data_spec.video_sampling_style is not None
+        and _gym_row_has_video_media(extra_env_info)
+    ):
+        if not (
+            hasattr(tokenizer, "apply_chat_template")
+            and hasattr(tokenizer, "tokenizer")
+        ):
+            raise TypeError(
+                "Gym video data requires a multimodal processor with "
+                "apply_chat_template and tokenizer attributes"
+            )
+        from nemo_rl.environments.nemo_gym_video import (
+            nemo_gym_example_to_video_datum_spec,
+        )
+
+        video_output = nemo_gym_example_to_video_datum_spec(
+            extra_env_info,
+            processor=tokenizer,
+            max_seq_length=max_seq_length,
+            idx=idx,
+            task_name=datum_dict["task_name"],
+            data_config=task_data_spec,
+        )
+        # A single NeMo-Gym manifest may mix static-video rows with regular
+        # multimodal rows (for example CAPRL video + SAV tracking images). The
+        # shared data spec still carries video preprocessing settings so video
+        # rows can use the lossless cached-frame path, but those settings must
+        # not turn still-image rows into invalid video examples. Non-video rows
+        # use the normal Gym placeholder below and receive their image tensors
+        # during full-trajectory postprocessing.
+        if video_output is not None:
+            return cast(DatumSpec, video_output)
+
+    if task_data_spec is not None and task_data_spec.image_max_num_tiles is not None:
+        image_max_num_tiles = task_data_spec.image_max_num_tiles
+        if image_max_num_tiles < 1:
+            raise ValueError("image_max_num_tiles must be at least 1.")
+        image_processor = getattr(tokenizer, "image_processor", None)
+        if image_processor is None:
+            raise TypeError(
+                "Gym image_max_num_tiles requires a multimodal processor with "
+                "an image_processor attribute"
+            )
+
+        if hasattr(image_processor, "max_num_tiles"):
+            pass
+        elif all(
+            hasattr(image_processor, name)
+            for name in ("min_num_patches", "max_num_patches")
+        ):
+            min_num_patches = image_processor.min_num_patches
+            if (
+                not isinstance(min_num_patches, int)
+                or isinstance(min_num_patches, bool)
+                or min_num_patches < 1
+            ):
+                raise ValueError(
+                    "The configured dynamic image processor has an invalid "
+                    "min_num_patches value."
+                )
+        else:
+            raise ValueError(
+                "The configured image processor supports neither max_num_tiles "
+                "nor a dynamic min_num_patches/max_num_patches budget."
+            )
+
+        # Keep the logical tile cap for Megatron postprocessing and send its
+        # vLLM-facing equivalent with the Gym request. The vLLM
+        # NanoNemotronVLProcessor uses max_num_tiles for both InternVL and
+        # dynamic-resolution checkpoints. The async worker adapts that logical
+        # tile cap to a dynamic min/max patch budget when necessary.
+        extra_env_info["_nemo_rl_image_max_num_tiles"] = image_max_num_tiles
+        from nemo_rl.environments.nemo_gym_video import (
+            _inject_vllm_mm_processor_kwargs,
+        )
+
+        _inject_vllm_mm_processor_kwargs(
+            extra_env_info,
+            {"max_num_tiles": image_max_num_tiles},
+        )
+
+    output: DatumSpec = {
+        # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+        # fake keys for compatibility with the current GRPO implementation
+        # Empty placeholders must use the same dtype as real tokenizer output.
+        # Otherwise a mixed still-image/video Gym batch combines float32 SAV
+        # placeholders with int64 video token IDs and fails before rollout.
+        "message_log": [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.empty(0, dtype=torch.long),
+            }
+        ],
+        "length": 0,
+    }
+    return output
+
+
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a raw-text datum for cross-tokenizer distillation.
+
+    Tokenization is deferred to the collator, so the text is carried forward
+    as a single assistant message in ``message_log``.
+    """
+    output: DatumSpec = {
+        # Defensive shallow-per-message copy so downstream mutation (e.g.
+        # adding token_ids) doesn't leak back into the dataset row.
+        "message_log": [dict(m) for m in datum_dict["messages"]],
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        # fake keys (not used for cross-tokenizer distillation)
+        "length": 0,
+        "extra_env_info": None,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
+# Processor registry. Key is the processor name, value is the processor function.
+# Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
+# type checkers see each concrete function's signature as a distinct callable type.
+# Without the cast, the registry's inferred type becomes a union of those specific
+# callables, which is not assignable to the uniform TaskDataProcessFnCallable.
+# The cast asserts our intent that all entries conform to the common callable protocol.
+PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
+    Dict[str, TaskDataProcessFnCallable],
+    {
+        "default": math_hf_data_processor,
+        "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
+        "math_data_processor": math_data_processor,
+        "math_hf_data_processor": math_hf_data_processor,
+        "multichoice_qa_processor": multichoice_qa_processor,
+        "sft_processor": sft_processor,
+        "vlm_hf_data_processor": vlm_hf_data_processor,
+        "nemo_gym_data_processor": nemo_gym_data_processor,
+    },
+)
+
+
+def register_processor(
+    processor_name: str, processor_function: TaskDataProcessFnCallable
+) -> None:
+    if processor_name in PROCESSOR_REGISTRY:
+        raise ValueError(f"Processor name {processor_name} already registered")
+    PROCESSOR_REGISTRY[processor_name] = processor_function
+
+    print(f"[INFO] Dataset processor {processor_name} registered")

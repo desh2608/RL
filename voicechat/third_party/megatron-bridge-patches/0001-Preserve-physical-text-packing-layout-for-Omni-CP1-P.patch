@@ -1,0 +1,284 @@
+From f76e18e44bad8f094de3e5cbf6932e8efa427bf4 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 19 Sep 2026 22:18:57 -0700
+Subject: [PATCH 1/4] Preserve physical text packing layout for Omni CP1 PP1
+ attention
+
+---
+ .../nemotron_omni/modeling_nemotron_omni.py   |  36 +++-
+ .../nemotron_omni/test_nemotron_omni_model.py |   1 +
+ .../nemotron_omni/test_text_only_packing.py   | 189 ++++++++++++++++++
+ 3 files changed, 225 insertions(+), 1 deletion(-)
+ create mode 100644 tests/unit_tests/models/nemotron_omni/test_text_only_packing.py
+
+diff --git a/src/megatron/bridge/models/nemotron_omni/modeling_nemotron_omni.py b/src/megatron/bridge/models/nemotron_omni/modeling_nemotron_omni.py
+index 250b9660..884c46d9 100644
+--- a/src/megatron/bridge/models/nemotron_omni/modeling_nemotron_omni.py
++++ b/src/megatron/bridge/models/nemotron_omni/modeling_nemotron_omni.py
+@@ -28,6 +28,7 @@ is not the canonical model selected by AutoBridge.
+ 
+ import logging
+ from collections import namedtuple
++from dataclasses import replace
+ from typing import Optional
+ 
+ import torch
+@@ -899,7 +900,7 @@ class NemotronOmniModel(MegatronModule):
+         if packed_seq_params is not None:
+             # THD tensors and their logical boundaries are final collator
+             # outputs. The model may shard token-aligned tensors for CP, but
+-            # never rebuilds or mutates the packing metadata.
++            # never mutates the caller's packing metadata.
+             attention_mask = None
+ 
+         (
+@@ -936,6 +937,39 @@ class NemotronOmniModel(MegatronModule):
+             # but matches vLLM prefill numerics. Multi-sample and CP runs keep
+             # packed metadata so their sequence boundaries are preserved.
+             language_packed_seq_params = None
++        elif (
++            language_packed_seq_params is not None
++            and self.context_parallel_lm == 1
++            and self.pre_process
++            and self.post_process
++            and (images is None or images.numel() == 0)
++            and not has_sound_inputs
++            and language_packed_seq_params.qkv_format == "thd"
++            and language_packed_seq_params.cu_seqlens_q_padded is not None
++            and language_packed_seq_params.cu_seqlens_kv_padded is not None
++        ):
++            # Text-only CP=1 uses the ordinary text packer's convention: every
++            # sample includes its trailing alignment tokens in attention's
++            # sequence length. This keeps the attention output in the same
++            # physical THD layout as the residual stream under TP/SP. Distinct
++            # padded boundaries still prevent attention/Mamba state from
++            # crossing samples; causal valid tokens cannot see their trailing
++            # padding. Keep logical lengths and masks intact for the caller's
++            # unpadding/loss code by changing only this language-model copy.
++            # Restrict this to PP=1: later PP stages may have no media payloads
++            # even for multimodal inputs, so they cannot infer text-only.
++            language_packed_seq_params = replace(
++                language_packed_seq_params,
++                cu_seqlens_q=language_packed_seq_params.cu_seqlens_q_padded,
++                cu_seqlens_kv=language_packed_seq_params.cu_seqlens_kv_padded,
++                max_seqlen_q=int(
++                    language_packed_seq_params.cu_seqlens_q_padded.diff().max().item()
++                ),
++                max_seqlen_kv=int(
++                    language_packed_seq_params.cu_seqlens_kv_padded.diff().max().item()
++                ),
++                pad_between_seqs=False,
++            )
+ 
+         if combined_embeddings is not None and self.sequence_parallel_lm:
+             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+diff --git a/tests/unit_tests/models/nemotron_omni/test_nemotron_omni_model.py b/tests/unit_tests/models/nemotron_omni/test_nemotron_omni_model.py
+index 986d590a..35a4deb3 100644
+--- a/tests/unit_tests/models/nemotron_omni/test_nemotron_omni_model.py
++++ b/tests/unit_tests/models/nemotron_omni/test_nemotron_omni_model.py
+@@ -81,6 +81,7 @@ class _BoundaryModel(NemotronOmniModel):
+     def __init__(self, image_features, sound_features=None):
+         nn.Module.__init__(self)
+         self.pre_process = True
++        self.post_process = True
+         self.image_token_index = 18
+         self.sound_token_index = 19
+         self.context_parallel_lm = 1
+diff --git a/tests/unit_tests/models/nemotron_omni/test_text_only_packing.py b/tests/unit_tests/models/nemotron_omni/test_text_only_packing.py
+new file mode 100644
+index 00000000..806aab56
+--- /dev/null
++++ b/tests/unit_tests/models/nemotron_omni/test_text_only_packing.py
+@@ -0,0 +1,189 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""CPU contract tests for Omni text-only packed metadata.
++
++These exercise the real Omni forward with a recording language-model shell;
++they do not run Transformer Engine, tensor-parallel collectives, or GPU kernels.
++Run directly with ``python <this file>`` or collect with pytest.
++"""
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++from megatron.core.packed_seq_params import PackedSeqParams
++from torch import nn
++
++from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import NemotronOmniModel
++
++
++class RecordingLanguageModel(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.last_kwargs = None
++
++    def embedding(self, input_ids, position_ids):
++        del position_ids
++        values = input_ids.transpose(0, 1).unsqueeze(-1).to(torch.float32)
++        return values.repeat(1, 1, 3)
++
++    def forward(self, *, decoder_input, **kwargs):
++        self.last_kwargs = kwargs
++        return decoder_input
++
++
++class BoundaryModel(NemotronOmniModel):
++    def __init__(self):
++        nn.Module.__init__(self)
++        self.pre_process = True
++        self.post_process = True
++        self.image_token_index = 18
++        self.sound_token_index = 19
++        self.context_parallel_lm = 1
++        self.sequence_parallel_lm = False
++        self.config = SimpleNamespace(mtp_num_layers=None)
++        self.language_model = RecordingLanguageModel()
++
++    def _encode_images(self, *args):
++        return torch.full((1, 3), 0.25)
++
++    def _encode_sound(self, *args):
++        return torch.full((1, 3), 0.5)
++
++
++def make_pack(lengths, padded_lengths):
++    assert len(lengths) == len(padded_lengths)
++    logical = torch.tensor([0] + lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32)
++    physical = torch.tensor([0] + padded_lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32)
++    tokens = torch.zeros(1, sum(padded_lengths), dtype=torch.long)
++    mask = torch.zeros_like(tokens, dtype=torch.float32)
++    for i, length in enumerate(lengths):
++        start = int(physical[i])
++        # Never accidentally use the image/audio placeholder IDs.
++        tokens[0, start : start + length] = (torch.arange(length) % 7) + 30 + i * 10
++        mask[0, start : start + length] = 1
++    params = PackedSeqParams(
++        qkv_format="thd",
++        cu_seqlens_q=logical,
++        cu_seqlens_kv=logical,
++        cu_seqlens_q_padded=physical,
++        cu_seqlens_kv_padded=physical,
++        max_seqlen_q=max(padded_lengths),
++        max_seqlen_kv=max(padded_lengths),
++        total_tokens=tokens.shape[1],
++        pad_between_seqs=not torch.equal(logical, physical),
++    )
++    return tokens, mask, params
++
++
++def causal_attention(values):
++    # Tiny independent CPU oracle, not a stand-in for the TE backend test.
++    query = values[None, None, :, :] / 100.0
++    return torch.nn.functional.scaled_dot_product_attention(
++        query, query, values[None, None, :, :], is_causal=True
++    )[0, 0]
++
++
++class TextOnlyPackingTests(unittest.TestCase):
++    def test_observed_tp4_shape_and_original_metadata_and_loss_masks(self):
++        # A witness with the failure's logical 16227 / physical 16384 totals.
++        tokens, mask, original = make_pack([4001, 8001, 4225], [4032, 8064, 4288])
++        original_state = {key: value for key, value in vars(original).items()}
++        model = BoundaryModel()
++        output = model(input_ids=tokens, labels=tokens, loss_mask=mask, packed_seq_params=original)
++        forwarded = model.language_model.last_kwargs["packed_seq_params"]
++        self.assertIsNot(forwarded, original)
++        self.assertEqual(output.shape[0], 16384)
++        self.assertEqual(int(forwarded.cu_seqlens_q[-1]), output.shape[0])
++        self.assertEqual(int(forwarded.cu_seqlens_q[-1]) % 4, 0)
++        self.assertEqual(int(original.cu_seqlens_q[-1]), 16227)
++        self.assertEqual(forwarded.cu_seqlens_q.tolist(), [0, 4032, 12096, 16384])
++        self.assertTrue(torch.equal(forwarded.cu_seqlens_q, forwarded.cu_seqlens_kv))
++        self.assertFalse(forwarded.pad_between_seqs)
++        self.assertTrue(torch.equal(forwarded.seq_idx, original.seq_idx))
++        for key, value in original_state.items():
++            self.assertIs(vars(original)[key], value, key)
++        self.assertIs(model.language_model.last_kwargs["loss_mask"], mask)
++        self.assertIs(model.language_model.last_kwargs["labels"], tokens)
++        self.assertEqual(int(mask.sum()), 16227)
++        self.assertTrue(torch.all(mask[tokens == 0] == 0))
++
++    def test_valid_token_attention_and_mamba_reset_boundaries(self):
++        lengths, padded = [3, 5, 1], [4, 8, 4]
++        tokens, mask, original = make_pack(lengths, padded)
++        model = BoundaryModel()
++        embeddings = model(input_ids=tokens, loss_mask=mask, packed_seq_params=original)[:, 0]
++        forwarded = model.language_model.last_kwargs["packed_seq_params"]
++        boundaries = forwarded.cu_seqlens_q.tolist()
++        attention = torch.cat(
++            [causal_attention(embeddings[a:b]) for a, b in zip(boundaries[:-1], boundaries[1:])]
++        )
++        for i, length in enumerate(lengths):
++            start = boundaries[i]
++            expected = causal_attention(embeddings[start : start + length])
++            torch.testing.assert_close(attention[start : start + length], expected)
++            # Mamba uses seq_idx reset boundaries from padded cumulative lengths.
++            self.assertTrue(torch.all(forwarded.seq_idx[0, start : boundaries[i + 1]] == i))
++        # Negative control: treating multiple samples as one dense sequence leaks.
++        dense = causal_attention(embeddings)
++        self.assertFalse(torch.allclose(dense[boundaries[1]], attention[boundaries[1]]))
++
++    def test_real_media_preserves_logical_metadata(self):
++        for modality in ("image", "audio"):
++            with self.subTest(modality=modality):
++                tokens, mask, original = make_pack([3, 5], [4, 8])
++                model = BoundaryModel()
++                tokens[0, 0] = 18 if modality == "image" else 19
++                media = {"images": torch.ones(1)} if modality == "image" else {"sound_clips": torch.ones(2, 2)}
++                model(input_ids=tokens, loss_mask=mask, packed_seq_params=original, **media)
++                self.assertIs(model.language_model.last_kwargs["packed_seq_params"], original)
++
++    def test_empty_media_and_existing_dummy_sound_are_text_only(self):
++        tokens, _, original = make_pack([3, 5], [4, 8])
++        model = BoundaryModel()
++        model(
++            input_ids=tokens,
++            packed_seq_params=original,
++            pixel_values=torch.empty(0),
++            sound_clips=torch.zeros(1, 1),
++        )
++        forwarded = model.language_model.last_kwargs["packed_seq_params"]
++        self.assertIsNot(forwarded, original)
++        self.assertEqual(forwarded.cu_seqlens_q.tolist(), [0, 4, 12])
++
++    def test_cp2_preserves_collator_metadata(self):
++        tokens, _, original = make_pack([3, 5], [4, 8])
++        model = BoundaryModel()
++        model.context_parallel_lm = 2
++        model.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 2, rank=lambda: 0))
++        cp_index = torch.tensor([0, 3, 4, 5, 10, 11])
++        with patch(
++            "megatron.bridge.models.nemotron_omni.modeling_nemotron_omni.get_packed_seq_cp_partition_indices",
++            return_value=cp_index,
++        ):
++            model(input_ids=tokens, packed_seq_params=original)
++        self.assertIs(model.language_model.last_kwargs["packed_seq_params"], original)
++
++    def test_pp_stages_keep_original_metadata(self):
++        tokens, _, original = make_pack([3, 5], [4, 8])
++        for pre_process, post_process in ((True, False), (False, True), (False, False)):
++            with self.subTest(pre_process=pre_process, post_process=post_process):
++                model = BoundaryModel()
++                model.pre_process = pre_process
++                model.post_process = post_process
++                model(input_ids=tokens if pre_process else None, packed_seq_params=original)
++                self.assertIs(model.language_model.last_kwargs["packed_seq_params"], original)
++
++    def test_single_sample_and_dense_contracts_stay_unchanged(self):
++        tokens, _, original = make_pack([3], [4])
++        model = BoundaryModel()
++        model(input_ids=tokens, packed_seq_params=original)
++        self.assertIsNone(model.language_model.last_kwargs["packed_seq_params"])
++        model(input_ids=tokens)
++        self.assertIsNone(model.language_model.last_kwargs["packed_seq_params"])
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+-- 
+2.25.1
+

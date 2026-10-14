@@ -1,0 +1,664 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import contextlib
+import io
+import itertools
+import logging
+import re
+from typing import Any, NotRequired, TypedDict, Union
+
+import ray
+import torch
+from math_verify import grader
+from math_verify.errors import TimeoutException
+from math_verify.metric import math_metric
+from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+
+from nemo_rl.data.interfaces import LLMMessageLogType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.environments.dapo_math_verifier import compute_score as dapo_math_verify
+from nemo_rl.environments.interfaces import (
+    EnvironmentInterface,
+    EnvironmentReturn,
+)
+from nemo_rl.environments.metrics import (
+    calculate_pass_rate_per_prompt,
+)
+from nemo_rl.environments.utils import chunk_list_to_workers
+from nemo_rl.evals import answer_parsing
+
+
+class MathEnvConfig(TypedDict):
+    num_workers: int
+    stop_strings: NotRequired[list[str] | None]  # Default stop strings for this env
+    # The verifier type. None defaults to "math".
+    verifier_type: NotRequired[str | None]
+    math_verify_impl: NotRequired[str | None]
+
+
+@contextlib.contextmanager
+def _mute_output():
+    devnull_out, devnull_err = io.StringIO(), io.StringIO()
+    with (
+        contextlib.redirect_stdout(devnull_out),
+        contextlib.redirect_stderr(devnull_err),
+    ):
+        yield
+
+
+def _select_extracted_answer(
+    extracted_answer: Any, math_verify_impl: str
+) -> str | None:
+    """Pick the answer to record for a sample, or ``None`` if none is usable.
+
+    Never raises: an unparseable generation has to produce ``None`` here rather
+    than an exception, because the caller has already committed this sample's
+    score by the time it asks for the answer.
+    """
+    if math_verify_impl == "dapo_math_verify":
+        # This branch hands back a plain normalized string, not a (gold, pred) pair.
+        return extracted_answer if isinstance(extracted_answer, str) else None
+
+    if extracted_answer is None or len(extracted_answer) != 2:
+        return None
+    extracted_gold, extracted_prediction = extracted_answer
+    for pred in extracted_prediction:
+        if any(grader.verify(gold, pred) for gold in extracted_gold):
+            return pred
+    # Nothing matched, so every prediction is wrong; record the first one.
+    # ``extracted_prediction`` is a flat list[str] -- indexing it twice would
+    # take the first *character*, and it is empty when nothing parsed at all.
+    return extracted_prediction[0] if extracted_prediction else None
+
+
+@ray.remote  # pragma: no cover
+class HFVerifyWorker:
+    def __init__(self) -> None:
+        logging.getLogger("math_verify").setLevel(logging.CRITICAL)
+
+        # Use Latex and plain math extraction from predictions
+        # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
+        self.verify_func = math_metric(
+            gold_extraction_target=(LatexExtractionConfig(),),
+            pred_extraction_target=(
+                ExprExtractionConfig(),
+                LatexExtractionConfig(),
+            ),
+        )
+
+    def verify(
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+        **kwargs,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
+        """
+        results = []
+        extracted_answers: list[str | None] = []
+
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            score: float = 0.0
+            extracted: str | None = None
+            try:
+                with _mute_output():
+                    math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
+                    if kwargs.get("math_verify_impl") == "dapo_math_verify":
+                        # This compute_score is from the DAPO Math Verifier from Verl
+                        reward_dict = dapo_math_verify(response, ground_truth)
+                        ret_score = reward_dict["score"]
+                        extracted_answer = reward_dict["pred"]
+                    elif kwargs.get("math_verify_impl") == "hf_math_verify":
+                        ground_truth_parsable = "\\boxed{" + ground_truth + "}"
+                        ret_score, extracted_answer = self.verify_func(
+                            [ground_truth_parsable], [response]
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
+                        )
+
+                score = float(ret_score)
+
+            # It's possible to emit a TimeoutException and that wouldn't be caught since
+            # it actually subclasses from BaseException and math-verify itself does not
+            # to catch it.
+            except (Exception, TimeoutException):
+                score = 0.0
+            else:
+                # Outside the try on purpose: failing to record an answer must
+                # not retract a score the verifier already returned.
+                if return_extracted_answer:
+                    extracted = _select_extracted_answer(
+                        extracted_answer, math_verify_impl
+                    )
+
+            # Exactly one score and one answer per sample, on every path: both
+            # are consumed positionally against the batch downstream.
+            results.append(score)
+            if return_extracted_answer:
+                extracted_answers.append(extracted)
+
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
+
+
+@ray.remote  # pragma: no cover
+class MultilingualMultichoiceVerifyWorker:
+    def verify(
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+        **kwargs,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
+        """
+        results = []
+        extracted_answers: list[str | None] = []
+
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            response = answer_parsing.normalize_response(response)
+            extracted_answer = None
+            for answer_regex in answer_parsing.MULTILINGUAL_ANSWER_REGEXES:
+                regex = answer_parsing.MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(
+                    answer_regex
+                )
+                match = re.search(regex, response)
+                if match:
+                    extracted_answer = answer_parsing.normalize_extracted_answer(
+                        match.group(1)
+                    )
+                    break
+            score = 1.0 if extracted_answer == ground_truth else 0.0
+            results.append(score)
+            extracted_answers.append(extracted_answer)
+
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
+
+
+@ray.remote  # pragma: no cover
+class EnglishMultichoiceVerifyWorker:
+    def verify(
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+        **kwargs,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
+        """
+        results = []
+        extracted_answers: list[str | None] = []
+
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            ground_truth = answer_parsing.normalize_response(ground_truth)
+            response = answer_parsing.normalize_response(response)
+            extracted_answer = None
+            match = re.search(r"(?i)Answer\s*:[ \t]*([A-Z])", response)
+            if match:
+                extracted_answer = answer_parsing.normalize_extracted_answer(
+                    match.group(1)
+                )
+            score = 1.0 if extracted_answer == ground_truth else 0.0
+            results.append(score)
+            if return_extracted_answer:
+                extracted_answers.append(extracted_answer)
+
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
+
+
+@ray.remote  # pragma: no cover
+class HFMultiRewardVerifyWorker:
+    # Reward component names returned by this worker.
+    REWARD_NAMES: list[str] = [
+        "reward/correctness",
+        "reward/integer",
+        "reward/format",
+    ]
+
+    def __init__(self) -> None:
+        logging.getLogger("math_multi_reward_verify").setLevel(logging.CRITICAL)
+
+        # Use Latex and plain math extraction from predictions
+        # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
+        self.verify_func = math_metric(
+            gold_extraction_target=(LatexExtractionConfig(),),
+            pred_extraction_target=(
+                ExprExtractionConfig(),
+                LatexExtractionConfig(),
+            ),
+        )
+
+    def verify(
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+        **kwargs,
+    ) -> Union[
+        dict[str, list[float]],
+        tuple[dict[str, list[float]], list[str | None]],
+    ]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            If return_extracted_answer is False, returns dict mapping reward component
+            names to per-sample scores.
+            If return_extracted_answer is True, returns (scores_dict, extracted_answers).
+        """
+
+        def extract_xml_answer(text: str) -> str:
+            answer = text.split("<answer>")[-1]
+            answer = answer.split("</answer>")[0]
+            return answer.strip()
+
+        def correctness_reward_func(completions, answer, **kwargs) -> list[float]:
+            extracted_responses = [extract_xml_answer(r) for r in completions]
+            return [1.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+
+        def int_reward_func(completions, **kwargs) -> list[float]:
+            extracted_responses = [extract_xml_answer(r) for r in completions]
+            return [1.0 if r.isdigit() else 0.0 for r in extracted_responses]
+
+        def format_reward_func(completions, **kwargs) -> list[float]:
+            """Reward function that checks if the completion has a specific format."""
+            rewards = []
+            for response in completions:
+                pattern = r"^<think>.*?</think>\n<answer>.*?</answer>$"
+
+                if (
+                    re.search(pattern, response, re.DOTALL)
+                    and response.count("<answer>") == 1
+                    and response.count("</answer>") == 1
+                ):
+                    rewards.append(1.0)
+                else:
+                    rewards.append(0.0)
+
+            return rewards
+
+        results: dict[str, list[float]] = {name: [] for name in self.REWARD_NAMES}
+        extracted_answers: list[str | None] = []
+
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            try:
+                math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
+                if math_verify_impl == "hf_math_verify":
+                    cor_reward = correctness_reward_func([response], [ground_truth])
+                    int_reward = int_reward_func([response])
+                    format_reward = format_reward_func([response])
+                else:
+                    raise ValueError(
+                        f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify'"
+                    )
+
+                results["reward/correctness"].extend(cor_reward)
+                results["reward/integer"].extend(int_reward)
+                results["reward/format"].extend(format_reward)
+
+                if return_extracted_answer:
+                    extracted_answer = extract_xml_answer(response)
+                    extracted_answers.append(extracted_answer)
+
+            # It's possible to emit a TimeoutException and that wouldn't be caught since
+            # it actually subclasses from BaseException and math-verify itself does not
+            # to catch it.
+            except (Exception, TimeoutException):
+                for name in self.REWARD_NAMES:
+                    results[name].append(0.0)
+                extracted_answers.append(None)
+
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
+
+
+class MathEnvironmentMetadata(TypedDict):
+    ground_truth: str
+    extracted_answer: str | None
+
+
+# Use a base class to share some functions to avoid code duplication.
+class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
+    WORKER_CLASS_DICT: dict[str, type[ray.remote]]
+
+    def __init__(self, cfg: MathEnvConfig):
+        self.cfg = cfg
+        self.num_workers = cfg["num_workers"]
+        self._worker_counter = itertools.count()
+        verifier_type = cfg.get("verifier_type", "math")
+        assert isinstance(verifier_type, str), (
+            f"{verifier_type=} must be a string but was {type(verifier_type)}"
+        )
+
+        worker_cls = self.WORKER_CLASS_DICT[verifier_type]
+        self.workers = [
+            worker_cls.options(  # type: ignore # (decorated with @ray.remote)
+                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+            ).remote()
+            for _ in range(self.num_workers)
+        ]
+
+    def shutdown(self) -> None:
+        # shutdown all workers
+        for worker in self.workers:
+            ray.kill(worker)
+
+    def global_post_process_and_metrics(
+        self, batch: BatchedDataDict[Any]
+    ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
+        """Computes metrics for this environment given a global rollout batch.
+
+        Every rank will run this function, so you're free to use distributed
+        calculations if you'd prefer for heavy metrics.
+        """
+        # For multi-reward environments the batch stores per-component reward
+        # tensors under named keys (e.g. "reward/correctness").  For single-reward
+        # environments it stores a flat Tensor under "rewards".
+        if "reward/correctness" in batch:
+            rewards = batch["reward/correctness"]
+        else:
+            rewards = batch["rewards"]
+
+        # set a reward of 0 for any incorrectly ended sequences
+        rewards = rewards * batch["is_end"]
+        if (rewards == 1).float().sum() > 0:
+            correct_solution_generation_lengths = (
+                (batch["generation_lengths"] - batch["prompt_lengths"])[rewards == 1]
+                .float()
+                .mean()
+                .item()
+            )
+        else:
+            correct_solution_generation_lengths = 0
+
+        metrics = {
+            # "table": table, TODO @sahilj WIP
+            "accuracy": rewards.mean().item(),
+            "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
+                batch["text"], rewards
+            ),
+            "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
+            "num_problems_in_batch": batch["is_end"].shape[0],
+            "generation_lengths": batch["generation_lengths"].float().mean().item(),
+            "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
+            "correct_solution_generation_lengths": correct_solution_generation_lengths,
+        }
+
+        return batch, metrics
+
+
+@ray.remote(
+    max_restarts=-1, max_task_retries=-1, max_concurrency=1000
+)  # pragma: no cover
+class MathEnvironment(BaseMathEnvironment):
+    # TODO: split out this environment since it's doing more than just math
+    WORKER_CLASS_DICT = {
+        "math": HFVerifyWorker,
+        "english_multichoice": EnglishMultichoiceVerifyWorker,
+        "multilingual_multichoice": MultilingualMultichoiceVerifyWorker,
+    }
+
+    def step(
+        self,
+        message_log_batch: list[LLMMessageLogType],
+        metadata: list[MathEnvironmentMetadata],
+        return_extracted_answer: bool = False,
+    ) -> EnvironmentReturn[MathEnvironmentMetadata]:
+        """Runs a step in the math environment.
+
+        Args:
+            message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
+            metadata: list[MathEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness. The extracted answer will be stored to caculate cons@k.
+
+        Returns:
+            EnvironmentReturn: A tuple containing:
+                - list[dict[str, str]]: Observations/responses batch
+                - list[dict]: Updated metadata
+                - list[str]: Next stop strings for the next turn
+                - Tensor: Rewards tensor
+                - Tensor: Done flags tensor
+        """
+        # Extract the assistant's responses from the message history
+        # Each message list should have at least one assistant response
+        assistant_response_batch = []
+        for conversation in message_log_batch:
+            assistant_responses = [
+                str(interaction["content"])
+                for interaction in conversation
+                if interaction["role"] == "assistant"
+            ]
+            assistant_response_batch.append("".join(assistant_responses))
+
+        ground_truths = [g["ground_truth"] for g in metadata]
+
+        chunked_assistant_response_batch = chunk_list_to_workers(
+            assistant_response_batch, self.num_workers
+        )
+        chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
+
+        # Round-robin the starting worker index.
+        # Without the rotation, all the requests will be sent to workers[0] if this function
+        # is called per-sample.
+        worker_index = next(self._worker_counter) % self.num_workers
+
+        # Process each chunk in parallel
+        futures = [
+            self.workers[(worker_index + i) % self.num_workers].verify.remote(
+                chunk,
+                ground_truth_chunk,
+                return_extracted_answer,
+                math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
+            )
+            for i, (chunk, ground_truth_chunk) in enumerate(
+                zip(chunked_assistant_response_batch, chunked_ground_truths)
+            )
+        ]
+
+        worker_results = ray.get(futures)
+
+        # Flatten the results and extract both scores and answers
+        results = []
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+
+        for worker_result in worker_results:
+            worker_scores = worker_result
+            if return_extracted_answer:
+                worker_scores, worker_answers = worker_result
+                extracted_answers.extend(worker_answers)
+            results.extend(worker_scores)
+
+        observations = [
+            {
+                "role": "environment",
+                "content": "Environment: correct"
+                if result
+                else "Environment: incorrect",
+            }
+            for result in results
+        ]
+
+        # create a tensor of rewards and done flags
+        rewards = torch.tensor(results).cpu()
+        done = torch.ones_like(rewards).cpu()
+        next_stop_strings = [None] * len(message_log_batch)
+
+        return EnvironmentReturn(
+            observations=observations,
+            metadata=metadata,
+            next_stop_strings=next_stop_strings,
+            rewards=rewards,
+            terminateds=done,
+            answers=extracted_answers,
+        )
+
+
+@ray.remote(
+    max_restarts=-1, max_task_retries=-1, max_concurrency=1000
+)  # pragma: no cover
+class MathMultiRewardEnvironment(BaseMathEnvironment):
+    WORKER_CLASS_DICT = {
+        "math": HFMultiRewardVerifyWorker,
+    }
+
+    def step(
+        self,
+        message_log_batch: list[LLMMessageLogType],
+        metadata: list[MathEnvironmentMetadata],
+        return_extracted_answer: bool = False,
+    ) -> EnvironmentReturn[MathEnvironmentMetadata]:
+        """Runs a step in the math environment.
+
+        Args:
+            message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
+            metadata: list[MathEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness. The extracted answer will be stored to caculate cons@k.
+
+        Returns:
+            EnvironmentReturn: A tuple containing:
+                - list[dict[str, str]]: Observations/responses batch
+                - list[dict]: Updated metadata
+                - list[str]: Next stop strings for the next turn
+                - Tensor: Rewards tensor
+                - Tensor: Done flags tensor
+        """
+        # Extract the assistant's responses from the message history
+        # Each message list should have at least one assistant response
+        assistant_response_batch = []
+        for conversation in message_log_batch:
+            assistant_responses = [
+                str(interaction["content"])
+                for interaction in conversation
+                if interaction["role"] == "assistant"
+            ]
+            assistant_response_batch.append("".join(assistant_responses))
+
+        ground_truths = [g["ground_truth"] for g in metadata]
+
+        chunked_assistant_response_batch = chunk_list_to_workers(
+            assistant_response_batch, self.num_workers
+        )
+        chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
+
+        # Round-robin the starting worker index.
+        # Without the rotation, all the requests will be sent to workers[0] if this function
+        # is called per-sample.
+        worker_index = next(self._worker_counter) % self.num_workers
+
+        # Process each chunk in parallel
+        futures = [
+            self.workers[(worker_index + i) % self.num_workers].verify.remote(
+                chunk,
+                ground_truth_chunk,
+                return_extracted_answer,
+                math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
+            )
+            for i, (chunk, ground_truth_chunk) in enumerate(
+                zip(chunked_assistant_response_batch, chunked_ground_truths)
+            )
+        ]
+
+        worker_results = ray.get(futures)
+
+        # Flatten the results and extract both scores and answers.
+        # Each worker returns dict[str, list[float]] (or a tuple with extracted answers).
+        reward_names: list[str] | None = None
+        results: dict[str, list[float]] = {}
+        extracted_answers: list[str | None] | None = (
+            [] if return_extracted_answer else None
+        )
+
+        for worker_result in worker_results:
+            worker_scores = worker_result
+            if return_extracted_answer:
+                worker_scores, worker_answers = worker_result
+                extracted_answers.extend(worker_answers)
+            if reward_names is None:
+                reward_names = list(worker_scores.keys())
+                results = {name: [] for name in reward_names}
+            for name in reward_names:
+                results[name].extend(worker_scores[name])
+
+        correctness_key = "reward/correctness"
+        observations = [
+            {
+                "role": "environment",
+                "content": "Environment: correct"
+                if score
+                else "Environment: incorrect",
+            }
+            for score in results[correctness_key]
+        ]
+
+        # Build dict of reward tensors: {name: Tensor[B]}
+        rewards: dict[str, torch.Tensor] = {
+            name: torch.tensor(scores, dtype=torch.float32).cpu()
+            for name, scores in results.items()
+        }
+        batch_size = len(results[correctness_key])
+        done = torch.ones(batch_size).cpu()
+        next_stop_strings = [None] * len(message_log_batch)
+
+        return EnvironmentReturn(
+            observations=observations,
+            metadata=metadata,
+            next_stop_strings=next_stop_strings,
+            rewards=rewards,
+            terminateds=done,
+            answers=extracted_answers,
+        )

@@ -1,0 +1,144 @@
+From 565c9c7d5dbdc35a5b1a6fb2d0c54f4e8ded23be Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 20 Sep 2026 01:13:52 -0700
+Subject: [PATCH 1/3] Restore HDO master parameters after DP-reshardable
+ checkpoint load
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ megatron/core/optimizer/distrib_optimizer.py  |   3 +
+ .../unit_tests/test_hdo_dp_reshardable_cpu.py | 108 ++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+ create mode 100644 tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index 8576b066a..e94a72df0 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -2111,6 +2111,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                         # Main param & optimizer states.
+                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
+ 
++        if isinstance(self.optimizer, HybridDeviceOptimizer):
++            self.optimizer._sync_hdo_state_to_sub_optimizers()
++
+     @torch.no_grad()
+     def load_parameter_state_from_fs_model_space(self, state_dict):
+         """Loads the parameter state from a "model space" representation.
+diff --git a/tests/unit_tests/test_hdo_dp_reshardable_cpu.py b/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+new file mode 100644
+index 000000000..7699df6fe
+--- /dev/null
++++ b/tests/unit_tests/test_hdo_dp_reshardable_cpu.py
+@@ -0,0 +1,108 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""CPU numerical regression; also runnable directly without distributed fixtures."""
++
++import io
++import unittest
++from collections import defaultdict
++from types import SimpleNamespace
++
++import torch
++
++from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
++    HybridDeviceOptimizer,
++)
++from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
++
++
++class TestHDODPReshardableCPU(unittest.TestCase):
++    def test_restored_master_and_next_adam_step_match_uninterrupted_training(self):
++        # The HDO constructor needs CUDA streams. Build only its CPU Adam branch,
++        # retaining the real shared-state and FP32-master mappings used after load.
++        for dtype in (torch.bfloat16, torch.float16):
++            with self.subTest(dtype=dtype):
++                reference_param = torch.nn.Parameter(
++                    torch.tensor([1.000123, -2.000321])
++                )
++                reference = torch.optim.AdamW([reference_param], lr=0.01, fused=True)
++                for gradient in ([0.2, -0.3], [0.4, 0.1], [-0.1, 0.5]):
++                    reference_param.grad = torch.tensor(gradient)
++                    reference.step()
++                saved = {
++                    "param": reference_param.detach().clone(),
++                    "exp_avg": reference.state[reference_param]["exp_avg"].clone(),
++                    "exp_avg_sq": reference.state[reference_param][
++                        "exp_avg_sq"
++                    ].clone(),
++                    "padding": False,
++                }
++                checkpoint = io.BytesIO()
++                torch.save({0: {dtype: [[saved]]}}, checkpoint)
++                checkpoint.seek(0)
++                restored = torch.load(checkpoint, weights_only=True)
++
++                model_param = torch.nn.Parameter(reference_param.detach().to(dtype))
++                shard_param = torch.nn.Parameter(model_param.detach().clone())
++                inner_param = torch.nn.Parameter(torch.tensor([-3.125, 4.25]))
++                inner = torch.optim.AdamW([inner_param], lr=0.01, fused=True)
++                shared_state = {
++                    "master_param": inner_param,
++                    "exp_avg": torch.zeros_like(inner_param),
++                    "exp_avg_sq": torch.zeros_like(inner_param),
++                    # Non-tensor checkpoint metadata restores this before the
++                    # distributed parameter-state loader runs.
++                    "step": reference.state[reference_param]["step"].clone(),
++                }
++                inner.state[inner_param] = shared_state
++                hdo = object.__new__(HybridDeviceOptimizer)
++                hdo.param_groups = [{"params": [shard_param]}]
++                hdo.state = defaultdict(dict, {shard_param: shared_state})
++                hdo.cpu_optimizers = [inner]
++                hdo.gpu_optimizer = None
++                hdo.param_update_in_fp32 = True
++                hdo.param_to_fp32_param = {shard_param: inner_param}
++                hdo.inner_param_to_orig_param = {inner_param: shard_param}
++                hdo.defaults = {"cpu_optimizer_cls": torch.optim.AdamW}
++                wrapper = SimpleNamespace(
++                    config=SimpleNamespace(
++                        use_precision_aware_optimizer_no_fp8_or_ds_fp8=True
++                    ),
++                    optimizer=hdo,
++                    model_param_group_index_map={model_param: (0, 0)},
++                    gbuf_ranges=[{dtype: [{"param_map": {model_param: {}}}]}],
++                )
++                wrapper._set_main_param_and_optimizer_states = lambda param, tensors: (
++                    DistributedOptimizer._set_main_param_and_optimizer_states(
++                        wrapper, param, tensors
++                    )
++                )
++                DistributedOptimizer.load_parameter_state_from_dp_reshardable(
++                    wrapper, restored
++                )
++
++                torch.testing.assert_close(inner_param, reference_param, rtol=0, atol=0)
++                self.assertEqual(inner_param.dtype, torch.float32)
++                self.assertIs(inner.state[inner_param], hdo.state[shard_param])
++                for key in ("exp_avg", "exp_avg_sq", "step"):
++                    torch.testing.assert_close(
++                        inner.state[inner_param][key],
++                        reference.state[reference_param][key],
++                        rtol=0,
++                        atol=0,
++                    )
++                inner_param.grad = torch.tensor([0.125, -0.25])
++                reference_param.grad = inner_param.grad.clone()
++                inner.step()
++                reference.step()
++                torch.testing.assert_close(inner_param, reference_param, rtol=0, atol=0)
++                for key in ("exp_avg", "exp_avg_sq", "step"):
++                    torch.testing.assert_close(
++                        inner.state[inner_param][key],
++                        reference.state[reference_param][key],
++                        rtol=0,
++                        atol=0,
++                    )
++                self.assertEqual(inner.state[inner_param]["step"].item(), 4)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.25.1
+

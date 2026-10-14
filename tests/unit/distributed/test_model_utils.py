@@ -1,0 +1,1614 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import functools
+import os
+
+import pytest
+import ray
+import torch
+
+from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedGatherLogprob,
+    ChunkedDistributedLogprob,
+    ChunkedDistributedLogprobWithSampling,
+    DistributedLogprob,
+    DistributedLogprobWithSampling,
+    _compute_distributed_log_softmax,
+    _get_tokens_on_this_cp_rank,
+    allgather_cp_sharded_tensor,
+    distributed_vocab_logsumexp,
+    distributed_vocab_topk,
+    from_parallel_logits_to_logprobs,
+    from_parallel_logits_to_logprobs_packed_sequences,
+    gather_logits_at_global_indices,
+)
+from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    PY_EXECUTABLES,
+)
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+
+
+@ray.remote(num_gpus=1)
+class ModelUtilsTestActor:
+    def __init__(self, tp_size, cp_size, sharding):
+        self.tp_size = tp_size
+        self.cp_size = cp_size
+        self.sharding = sharding
+        self.env_vars = dict(os.environ)
+
+    def test_packed_sequences_equivalence(self):
+        """Test that packed and unpacked functions return the same results."""
+        # Initialize worker groups
+        torch.distributed.init_process_group(backend="nccl")
+
+        tp_rank = int(os.environ["RANK"]) % self.tp_size
+        cp_rank = int(os.environ["RANK"]) // self.tp_size
+        tp_ranks = self.sharding.get_ranks(tp=tp_rank)
+        if type(tp_ranks) != int:
+            tp_ranks = tp_ranks.layout.tolist()
+        else:
+            tp_ranks = [tp_ranks]
+        cp_ranks = self.sharding.get_ranks(cp=cp_rank)
+        if type(cp_ranks) != int:
+            cp_ranks = cp_ranks.layout.tolist()
+        else:
+            cp_ranks = [cp_ranks]
+
+        tp_group = torch.distributed.new_group(ranks=cp_ranks)
+        cp_group = torch.distributed.new_group(ranks=tp_ranks)  # this is correct
+
+        # Test parameters
+        batch_size = 4
+        seq_len = 32
+        vocab_size = 1024
+
+        if self.cp_size > 1 and seq_len % (2 * self.cp_size) != 0:
+            seq_len = (seq_len // (2 * self.cp_size) + 1) * (2 * self.cp_size)
+
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        unpacked_seq_len = seq_len
+
+        # Create random data
+        torch.manual_seed(42)  # For reproducibility
+        unpacked_logits = torch.randn(
+            batch_size, unpacked_seq_len, vocab_part_size, device="cuda"
+        )
+        unpacked_target_ids = (
+            torch.arange(batch_size * seq_len).reshape(batch_size, seq_len).to("cuda")
+        )
+
+        # 1. Get expected logprobs from non-packed function
+        expected_logprobs = from_parallel_logits_to_logprobs(
+            unpacked_logits,
+            unpacked_target_ids,
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            cp_group=None,
+        )
+
+        # 1.5 get with_cp logprobs
+        with_cp_logprobs = from_parallel_logits_to_logprobs(
+            _get_tokens_on_this_cp_rank(
+                unpacked_logits, cp_rank, self.cp_size, seq_dim=1
+            ),
+            unpacked_target_ids,
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            cp_group=cp_group,
+        )
+
+        torch.testing.assert_close(
+            with_cp_logprobs, expected_logprobs, rtol=1e-5, atol=1e-5
+        )
+
+        # 2. Prepare inputs for packed function
+        # For simplicity, all sequences have the same length
+        seq_lengths = torch.full((batch_size,), seq_len, dtype=torch.int32)
+        cu_seqlens = torch.nn.functional.pad(
+            torch.cumsum(seq_lengths, dim=0, dtype=torch.int32), (1, 0)
+        ).to("cuda")
+
+        # Pack the logits and target_ids
+        packed_logits = _get_tokens_on_this_cp_rank(
+            unpacked_logits, cp_rank, self.cp_size, seq_dim=1
+        ).reshape(1, -1, vocab_part_size)
+        packed_target_ids = unpacked_target_ids.reshape(1, -1)
+
+        # 3. Get actual logprobs from packed function
+        actual_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+            packed_logits,
+            packed_target_ids,
+            cu_seqlens,
+            seq_len,  # unpacked_seqlen
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            cp_group=cp_group,
+        )
+
+        # 4. Compare results
+        torch.testing.assert_close(
+            actual_logprobs, expected_logprobs, rtol=1e-5, atol=1e-5
+        )
+        return {"success": True, "error": None}
+
+
+MODEL_UTILS_TEST_ACTOR_FQN = f"{ModelUtilsTestActor.__module__}.ModelUtilsTestActor"
+
+
+@pytest.fixture
+def register_model_utils_test_actor():
+    """Register the ModelUtilsTestActor for use in tests."""
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(MODEL_UTILS_TEST_ACTOR_FQN)
+    ACTOR_ENVIRONMENT_REGISTRY[MODEL_UTILS_TEST_ACTOR_FQN] = PY_EXECUTABLES.SYSTEM
+
+    yield MODEL_UTILS_TEST_ACTOR_FQN
+
+    # Clean up registry
+    if MODEL_UTILS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[MODEL_UTILS_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[MODEL_UTILS_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.fixture
+def virtual_cluster_2_gpus():
+    """Create a virtual cluster with 2 GPU bundles."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    yield cluster
+    cluster.shutdown()
+
+
+@pytest.fixture
+def virtual_cluster_4_gpus():
+    """Create a virtual cluster with 4 GPU bundles."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[4], use_gpus=True)
+    yield cluster
+    cluster.shutdown()
+
+
+import numpy as np
+
+
+@pytest.mark.parametrize(
+    "tp_cp_config",
+    [
+        (2, 1),  # TP=2, CP=1
+        (1, 2),  # TP=1, CP=2
+    ],
+)
+def test_from_parallel_logits_to_logprobs_packed_sequences(
+    register_model_utils_test_actor, tp_cp_config
+):
+    """Test packed sequences function against unpacked version."""
+    tp_size, cp_size = tp_cp_config
+    world_size = tp_size * cp_size
+
+    # Skip if not enough GPUs
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
+        )
+
+    # Create appropriate virtual cluster
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+
+    try:
+        actor_fqn = register_model_utils_test_actor
+
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size, cp_size), names=["tp", "cp"]
+        )
+        builder = RayWorkerBuilder(actor_fqn, tp_size, cp_size, sharding)
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        # Run the test on all workers
+        futures = worker_group.run_all_workers_single_data(
+            "test_packed_sequences_equivalence"
+        )
+        results = ray.get(futures)
+
+        # Check that all workers succeeded
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        cluster.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# distributed_test_runner-based packed-sequences tests (coverage-friendly)
+# ---------------------------------------------------------------------------
+
+
+def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_size):
+    """Test from_parallel_logits_to_logprobs_packed_sequences with coverage.
+
+    Uses _pack_input_ids to build packed targets and compares:
+      1. target_is_pre_rolled=False against the unpacked baseline (CP=1 only)
+      2. target_is_pre_rolled=True against target_is_pre_rolled=False
+    with variable-length sequences.
+    """
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    # Build 2-D process groups: inner=TP, outer=CP
+    tp_groups = []
+    cp_groups = []
+    for cp_r in range(cp_size):
+        ranks = [cp_r * tp_size + tp_r for tp_r in range(tp_size)]
+        tp_groups.append(torch.distributed.new_group(ranks=ranks))
+    for tp_r in range(tp_size):
+        ranks = [cp_r * tp_size + tp_r for cp_r in range(cp_size)]
+        cp_groups.append(torch.distributed.new_group(ranks=ranks))
+
+    my_tp_rank = rank % tp_size
+    my_cp_rank = rank // tp_size
+    tp_group = tp_groups[my_cp_rank]
+    cp_group = cp_groups[my_tp_rank] if cp_size > 1 else None
+    my_cp_rank_val = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+
+    batch_size = 4
+    vocab_size = 1024
+    vocab_part_size = vocab_size // tp_size
+    vocab_start_index = my_tp_rank * vocab_part_size
+    vocab_end_index = (my_tp_rank + 1) * vocab_part_size
+
+    # Variable-length sequences
+    raw_seq_lengths = [24, 48, 16, 40]
+    max_seq_len = max(raw_seq_lengths)
+
+    if cp_size > 1 and max_seq_len % (2 * cp_size) != 0:
+        max_seq_len = (max_seq_len // (2 * cp_size) + 1) * (2 * cp_size)
+        raw_seq_lengths = [min(l, max_seq_len) for l in raw_seq_lengths]
+
+    pad_to = 2 * cp_size if cp_size > 1 else 1
+    padded_seq_lengths = [
+        ((l + pad_to - 1) // pad_to) * pad_to for l in raw_seq_lengths
+    ]
+
+    # Build cu_seqlens / cu_seqlens_padded
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+    for i in range(batch_size):
+        cu_seqlens[i + 1] = cu_seqlens[i] + raw_seq_lengths[i]
+        cu_seqlens_padded[i + 1] = cu_seqlens_padded[i] + padded_seq_lengths[i]
+
+    total_padded = int(cu_seqlens_padded[-1].item())
+
+    torch.manual_seed(42)
+    unpacked_logits_full = torch.randn(
+        batch_size, max_seq_len, vocab_size, device="cuda"
+    )
+    input_ids = torch.randint(0, vocab_size, (batch_size, max_seq_len), device="cuda")
+
+    unpacked_logits_local = unpacked_logits_full[
+        :, :, vocab_start_index:vocab_end_index
+    ]
+
+    # --- Pack logits: [B, S, V_local] -> [1, T_padded // CP, V_local] ---
+    # Each sequence is individually padded and CP-sharded (matching production).
+    packed_logits = torch.zeros(
+        1, total_padded // cp_size, vocab_part_size, device="cuda"
+    )
+    for i in range(batch_size):
+        sl = raw_seq_lengths[i]
+        psl = padded_seq_lengths[i]
+        padded_seq = torch.zeros(1, psl, vocab_part_size, device="cuda")
+        padded_seq[:, :sl, :] = unpacked_logits_local[i : i + 1, :sl, :]
+        offset = int(cu_seqlens_padded[i].item())
+        if cp_size > 1:
+            sharded = _get_tokens_on_this_cp_rank(padded_seq, my_cp_rank_val, cp_size)
+            packed_logits[:, offset // cp_size : (offset + psl) // cp_size, :] = sharded
+        else:
+            packed_logits[:, offset : offset + psl, :] = padded_seq
+
+    # --- Path 1: target_is_pre_rolled=False ---
+    # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
+    packed_target_raw = _pack_input_ids(input_ids, cu_seqlens, cu_seqlens_padded)
+
+    logprobs_not_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
+        packed_logits,
+        packed_target_raw,
+        cu_seqlens_padded,
+        max_seq_len,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        cp_group=cp_group,
+        chunk_size=chunk_size,
+        target_is_pre_rolled=False,
+    )
+
+    # --- Path 2: target_is_pre_rolled=True ---
+    packed_target_pre_rolled = _pack_input_ids(
+        input_ids,
+        cu_seqlens,
+        cu_seqlens_padded,
+        cp_rank=my_cp_rank_val,
+        cp_size=cp_size,
+        roll_shift=-1,
+    )
+
+    logprobs_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
+        packed_logits,
+        packed_target_pre_rolled,
+        cu_seqlens_padded,
+        max_seq_len,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        cp_group=cp_group,
+        chunk_size=chunk_size,
+        target_is_pre_rolled=True,
+    )
+
+    # Both paths must produce identical results
+    for i in range(batch_size):
+        valid_len = raw_seq_lengths[i] - 1
+        torch.testing.assert_close(
+            logprobs_pre_rolled[i, :valid_len],
+            logprobs_not_pre_rolled[i, :valid_len],
+            rtol=1e-5,
+            atol=1e-5,
+            msg=f"pre_rolled vs not_pre_rolled mismatch on rank {rank}, seq {i}",
+        )
+
+    # --- Also compare against the unpacked baseline ---
+    # The unpacked function CP-shards each row from max_seq_len, which matches
+    # the packed per-sequence CP-sharding only when CP=1.
+    if cp_size == 1:
+        baseline_logprobs = from_parallel_logits_to_logprobs(
+            unpacked_logits_local,
+            input_ids,
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            cp_group=cp_group,
+        )
+        for i in range(batch_size):
+            valid_len = raw_seq_lengths[i] - 1
+            torch.testing.assert_close(
+                logprobs_not_pre_rolled[i, :valid_len],
+                baseline_logprobs[i, :valid_len],
+                rtol=1e-5,
+                atol=1e-5,
+                msg=f"packed vs unpacked mismatch on rank {rank}, seq {i}",
+            )
+
+
+@pytest.mark.parametrize(
+    "tp_size, cp_size, chunk_size",
+    [
+        (2, 1, None),
+        (1, 2, None),
+        (2, 1, 8),
+        (1, 2, 8),
+    ],
+    ids=lambda v: str(v),
+)
+def test_packed_sequences_with_distributed_runner(
+    distributed_test_runner, tp_size, cp_size, chunk_size
+):
+    """Test from_parallel_logits_to_logprobs_packed_sequences using distributed_test_runner.
+
+    Covers both target_is_pre_rolled paths, variable-length sequences, and chunk_size,
+    with proper code coverage tracking (unlike Ray-based tests).
+    """
+    world_size = tp_size * cp_size
+    test_fn = functools.partial(
+        _run_packed_sequences_equivalence,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        chunk_size=chunk_size,
+    )
+    distributed_test_runner(test_fn, world_size=world_size)
+
+
+@ray.remote(num_gpus=1)
+class AllGatherCPTestActor:
+    def __init__(self, cp_size):
+        self.cp_size = cp_size
+        self.env_vars = dict(os.environ)
+
+    def test_allgather_cp_tensor(self):
+        """Test that allgather_cp_sharded_tensor correctly reconstructs tensors."""
+        # Initialize process group
+        torch.distributed.init_process_group(backend="nccl")
+
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+
+        # Create CP group - all ranks participate in CP
+        cp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+
+        # Test parameters
+        batch_size = 2
+        original_seq_len = 8
+        hidden_size = 16
+
+        # Ensure sequence length is compatible with CP load balancing
+        if original_seq_len % (2 * self.cp_size) != 0:
+            original_seq_len = (original_seq_len // (2 * self.cp_size) + 1) * (
+                2 * self.cp_size
+            )
+
+        # Create original tensor (same on all ranks for testing)
+        torch.manual_seed(42)  # Same seed for reproducibility
+        original_tensor = (
+            torch.arange(
+                batch_size * original_seq_len * hidden_size, dtype=torch.float32
+            )
+            .reshape(batch_size, original_seq_len, hidden_size)
+            .to("cuda")
+        )
+        original_tensor.requires_grad = True
+
+        # Shard the tensor using CP logic
+        sharded_tensor = _get_tokens_on_this_cp_rank(
+            original_tensor, rank, self.cp_size, seq_dim=1
+        )
+
+        # Test 1: Gather sharded tensor and verify it matches original
+        gathered_tensor = allgather_cp_sharded_tensor(
+            sharded_tensor, cp_group, seq_dim=1
+        )
+
+        # Verify shapes match
+        if gathered_tensor.shape != original_tensor.shape:
+            return {
+                "success": False,
+                "error": f"Shape mismatch: expected {original_tensor.shape}, got {gathered_tensor.shape}",
+            }
+
+        # Verify content matches (should be identical)
+        torch.testing.assert_close(
+            gathered_tensor, original_tensor, rtol=1e-5, atol=1e-5
+        )
+
+        # test backward
+        def loss_fn(x):
+            return torch.sum(x**2)
+
+        loss = loss_fn(gathered_tensor)
+        loss.backward()
+        grad = original_tensor.grad / self.cp_size
+        grad_sharded = _get_tokens_on_this_cp_rank(grad, rank, self.cp_size, seq_dim=1)
+
+        torch.testing.assert_close(
+            grad_sharded,
+            _get_tokens_on_this_cp_rank(
+                2 * original_tensor, rank, self.cp_size, seq_dim=1
+            ),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            _get_tokens_on_this_cp_rank(
+                grad, (rank + 1) % self.cp_size, self.cp_size, seq_dim=1
+            ),
+            torch.zeros_like(sharded_tensor),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+        # Test 2: Test with different sequence dimension (seq_dim=0)
+        # Create a tensor with sequence dimension at dim=0
+        original_tensor_dim0 = torch.randn(
+            original_seq_len, batch_size, hidden_size, device="cuda"
+        )
+
+        sharded_tensor_dim0 = _get_tokens_on_this_cp_rank(
+            original_tensor_dim0, rank, self.cp_size, seq_dim=0
+        )
+
+        gathered_tensor_dim0 = allgather_cp_sharded_tensor(
+            sharded_tensor_dim0, cp_group, seq_dim=0
+        )
+
+        # Verify shapes and content match
+        if gathered_tensor_dim0.shape != original_tensor_dim0.shape:
+            return {
+                "success": False,
+                "error": f"Shape mismatch for seq_dim=0: expected {original_tensor_dim0.shape}, got {gathered_tensor_dim0.shape}",
+            }
+
+        torch.testing.assert_close(
+            gathered_tensor_dim0, original_tensor_dim0, rtol=1e-5, atol=1e-5
+        )
+
+        # Test 3: Test with different tensor shapes
+        # Test with 2D tensor
+        original_2d = torch.randn(original_seq_len, hidden_size, device="cuda")
+        sharded_2d = _get_tokens_on_this_cp_rank(
+            original_2d, rank, self.cp_size, seq_dim=0
+        )
+        gathered_2d = allgather_cp_sharded_tensor(sharded_2d, cp_group, seq_dim=0)
+
+        torch.testing.assert_close(gathered_2d, original_2d, rtol=1e-5, atol=1e-5)
+
+        return {"success": True, "error": None}
+
+
+ALLGATHER_CP_TEST_ACTOR_FQN = f"{AllGatherCPTestActor.__module__}.AllGatherCPTestActor"
+
+
+@pytest.fixture
+def register_allgather_cp_test_actor():
+    """Register the AllGatherCPTestActor for use in tests."""
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        ALLGATHER_CP_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[ALLGATHER_CP_TEST_ACTOR_FQN] = PY_EXECUTABLES.SYSTEM
+
+    yield ALLGATHER_CP_TEST_ACTOR_FQN
+
+    # Clean up registry
+    if ALLGATHER_CP_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[ALLGATHER_CP_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[ALLGATHER_CP_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize("cp_size", [2])
+def test_allgather_cp_sharded_tensor(register_allgather_cp_test_actor, cp_size):
+    """Test allgather_cp_sharded_tensor function."""
+    # Skip if not enough GPUs
+    if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {cp_size}, got {torch.cuda.device_count()}"
+        )
+
+    # Create virtual cluster
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[cp_size], use_gpus=True)
+
+    try:
+        actor_fqn = register_allgather_cp_test_actor
+
+        # For CP, all ranks are in a single group
+        sharding = NamedSharding(layout=list(range(cp_size)), names=["cp"])
+        builder = RayWorkerBuilder(actor_fqn, cp_size)
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        # Run the test on all workers
+        futures = worker_group.run_all_workers_single_data("test_allgather_cp_tensor")
+        results = ray.get(futures)
+
+        # Check that all workers succeeded
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class ChunkedGatherLogprobTestActor:
+    def __init__(self, tp_size, chunk_size, inference_only, sharding):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.inference_only = inference_only
+        self.sharding = sharding
+        self.env_vars = dict(os.environ)
+
+    def test_chunked_gather_logprob(self):
+        torch.distributed.init_process_group(backend="nccl")
+
+        rank = int(os.environ["RANK"])
+        # TP-only: world_size == tp_size when cp_size == 1
+        tp_rank = rank
+        tp_group = torch.distributed.new_group(ranks=list(range(self.tp_size)))
+
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        gather_k = 3
+
+        torch.manual_seed(1337)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        global_indices = torch.randint(
+            low=0, high=vocab_size, size=(batch_size, seq_len, gather_k), device="cuda"
+        )
+
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        baseline_logits = (
+            full_logits.clone().detach().requires_grad_(not self.inference_only)
+        )
+        baseline_log_probs = torch.nn.functional.log_softmax(baseline_logits, dim=-1)
+        baseline_selected = torch.gather(
+            baseline_log_probs, dim=-1, index=global_indices
+        )
+
+        if not self.inference_only:
+            torch.gather(
+                baseline_log_probs, dim=-1, index=global_indices
+            ).sum().backward()
+            baseline_grad = baseline_logits.grad[
+                :, :, vocab_start_index:vocab_end_index
+            ]
+
+        local_logits = full_logits[:, :, vocab_start_index:vocab_end_index]
+        local_logits = (
+            local_logits.clone().detach().requires_grad_(not self.inference_only)
+        )
+
+        gathered = ChunkedDistributedGatherLogprob.apply(
+            local_logits,
+            global_indices,
+            vocab_start_index,
+            vocab_end_index,
+            self.chunk_size,
+            tp_group,
+            self.inference_only,
+        )
+
+        torch.testing.assert_close(gathered, baseline_selected, rtol=1e-4, atol=1e-4)
+
+        forward_diff = torch.max(torch.abs(gathered - baseline_selected)).item()
+
+        if not self.inference_only:
+            gathered.sum().backward()
+            grad_local = local_logits.grad
+            torch.testing.assert_close(grad_local, baseline_grad, rtol=1e-4, atol=1e-4)
+            grad_diff = torch.max(torch.abs(grad_local - baseline_grad)).item()
+        else:
+            grad_diff = None
+
+        return {
+            "forward_max_diff": forward_diff,
+            "grad_max_diff": grad_diff,
+        }
+
+
+CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN = (
+    f"{ChunkedGatherLogprobTestActor.__module__}.ChunkedGatherLogprobTestActor"
+)
+
+
+@pytest.fixture
+def register_chunked_gather_logprob_test_actor():
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN
+
+    if CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize(
+    "tp_size, chunk_size, inference_only",
+    [
+        (1, 5, False),
+        (2, 4, False),
+        (1, 3, True),
+    ],
+)
+def test_chunked_distributed_gather_logprob(
+    register_chunked_gather_logprob_test_actor, tp_size, chunk_size, inference_only
+):
+    world_size = tp_size
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+
+    try:
+        actor_fqn = register_chunked_gather_logprob_test_actor
+
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size), names=["tp"]
+        )
+        builder = RayWorkerBuilder(
+            actor_fqn, tp_size, chunk_size, inference_only, sharding
+        )
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        futures = worker_group.run_all_workers_single_data(
+            "test_chunked_gather_logprob"
+        )
+        results = ray.get(futures)
+
+        for i, result in enumerate(results):
+            assert result["forward_max_diff"] < 1e-4, (
+                f"Worker {i} forward diff too large: {result['forward_max_diff']}"
+            )
+            if not inference_only:
+                assert (
+                    result["grad_max_diff"] is not None
+                    and result["grad_max_diff"] < 1e-4
+                ), f"Worker {i} grad diff too large: {result['grad_max_diff']}"
+            else:
+                assert result["grad_max_diff"] is None
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class DistributedLogprobTestActor:
+    def __init__(self, tp_size, chunk_size):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.env_vars = dict(os.environ)
+        torch.distributed.init_process_group(backend="nccl")
+        self.tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    def _torch_baseline_logprob(self, full_logits, target):
+        """Single-GPU PyTorch baseline implementation for comparison."""
+        # Compute log softmax using standard PyTorch
+        log_softmax = torch.nn.functional.log_softmax(full_logits, dim=-1)
+
+        # Gather log probabilities for target tokens
+        target_mask = target >= 0  # Valid targets (assuming -1 or similar for padding)
+        log_probs = torch.gather(log_softmax, -1, target.unsqueeze(-1)).squeeze(-1)
+        log_probs = log_probs * target_mask.float()
+
+        return log_probs
+
+    def test_distributed_logprob_forward_and_backward(self):
+        """Test DistributedLogprob forward and backward passes against PyTorch baseline."""
+        rank = int(os.environ["RANK"])
+
+        # Test parameters
+        batch_size = 4
+        seq_len = 8
+        full_vocab_size = 1024
+        vocab_part_size = full_vocab_size // self.tp_size
+        chunk_size = self.chunk_size
+
+        # Calculate vocab partition for this rank
+        vocab_start_index = rank * vocab_part_size
+        vocab_end_index = (rank + 1) * vocab_part_size
+
+        # Create test data with fixed seed for reproducibility (same across all ranks)
+        torch.manual_seed(42)
+
+        # Create full logits (same on all ranks for fair comparison)
+        full_logits = torch.randn(
+            batch_size, seq_len, full_vocab_size, device="cuda", requires_grad=True
+        )
+
+        # Extract this rank's vocab partition
+        vocab_parallel_logits = (
+            full_logits[:, :, vocab_start_index:vocab_end_index]
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+
+        # Create target tokens (ensure they span across vocab partitions) - use same seed
+        torch.manual_seed(
+            43
+        )  # Different seed for targets to ensure they span vocab partitions
+        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+        # === FORWARD PASS TEST ===
+        # Use the same full logits for baseline computation (without gradient tracking for forward test)
+        baseline_logits_forward = full_logits.clone().detach()
+        baseline_log_probs_forward = self._torch_baseline_logprob(
+            baseline_logits_forward, target
+        )
+
+        # Compute using DistributedLogprob (forward only first)
+        if chunk_size is not None:
+            distributed_log_probs_inference = ChunkedDistributedLogprob.apply(
+                vocab_parallel_logits.clone().detach(),  # Clone to avoid affecting backward test
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                self.tp_group,
+                True,  # inference_only=True for forward test
+            )
+        else:
+            distributed_log_probs_inference = DistributedLogprob.apply(
+                vocab_parallel_logits.clone().detach(),  # Clone to avoid affecting backward test
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                self.tp_group,
+                True,  # inference_only=True for forward test
+            )
+
+        # Compare forward results
+        torch.testing.assert_close(
+            distributed_log_probs_inference,
+            baseline_log_probs_forward,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+        forward_max_diff = torch.max(
+            torch.abs(distributed_log_probs_inference - baseline_log_probs_forward)
+        ).item()
+
+        # === BACKWARD PASS TEST ===
+        # Compute baseline gradients - use full_logits with gradient tracking
+        baseline_log_probs = self._torch_baseline_logprob(full_logits, target)
+        baseline_loss = torch.sum(baseline_log_probs)
+        baseline_loss.backward()
+        baseline_grad = full_logits.grad[
+            :, :, vocab_start_index:vocab_end_index
+        ].clone()
+
+        # Reset full_logits grad for clean comparison
+        full_logits.grad = None
+
+        # Compute distributed gradients
+        distributed_log_probs = DistributedLogprob.apply(
+            vocab_parallel_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            self.tp_group,
+            False,  # inference_only=False to enable backward
+        )
+
+        distributed_loss = torch.sum(distributed_log_probs)
+        distributed_loss.backward()
+        distributed_grad = vocab_parallel_logits.grad
+
+        # Compare gradients
+        torch.testing.assert_close(
+            distributed_grad, baseline_grad, rtol=1e-4, atol=1e-4
+        )
+
+        # Compare log probs again (should be same as forward test)
+        torch.testing.assert_close(
+            distributed_log_probs, baseline_log_probs, rtol=1e-4, atol=1e-4
+        )
+
+        grad_max_diff = torch.max(torch.abs(distributed_grad - baseline_grad)).item()
+        logprob_max_diff = torch.max(
+            torch.abs(distributed_log_probs - baseline_log_probs)
+        ).item()
+
+        return {
+            "forward_max_diff": forward_max_diff,
+            "grad_max_diff": grad_max_diff,
+            "logprob_max_diff": logprob_max_diff,
+        }
+
+    def test_distributed_log_softmax(self):
+        """Test the _compute_distributed_log_softmax function."""
+        rank = int(os.environ["RANK"])
+
+        # Test parameters
+        batch_size = 3
+        seq_len = 5
+        full_vocab_size = 256
+        vocab_part_size = full_vocab_size // self.tp_size
+
+        # Calculate vocab partition for this rank
+        vocab_start_index = rank * vocab_part_size
+        vocab_end_index = (rank + 1) * vocab_part_size
+
+        # Create test data with fixed seed
+        torch.manual_seed(42)
+
+        # Create full logits (same on all ranks for comparison)
+        full_logits = torch.randn(batch_size, seq_len, full_vocab_size, device="cuda")
+
+        # Extract this rank's vocab partition
+        vocab_parallel_logits = full_logits[
+            :, :, vocab_start_index:vocab_end_index
+        ].clone()
+
+        # 1. Compute baseline log softmax
+        baseline_log_softmax = torch.nn.functional.log_softmax(full_logits, dim=-1)
+        expected_log_softmax = baseline_log_softmax[
+            :, :, vocab_start_index:vocab_end_index
+        ]
+
+        # 2. Compute distributed log softmax
+        distributed_log_softmax = _compute_distributed_log_softmax(
+            vocab_parallel_logits, self.tp_group
+        )
+
+        # 3. Compare results
+        torch.testing.assert_close(
+            distributed_log_softmax, expected_log_softmax, rtol=1e-5, atol=1e-5
+        )
+
+        max_diff = torch.max(
+            torch.abs(distributed_log_softmax - expected_log_softmax)
+        ).item()
+
+        return {"max_diff": max_diff}
+
+    def test_edge_cases(self):
+        """Test edge cases like empty vocab partitions or extreme values."""
+        rank = int(os.environ["RANK"])
+
+        # Test parameters
+        batch_size = 2
+        seq_len = 3
+        full_vocab_size = 64
+        vocab_part_size = full_vocab_size // self.tp_size
+
+        vocab_start_index = rank * vocab_part_size
+        vocab_end_index = (rank + 1) * vocab_part_size
+
+        # Test 1: Very large logits (test numerical stability)
+        torch.manual_seed(42)
+        large_logits = (
+            torch.randn(batch_size, seq_len, full_vocab_size, device="cuda") * 100
+        )  # Large values
+        vocab_parallel_logits = large_logits[
+            :, :, vocab_start_index:vocab_end_index
+        ].clone()
+
+        torch.manual_seed(43)  # Consistent seed for targets
+        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+        # Should not produce NaN or Inf
+        log_probs = DistributedLogprob.apply(
+            vocab_parallel_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            self.tp_group,
+            True,
+        )
+
+        assert not torch.isnan(log_probs).any(), "Log probs contain NaN"
+        assert not torch.isinf(log_probs).any(), "Log probs contain Inf"
+
+        # Test 2: All targets pointing to vocab index 0 (all ranks must participate)
+        out_of_range_target = torch.full(
+            (batch_size, seq_len), 0, device="cuda"
+        )  # All point to vocab index 0
+
+        log_probs_oor = DistributedLogprob.apply(
+            vocab_parallel_logits,
+            out_of_range_target,
+            vocab_start_index,
+            vocab_end_index,
+            self.tp_group,
+            True,
+        )
+
+        # Compute baseline for comparison
+        # All ranks should see the same full logits for this test
+        torch.manual_seed(42)  # Reset seed to match the logits generation
+        baseline_large_logits = (
+            torch.randn(batch_size, seq_len, full_vocab_size, device="cuda") * 100
+        )
+        baseline_log_probs = self._torch_baseline_logprob(
+            baseline_large_logits, out_of_range_target
+        )
+
+        # The distributed result should match the baseline
+        torch.testing.assert_close(
+            log_probs_oor, baseline_log_probs, rtol=1e-4, atol=1e-4
+        )
+
+
+DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN = (
+    f"{DistributedLogprobTestActor.__module__}.DistributedLogprobTestActor"
+)
+
+
+@pytest.fixture
+def register_distributed_logprob_test_actor():
+    """Register the DistributedLogprobTestActor for use in tests."""
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN
+
+    # Clean up registry
+    if DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_LOGPROB_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize(
+    "tp_size, chunk_size",
+    [
+        (1, None),
+        (2, None),
+        (1, 4),
+        (2, 4),
+    ],
+)
+def test_distributed_logprob_all_tests(
+    register_distributed_logprob_test_actor, tp_size, chunk_size
+):
+    """Test all DistributedLogprob functionality for a given TP size."""
+    # Skip if not enough GPUs
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+
+    try:
+        actor_fqn = register_distributed_logprob_test_actor
+
+        # Create sharding for TP
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, chunk_size)
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        # Test 1: Combined Forward and Backward pass
+        print(
+            f"\n=== Testing TP={tp_size} ChunkSize={chunk_size}: Forward & Backward Pass ==="
+        )
+        futures = worker_group.run_all_workers_single_data(
+            "test_distributed_logprob_forward_and_backward"
+        )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            if "forward_max_diff" in result:
+                print(f"Worker {i} forward max diff: {result['forward_max_diff']:.2e}")
+            if "grad_max_diff" in result and "logprob_max_diff" in result:
+                print(
+                    f"Worker {i} gradient max diff: {result['grad_max_diff']:.2e}, "
+                    f"logprob max diff: {result['logprob_max_diff']:.2e}"
+                )
+
+        # Test 2: Log softmax function
+        print(f"\n=== Testing TP={tp_size} ChunkSize={chunk_size}: Log Softmax ===")
+        futures = worker_group.run_all_workers_single_data(
+            "test_distributed_log_softmax"
+        )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            if "max_diff" in result:
+                print(
+                    f"Worker {i} log softmax max difference: {result['max_diff']:.2e}"
+                )
+
+        # Test 3: Edge cases (only for TP=2)
+        if tp_size == 2:
+            print(f"\n=== Testing TP={tp_size} ChunkSize={chunk_size}: Edge Cases ===")
+            futures = worker_group.run_all_workers_single_data("test_edge_cases")
+            results = ray.get(futures)
+            print("Edge cases test completed successfully")
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class SamplingParamsTestActor:
+    def __init__(self, tp_size, sharding):
+        self.tp_size = tp_size
+        self.sharding = sharding
+        self.env_vars = dict(os.environ)
+        torch.distributed.init_process_group(backend="nccl")
+        self.tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    def test_top_k_top_p_filtering_forward_backward(self, top_k, top_p):
+        """Test top-k and top-p filtering logic including backward pass."""
+        batch_size = 2
+        seq_len = 4
+        vocab_size = 100
+
+        torch.manual_seed(42)
+        logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", requires_grad=True
+        )
+
+        filtered_logits, keep_mask = apply_top_k_top_p(logits, top_k=top_k, top_p=top_p)
+
+        # Test 1: Verify top-k filtering
+        if top_k is not None:
+            for b in range(batch_size):
+                for s in range(seq_len):
+                    topk_vals, topk_indices = torch.topk(logits[b, s], k=top_k)
+                    topk_mask = torch.zeros(
+                        vocab_size, dtype=torch.bool, device=logits.device
+                    )
+                    topk_mask[topk_indices] = True
+                    assert torch.all(torch.isinf(filtered_logits[b, s][~topk_mask])), (
+                        "Values outside top-k should be -inf"
+                    )
+                    if top_p == 1.0:
+                        assert not torch.any(
+                            torch.isinf(filtered_logits[b, s][topk_mask])
+                        ), "Top-k values should not be -inf when top_p=1.0"
+                    non_inf_count = (~torch.isinf(filtered_logits[b, s])).sum().item()
+                    assert non_inf_count <= top_k, (
+                        f"Non-inf count {non_inf_count} exceeds top_k {top_k}"
+                    )
+
+        # Test 2: Verify top-p filtering
+        if top_p < 1.0:
+            for b in range(batch_size):
+                for s in range(seq_len):
+                    if top_k is not None:
+                        topk_vals, topk_indices = torch.topk(logits[b, s], k=top_k)
+                        temp_logits = torch.full_like(logits[b, s], float("-inf"))
+                        temp_logits[topk_indices] = topk_vals
+                    else:
+                        temp_logits = logits[b, s]
+                    probs = torch.nn.functional.softmax(temp_logits, dim=-1)
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumsum_probs = torch.cumsum(sorted_probs, dim=0)
+                    cutoff_idx = torch.where(cumsum_probs > top_p)[0]
+                    if len(cutoff_idx) > 0:
+                        cutoff_idx = cutoff_idx[0].item() + 1
+                    else:
+                        cutoff_idx = len(sorted_probs)
+                    kept_indices = sorted_indices[:cutoff_idx]
+                    for idx in kept_indices:
+                        if not torch.isinf(filtered_logits[b, s, idx]):
+                            continue
+                        raise AssertionError(f"Index {idx} in top-p should not be -inf")
+
+        # Test 3: No filtering case
+        if top_k is None and top_p >= 1.0:
+            torch.testing.assert_close(
+                filtered_logits, logits.detach(), rtol=1e-5, atol=1e-5
+            )
+
+        # Test 4: Valid probabilities
+        probs = torch.nn.functional.softmax(filtered_logits, dim=-1)
+        assert torch.all(probs >= 0) and torch.all(probs <= 1), "Invalid probabilities"
+        assert torch.allclose(
+            probs.sum(dim=-1), torch.ones(batch_size, seq_len, device="cuda"), atol=1e-5
+        ), "Probabilities don't sum to 1"
+
+        # Test 5: Verify keep_mask alignment with filtered logits
+        if keep_mask is not None:
+            non_inf_mask = ~torch.isinf(filtered_logits.detach())
+            assert torch.equal(keep_mask, non_inf_mask), (
+                f"keep_mask doesn't match non-inf positions in filtered_logits! "
+                f"Mismatch count: {(keep_mask != non_inf_mask).sum().item()} out of {keep_mask.numel()}"
+            )
+
+        # Test 6: Backward pass
+        torch.manual_seed(44)
+        output_grad = torch.randn_like(filtered_logits)
+        non_inf_mask = ~torch.isinf(filtered_logits.detach())
+        expected_grad = output_grad * non_inf_mask.float()
+        filtered_logits.backward(output_grad)
+        actual_grad = logits.grad
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-5)
+
+        return {"success": True, "error": None, "top_k": top_k, "top_p": top_p}
+
+    def test_distributed_logprob_with_sampling(self, top_k, top_p, chunk_size):
+        """Test DistributedLogprobWithSampling and ChunkedDistributedLogprobWithSampling."""
+        tp_group = self.tp_group
+        tp_rank = torch.distributed.get_rank(tp_group)
+
+        batch_size = 4
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(42)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        vocab_parallel_logits = (
+            full_logits[:, :, vocab_start_index:vocab_end_index]
+            .clone()
+            .requires_grad_(True)
+        )
+
+        torch.manual_seed(43)
+        target = torch.randint(0, vocab_size, (batch_size, seq_len), device="cuda")
+
+        # === Expected computation using full logits ===
+        expected_logits_filtered, _ = apply_top_k_top_p(
+            full_logits.clone(), top_k=top_k, top_p=top_p
+        )
+        expected_log_probs = torch.nn.functional.log_softmax(
+            expected_logits_filtered, dim=-1
+        )
+        expected_target_logprobs = torch.gather(
+            expected_log_probs, -1, target.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # === Actual computation using distributed function ===
+        if chunk_size is None:
+            actual_logprobs = DistributedLogprobWithSampling.apply(
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                top_k,
+                top_p,
+                False,
+            )
+        else:
+            actual_logprobs = ChunkedDistributedLogprobWithSampling.apply(
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                top_k,
+                top_p,
+                chunk_size,
+                False,
+            )
+
+        # === Forward pass validation ===
+        torch.testing.assert_close(
+            actual_logprobs, expected_target_logprobs, rtol=1e-4, atol=1e-4
+        )
+
+        # === Backward pass validation ===
+        torch.manual_seed(44)
+        output_grad = torch.randn_like(actual_logprobs)
+
+        expected_logits_filtered_grad = full_logits.clone().requires_grad_(True)
+        expected_logits_filtered_after_filter, _ = apply_top_k_top_p(
+            expected_logits_filtered_grad, top_k=top_k, top_p=top_p
+        )
+        expected_log_probs_grad = torch.nn.functional.log_softmax(
+            expected_logits_filtered_after_filter, dim=-1
+        )
+        expected_target_logprobs_grad = torch.gather(
+            expected_log_probs_grad, -1, target.unsqueeze(-1)
+        ).squeeze(-1)
+        expected_target_logprobs_grad.backward(output_grad)
+        expected_grad = expected_logits_filtered_grad.grad[
+            :, :, vocab_start_index:vocab_end_index
+        ].clone()
+
+        actual_logprobs.backward(output_grad)
+        actual_grad = vocab_parallel_logits.grad.clone()
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-4)
+
+        return {
+            "success": True,
+            "error": None,
+            "top_k": top_k,
+            "top_p": top_p,
+            "chunk_size": chunk_size,
+        }
+
+
+SAMPLING_PARAMS_TEST_ACTOR_FQN = (
+    f"{SamplingParamsTestActor.__module__}.SamplingParamsTestActor"
+)
+
+
+@pytest.fixture
+def register_sampling_params_test_actor():
+    """Register the SamplingParamsTestActor for use in tests."""
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        SAMPLING_PARAMS_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[SAMPLING_PARAMS_TEST_ACTOR_FQN] = PY_EXECUTABLES.SYSTEM
+    yield SAMPLING_PARAMS_TEST_ACTOR_FQN
+    if SAMPLING_PARAMS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[SAMPLING_PARAMS_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[SAMPLING_PARAMS_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [
+        (None, 1.0),  # No filtering
+        (10, 1.0),  # Only top-k
+        (None, 0.9),  # Only top-p
+        (10, 0.9),  # Both top-k and top-p
+    ],
+)
+def test_sampling_params_top_k_top_p(
+    register_sampling_params_test_actor, tp_size, top_k, top_p
+):
+    """Test top-k and top-p filtering logic."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+    try:
+        actor_fqn = register_sampling_params_test_actor
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, sharding)
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        futures = worker_group.run_all_workers_single_data(
+            "test_top_k_top_p_filtering_forward_backward", top_k=top_k, top_p=top_p
+        )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
+
+
+@pytest.mark.parametrize("tp_size", [2])
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [
+        (10, 1.0),  # Only top-k
+        (None, 0.9),  # Only top-p
+        (10, 0.9),  # Both top-k and top-p
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [None, 4])
+def test_sampling_params_distributed_logprob(
+    register_sampling_params_test_actor, tp_size, top_k, top_p, chunk_size
+):
+    """Test DistributedLogprobWithSampling and ChunkedDistributedLogprobWithSampling."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+    try:
+        actor_fqn = register_sampling_params_test_actor
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, sharding)
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        futures = worker_group.run_all_workers_single_data(
+            "test_distributed_logprob_with_sampling",
+            top_k=top_k,
+            top_p=top_p,
+            chunk_size=chunk_size,
+        )
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class DistributedVocabTopkOpsTestActor:
+    """Equivalence of the chunked, TP-sharded top-k / gather ops vs an fp32 baseline."""
+
+    def __init__(self, tp_size, chunk_size, sharding):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.sharding = sharding
+        self.env_vars = dict(os.environ)
+        torch.distributed.init_process_group(backend="nccl")
+        self.tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    def test_distributed_vocab_topk(self):
+        """Top-k values match the global fp32 top-k and indices point at them."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+        k = 5
+
+        torch.manual_seed(1337)
+        full_logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        expected_vals, _ = torch.topk(full_logits.float(), k, dim=-1)
+        topk_vals, topk_indices = distributed_vocab_topk(
+            full_logits[:, :, vocab_start_index:vocab_end_index],
+            k,
+            self.tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(topk_vals, expected_vals, rtol=0, atol=0)
+        regathered = torch.gather(full_logits.float(), -1, topk_indices)
+        torch.testing.assert_close(regathered, topk_vals, rtol=0, atol=0)
+        return {"success": True, "error": None}
+
+    def test_distributed_vocab_logsumexp(self):
+        """Full-vocabulary normalizers match a single-tensor fp32 baseline."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(7331)
+        full_logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", dtype=torch.bfloat16
+        )
+        expected = torch.logsumexp(full_logits.float(), dim=-1)
+        actual = distributed_vocab_logsumexp(
+            full_logits[:, :, vocab_start_index:vocab_end_index],
+            self.tp_group,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+        return {"success": True, "error": None}
+
+    def test_gather_logits_at_global_indices(self):
+        """Gathered logits at global indices match the single-GPU fp32 gather."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        torch.manual_seed(2024)
+        full_logits = torch.randn(
+            batch_size, seq_len, vocab_size, device="cuda", dtype=torch.bfloat16
+        )
+        global_indices = torch.randint(
+            0, vocab_size, (batch_size, seq_len, 4), device="cuda"
+        )
+
+        expected = torch.gather(full_logits.float(), -1, global_indices)
+        gathered = gather_logits_at_global_indices(
+            full_logits[:, :, vocab_start_index:vocab_end_index],
+            global_indices,
+            tp_group=self.tp_group,
+            cp_group=None,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            chunk_size=self.chunk_size,
+        )
+
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        return {"success": True, "error": None}
+
+
+DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN = (
+    f"{DistributedVocabTopkOpsTestActor.__module__}.DistributedVocabTopkOpsTestActor"
+)
+
+
+@pytest.fixture
+def register_distributed_vocab_topk_ops_test_actor():
+    """Register the DistributedVocabTopkOpsTestActor for use in tests."""
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN
+
+    if DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+# chunk_size 5 leaves a remainder, 4 divides seq_len, None disables chunking.
+@pytest.mark.parametrize("tp_size, chunk_size", [(1, 5), (2, 4), (2, None)])
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "test_distributed_vocab_topk",
+        "test_distributed_vocab_logsumexp",
+        "test_gather_logits_at_global_indices",
+    ],
+)
+def test_distributed_vocab_topk_ops(
+    register_distributed_vocab_topk_ops_test_actor, method_name, tp_size, chunk_size
+):
+    """Test chunked, TP-sharded top-k and gather equivalence vs an fp32 baseline."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < tp_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {tp_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[tp_size], use_gpus=True)
+    try:
+        actor_fqn = register_distributed_vocab_topk_ops_test_actor
+        sharding = NamedSharding(layout=list(range(tp_size)), names=["tp"])
+        builder = RayWorkerBuilder(actor_fqn, tp_size, chunk_size, sharding)
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        futures = worker_group.run_all_workers_single_data(method_name)
+        results = ray.get(futures)
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()

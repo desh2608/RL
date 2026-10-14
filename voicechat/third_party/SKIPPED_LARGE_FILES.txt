@@ -1,0 +1,3 @@
+3rdparty/Gym-workspace/Gym/resources_servers/labbench2_vlm/data/test_media/figs/pdfs/b60fdf79-25b2-4bf2-a5bb-cb553d83770f/paper.pdf
+3rdparty/Gym-workspace/Gym/resources_servers/labbench2_vlm/data/test_media/tables/pdfs/54f637f5-27cf-450b-8d9c-6069006d15d0/paper.pdf
+3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/data/example_opecode.jsonl

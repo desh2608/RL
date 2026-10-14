@@ -1,0 +1,314 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import ast
+import glob
+import os
+from pathlib import Path
+from typing import Any, Dict, Type
+
+import pytest
+from omegaconf import OmegaConf
+from pydantic import TypeAdapter, ValidationError
+
+from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
+from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    RewardPenaltyConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+)
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
+from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+    MasterConfig as XTokenOffPolicyDistillationMasterConfig,
+)
+from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
+from nemo_rl.utils.config import (
+    load_config_with_inheritance,
+    register_omegaconf_resolvers,
+)
+
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
+
+register_omegaconf_resolvers()
+
+
+def validate_config_section(
+    section_config: Dict[str, Any],
+    config_class: Type,
+    config_file: str,
+) -> None:
+    """Validate a config section against its TypedDict class using Pydantic.
+
+    Raises AssertionError with formatted error messages if validation fails.
+    """
+    if not isinstance(section_config, dict):
+        raise TypeError("Config must be a dictionary")
+
+    # Use Pydantic's TypeAdapter to validate the TypedDict
+    adapter = TypeAdapter(config_class)
+    try:
+        adapter.validate_python(section_config)
+    except ValidationError as e:
+        # Format errors nicely with actual values
+        error_messages = []
+        for error in e.errors():
+            path_parts = []
+            if error["loc"]:
+                path_parts.extend(str(loc) for loc in error["loc"])
+            path = ".".join(path_parts) if path_parts else "root"
+
+            # Only include the actual input value for non-missing fields
+            # For missing fields, the 'input' is the parent dict which is confusing
+            input_info = ""
+            if "input" in error and error["type"] != "missing":
+                input_value = error.get("input")
+                # Truncate very long values for readability
+                input_str = str(input_value)
+                if len(input_str) > 100:
+                    input_str = input_str[:97] + "..."
+                input_info = f" (got: {input_str})"
+
+            error_messages.append(
+                f"  {path}: {error['msg']} (type={error['type']}){input_info}"
+            )
+
+        config_info = f"\n\nConfig file: {config_file}" if config_file else ""
+        raise AssertionError(
+            f"Config validation failed:{config_info}\n" + "\n".join(error_messages)
+        ) from e
+
+
+absolute_path = os.path.abspath(__file__)
+configs_dir = Path(
+    os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
+).resolve()
+config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
+assert len(config_files) > 0, "No config files found"
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_all_config_files_have_required_keys(config_file):
+    """Test that all config files in examples/configs have all required keys for their respective sections."""
+
+    print(f"\nValidating config file: {config_file}")
+
+    # Load the config file with inheritance
+    config = load_config_with_inheritance(config_file)
+    config_dict = OmegaConf.to_container(config, resolve=True)
+
+    if config_dict is None:
+        raise AssertionError(f"Config file {config_file} is empty or invalid")
+
+    # Determine which MasterConfig to use based on the config contents
+    master_config_class = None
+    config_type = None
+
+    if "/evals/" in config_file:
+        master_config_class = EvalMasterConfig
+        config_type = "eval"
+    elif "teachers" in config_dict or (
+        "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
+    ):
+        # Cross-tokenizer off-policy distillation also has a top-level
+        # ``distillation`` block, so it must be matched before the generic
+        # ``distillation`` branch below. The multi-teacher cross-tokenizer config
+        # is identified by its top-level ``teachers`` list (online distillation
+        # uses a singular ``teacher``); the per-(student, teacher) projection path
+        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
+        # as a fallback for any single-teacher config that still carries it.
+        master_config_class = XTokenOffPolicyDistillationMasterConfig
+        config_type = "xtoken_off_policy_distillation"
+    elif "distillation" in config_dict:
+        master_config_class = DistillationMasterConfig
+        config_type = "distillation"
+    elif "dpo" in config_dict:
+        master_config_class = DPOMasterConfig
+        config_type = "dpo"
+    elif "sft" in config_dict:
+        master_config_class = SFTMasterConfig
+        config_type = "sft"
+    elif "grpo" in config_dict:
+        master_config_class = GRPOMasterConfig
+        config_type = "grpo"
+    elif "ppo" in config_dict:
+        master_config_class = PPOMasterConfig
+        config_type = "ppo"
+    elif "rm" in config_dict:
+        master_config_class = RMMasterConfig
+        config_type = "rm"
+    else:
+        raise AssertionError(
+            f"Could not determine algorithm type for config {config_file}."
+        )
+
+    # Validate the entire config using the appropriate MasterConfig
+    validate_config_section(config_dict, master_config_class, config_file)
+
+
+def test_multimodal_dedup_grpo_config_keys_default_off():
+    """Older recipes keep flag-off behavior without duplicating default keys."""
+    assert GRPOConfig.model_fields["deduplicate_multimodal_data"].default is False
+    assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
+
+
+@pytest.mark.parametrize(
+    "launcher_relpath",
+    [
+        "examples/run_vlm_grpo.py",
+        "examples/nemo_gym/run_grpo_nemo_gym.py",
+    ],
+)
+def test_multimodal_launchers_forward_processor_to_both_trainers(
+    launcher_relpath: str,
+):
+    """Keep sync and async multimodal processing wired to the processor."""
+    launcher = Path(__file__).parents[2] / launcher_relpath
+    tree = ast.parse(launcher.read_text())
+    trainer_calls = {
+        node.func.id: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"grpo_train", "async_grpo_train"}
+    }
+
+    assert trainer_calls.keys() == {"grpo_train", "async_grpo_train"}
+    for trainer_name, call in trainer_calls.items():
+        processor_keywords = [
+            keyword
+            for keyword in call.keywords
+            if keyword.arg == "processor"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "processor"
+        ]
+        assert len(processor_keywords) == 1, (
+            f"{trainer_name} must receive processor=processor"
+        )
+
+
+def test_vlm_launcher_dispatches_on_async_grpo_enabled():
+    """Keep the VLM async recipe from silently using the synchronous trainer."""
+    launcher = Path(__file__).parents[2] / "examples/run_vlm_grpo.py"
+    tree = ast.parse(launcher.read_text())
+
+    async_branches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "config.grpo.async_grpo.enabled"
+    ]
+    assert len(async_branches) == 1
+
+    async_branch = async_branches[0]
+    async_calls = {
+        node.func.id
+        for statement in async_branch.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    sync_calls = {
+        node.func.id
+        for statement in async_branch.orelse
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert "async_grpo_train" in async_calls
+    assert "grpo_train" in sync_calls
+
+
+def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
+    """Unwanted-token penalty requires explicit unwanted-token config.
+
+    Validates that token_ids.unwanted is present whenever penalize_unwanted_tokens
+    is enabled.
+    """
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids=None)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={})
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={"unwanted": []})
+
+    config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [2]},
+    )
+    assert config.token_ids is not None
+    assert config.token_ids.unwanted == [2]
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_all_config_no_tp_size_accuracy_issues(config_file):
+    """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
+
+    There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    """
+
+    skip_config_files = [
+        "grpo-qwen3-30ba3b-4n8g-40K.yaml",
+        "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
+        "grpo-qwen3-32b-4n8g.yaml",
+        "grpo-qwen3-32b-8n8g-async-1off.yaml",
+        "grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.yaml",
+    ]
+    if os.path.basename(config_file) in skip_config_files:
+        pytest.skip(
+            f"Skipping config file {config_file} because it sets NRL_IGNORE_TP_ACCURACY_CHECK=1"
+        )
+
+    print(f"\nValidating config file: {config_file}")
+
+    # Load the config file with inheritance
+    config = load_config_with_inheritance(config_file)
+    config_dict = OmegaConf.to_container(config, resolve=True)
+
+    # Skip if config does not have policy or logprob_batch_size
+    if "policy" not in config_dict or "logprob_batch_size" not in config_dict["policy"]:
+        return
+
+    # Skip if config set force_on_policy_ratio to True
+    if "loss_fn" in config_dict and config_dict["loss_fn"].get(
+        "force_on_policy_ratio", False
+    ):
+        return
+
+    # Check if TP size >= 4 and train_micro_batch_size != logprob_batch_size
+    if config_dict["policy"]["megatron_cfg"]["enabled"]:
+        tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
+    else:
+        tp_size = config_dict["policy"]["dtensor_cfg"]["tensor_parallel_size"]
+
+    train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
+    logprob_bs = config_dict["policy"]["logprob_batch_size"]
+
+    if tp_size >= 4 and train_micro_bs != logprob_bs:
+        raise AssertionError(
+            f"Config file {config_file} has TP size >= 4 accuracy issues. "
+            "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
+        )
