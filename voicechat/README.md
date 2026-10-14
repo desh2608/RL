@@ -31,7 +31,7 @@
 # 1. 选一个自己的工作区（lustre 上，有几百 GB 空间），把仓库 clone 到 src/pipeline/nemo_rl
 WS=/lustre/fsw/portfolios/<portfolio>/users/$USER/rl-ws
 mkdir -p $WS/src/pipeline && cd $WS/src/pipeline
-git clone git@gitlab-master.nvidia.com:cchen1/nemo-rl-voicechat.git nemo_rl
+git clone ssh://git@gitlab-master.nvidia.com:12051/cchen1/nemo-rl-voicechat.git nemo_rl   # 或 https://gitlab-master.nvidia.com/cchen1/nemo-rl-voicechat.git
 
 # 2. 建工作区（软链共享的只读镜像/venv/模拟器，拷 Megatron-Bridge 树，约几分钟）
 bash $WS/src/pipeline/nemo_rl/voicechat/setup_workspace.sh $WS
