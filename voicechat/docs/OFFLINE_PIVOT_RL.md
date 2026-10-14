@@ -120,6 +120,7 @@ bash scripts/submit_run.sh $P/runs/smoke-v1-<UTC>Z </dev/null
 ```
 
 - `make_run` 必须加 `--project $P`：脚本目录是软链，默认推导出的项目路径不对。
+- 如果 `make_run` 读源码 git 状态时报 `dubious ownership`（容器里的用户是 root），在 exec 的命令最前面加上 `git config --global --add safe.directory '*';`。
 - 交互节点首次导入 82GB 镜像约 10 分钟。
 
 smoke 结束后，确认 `END_CODE` 为 0、`SMOKE_PASS.json` 存在，然后跑验收（见 CHECKS.md）：
