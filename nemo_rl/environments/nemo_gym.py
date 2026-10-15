@@ -38,6 +38,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_image_model_inputs_to_message,
     encode_images_in_examples,
+    extract_multimodal_model_inputs,
     extract_input_image_sources_from_responses_messages,
     image_size_from_source,
     resolve_to_image,
@@ -57,6 +58,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_audio import gym_audio_model_inputs
 from nemo_rl.environments.gym_shutdown import (
     GymShutdownGuard, extract_strict_shutdown, identity_from_environment, owned_endpoints,
 )
@@ -1378,6 +1380,18 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         "[NemoGym] Dropping media and masking sample: "
                         f"turn {turn_idx}: {exc}"
                     )
+            if turn_idx == 0:
+                audio_inputs = gym_audio_model_inputs(
+                    nemo_gym_row, processor, new_prompt_token_ids
+                )
+                if audio_inputs:
+                    processed_audio = {
+                        "input_ids": user_message["token_ids"], **audio_inputs
+                    }
+                    user_message.update(
+                        extract_multimodal_model_inputs(processor, processed_audio)
+                    )
+
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.

@@ -96,6 +96,13 @@ MEDIA_TAG_PATTERN = re.compile(
 logger = logging.getLogger(__name__)
 
 
+def _processor_type_name(processor: Any) -> str:
+    """Preserve the source processor's media contract through Bridge's adapter."""
+    if type(processor).__name__ == "NemoAudioProcessorAdapter":
+        processor = processor.processor
+    return type(processor).__name__
+
+
 def uses_image_placeholder(processor: Any) -> bool:
     """Return whether a processor requires explicit image placeholders.
 
@@ -106,7 +113,7 @@ def uses_image_placeholder(processor: Any) -> bool:
         Whether the processor expands image placeholders through ``__call__``
         rather than tokenized ``apply_chat_template``.
     """
-    return type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
+    return _processor_type_name(processor) in _PLACEHOLDER_STYLE_PROCESSOR_NAMES
 
 
 _FIXED_TILE_IMAGE_PROCESSOR_NAMES = frozenset({"NemotronNanoVLV2Processor"})
@@ -114,7 +121,7 @@ _FIXED_TILE_IMAGE_PROCESSOR_NAMES = frozenset({"NemotronNanoVLV2Processor"})
 
 def uses_fixed_tile_image_processor(processor: Any) -> bool:
     """Return whether stacked image tiles must keep their legacy metadata contract."""
-    return type(processor).__name__ in _FIXED_TILE_IMAGE_PROCESSOR_NAMES
+    return _processor_type_name(processor) in _FIXED_TILE_IMAGE_PROCESSOR_NAMES
 
 
 def image_size_from_source(source: "str | Image.Image") -> tuple[int, int]:
@@ -781,7 +788,7 @@ def get_dim_to_pack_along(processor, key: str) -> int:
 
 def get_pad_to_max_shape(processor: Any, key: str) -> bool:
     """Return whether a processor input must pad non-packing dimensions."""
-    return uses_image_placeholder(processor) and key == "pixel_values"
+    return (uses_image_placeholder(processor) and key == "pixel_values") or key == "sound_clips"
 
 
 def extract_multimodal_model_inputs(

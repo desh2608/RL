@@ -179,13 +179,20 @@ def source_facts(project, repo):
             pins[name] = git(['rev-parse', 'HEAD'], path) if have_git else git_head_fallback(path)
         except (subprocess.CalledProcessError, BuildError, OSError) as error:
             pins[name] = 'unknown:' + type(error).__name__
-    status = {'git_binary': have_git, 'porcelain': {}, 'patch': ''}
+    status = {'git_binary': have_git, 'porcelain': {}, 'patch': '', 'audit_errors': {}}
     if have_git:
         for name in ('nemo_rl_applied', 'gym'):
             path = repos[name]
-            porcelain = git(['status', '--porcelain', '--untracked-files=normal'], path)
+            try:
+                porcelain = git(['status', '--porcelain', '--untracked-files=normal'], path)
+                diff = subprocess.run(['git', 'diff', '--binary'], cwd=str(path), text=True, capture_output=True, check=True).stdout
+            except (subprocess.CalledProcessError, OSError) as error:
+                # Synced/frozen source and the plain-file Gym vendor need not
+                # carry usable Git metadata. The tarball hash still identifies
+                # the exact input; never certify this as a clean Git checkout.
+                status['audit_errors'][name] = type(error).__name__
+                continue
             status['porcelain'][name] = porcelain.splitlines()
-            diff = subprocess.run(['git', 'diff', '--binary'], cwd=str(path), text=True, capture_output=True, check=True).stdout
             if diff:
                 status['patch'] += f'# ==== {name} ({path}) HEAD {pins[name]}\n{diff}'
     return pins, status
@@ -848,6 +855,7 @@ def _assemble(args, project, guard_project, repo, gym_root, run, recipe, bundle,
     dirty = {name: entries for name, entries in status['porcelain'].items() if entries}
     if args.require_clean:
         require(status['git_binary'], '--require-clean needs a git binary inside the container')
+        require(not status['audit_errors'], '--require-clean needs usable Git metadata: ' + json.dumps(status['audit_errors']))
         require(not dirty, 'Worktree is not clean: ' + json.dumps(dirty))
     excludes = [f'--exclude={pattern}' for pattern in TAR_EXCLUDES]
     subprocess.run(['tar', *excludes, '-czf', str(run / 'source.tar.gz'), '-C', str(repo), '.'], check=True)
@@ -858,6 +866,7 @@ def _assemble(args, project, guard_project, repo, gym_root, run, recipe, bundle,
         (run / 'source.patch').write_text(status['patch'])
     write_json(run / 'SOURCE_STATUS.json', {
         'git_binary_available': status['git_binary'], 'porcelain': status['porcelain'],
+        'git_audit_errors': status['audit_errors'],
         'untracked_files_sha256': {
             f'{name}:{line[3:]}': sha(repo / line[3:]) if name == 'nemo_rl_applied' else sha(gym_root / line[3:])
             for name, entries in status['porcelain'].items() for line in entries
@@ -865,7 +874,7 @@ def _assemble(args, project, guard_project, repo, gym_root, run, recipe, bundle,
         'tar_excludes': list(TAR_EXCLUDES)})
     receipt = [f'{name}={value}' for name, value in pins.items()]
     receipt += ['source_kind=worktree_snapshot_including_uncommitted_changes',
-                f'worktree_dirty={"true" if dirty else "false"}',
+                f'worktree_dirty={"unknown" if status["audit_errors"] or not status["git_binary"] else "true" if dirty else "false"}',
                 f'dirty_files={";".join(f"{n}:{e.strip()}" for n, es in dirty.items() for e in es)}',
                 f'source_archive_sha256={source_sha}', 'builder=scripts/make_run.py',
                 f'new_cpu_tests_run={"true" if args.run_repo_tests else "false"}']

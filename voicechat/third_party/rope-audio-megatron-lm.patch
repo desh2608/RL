@@ -1,0 +1,1062 @@
+diff --git a/megatron/core/models/audio/audio_feature_config.py b/megatron/core/models/audio/audio_feature_config.py
+index fdfbdffff1..f76e895ce8 100644
+--- a/megatron/core/models/audio/audio_feature_config.py
++++ b/megatron/core/models/audio/audio_feature_config.py
+@@ -84,9 +84,9 @@ class NemoTransformerAudioTokenEstimator:
+     """Pure math for NeMo TransformerEncoder expanded-token counts.
+ 
+     Conv-style pre-encoders update lengths with floor division after each
+-    strided convolution. The stacking pre-encoder pads the batch tensor to a
+-    multiple of ``encoder_time_stride``, then keeps each sample's partial final
+-    stack as one output token, so stacking counts are per-sample ceil divisions.
++    strided convolution. The ``stacking`` pre-encoder pads to a multiple of
++    ``encoder_time_stride``, then keeps each sample's partial final stack as
++    one output token, so its counts are per-sample ceil divisions.
+ 
+     ``encoder_time_stride`` is required and has no default: it must be derived
+     from the loaded encoder config (``NemoTransformerAudioConfig.encoder_time_stride``,
+diff --git a/megatron/core/models/audio/nemo_audio_checkpoint.py b/megatron/core/models/audio/nemo_audio_checkpoint.py
+index 453113656a..3dbc3458da 100644
+--- a/megatron/core/models/audio/nemo_audio_checkpoint.py
++++ b/megatron/core/models/audio/nemo_audio_checkpoint.py
+@@ -32,9 +32,9 @@ MODEL_WEIGHTS_NAME = "model_weights.ckpt"
+ CHECKPOINT_NEMO_TRANSFORMER_AUDIO_CONFIG_NAME = "nemo_transformer_audio_config.json"
+ CHECKPOINT_NEMO_AUDIO_PREPROCESSOR_CONFIG_NAME = "nemo_audio_preprocessor_config.json"
+ 
+-# Encoder _target_s we know map onto the vendored ``transformer_encoder.TransformerEncoder``.
+-# ``transformer_encoder_flex`` is parameter-compatible with the non-flex variant for
+-# ``attn_mode == "full"`` (FlexAttention only adds attention-mask plumbing, not new params).
++# Encoder _target_s we know map onto one of the checkpoint-compatible vendored
++# Transformer encoders. ``self_attention_model=rope`` selects the RoPE tower;
++# other recognized configs select ``transformer_encoder.TransformerEncoder``.
+ _KNOWN_ENCODER_TARGETS = {
+     "nemo.collections.asr.modules.TransformerEncoder",
+     "nemo.collections.asr.modules.transformer_encoder.TransformerEncoder",
+@@ -156,6 +156,21 @@ def resolve_nemo_audio_configs_from_args(
+     left_context = getattr(args, "nemo_transformer_audio_left_context", None)
+     if left_context is not None:
+         encoder_cfg.left_context = None if left_context < 0 else left_context
++    # ``checkpoint`` is the no-override setting: preserve ``causal_mask`` from
++    # the resolved .nemo or JSON config rather than inferring it from weights.
++    causal_mode = getattr(args, "nemo_transformer_audio_causal_mode", "checkpoint")
++    if causal_mode not in ("checkpoint", "causal", "offline"):
++        raise ValueError(
++            "nemo_transformer_audio_causal_mode must be 'checkpoint', 'causal', or 'offline', "
++            f"got {causal_mode!r}"
++        )
++    if causal_mode != "checkpoint":
++        if encoder_cfg.architecture != "rope_transformer":
++            raise ValueError(
++                "Runtime causal/offline selection requires a rope_transformer audio checkpoint; "
++                f"got architecture={encoder_cfg.architecture!r}"
++            )
++        encoder_cfg.causal_mask = causal_mode == "causal"
+     encoder_cfg.recompute_layers = bool(getattr(args, "recompute_audio", False))
+     return encoder_cfg, preproc_cfg
+ 
+@@ -318,6 +333,17 @@ def _split_audio_configs(
+     pre_cfg = dict(cfg["preprocessor"])
+     if "causal_mask" not in enc_cfg and enc_cfg.get("attn_mode") == "causal":
+         enc_cfg["causal_mask"] = True
++    # The LLM-style NeMo encoder names its input dimension ``feat_in`` and
++    # uses zero-padded frame stacking + fused QKV/RoPE. Keep this compatibility
++    # mapping here so config-only inspection produces the same model shape as
++    # a converted archive.
++    if "n_mels" not in enc_cfg and "feat_in" in enc_cfg:
++        enc_cfg["n_mels"] = enc_cfg["feat_in"]
++    if enc_cfg.get("self_attention_model") == "rope":
++        enc_cfg.setdefault("architecture", "rope_transformer")
++        enc_cfg.setdefault("pre_encode", "stacking")
++        enc_cfg.setdefault("stacking_pad_mode", "zeros")
++        enc_cfg.setdefault("attn_impl", "te")
+ 
+     enc_target = enc_cfg.get("_target_", "")
+     pre_target = pre_cfg.get("_target_", "")
+@@ -426,8 +452,15 @@ def _validate_encoder_cfg(
+         "n_layers",
+         "pre_encode",
+         "subsampling_factor",
++        "stacking_pad_mode",
+         "qk_norm",
+         "qkv_bias",
++        "architecture",
++        "self_attention_model",
++        "rope_base",
++        "rotary_fraction",
++        "ff_expansion",
++        "pre_block_norm",
+     )
+     mismatches = []
+     for field in structural:
+diff --git a/megatron/core/models/audio/nemo_rope_transformer_encoder.py b/megatron/core/models/audio/nemo_rope_transformer_encoder.py
+new file mode 100644
+index 0000000000..cec5aba9d4
+--- /dev/null
++++ b/megatron/core/models/audio/nemo_rope_transformer_encoder.py
+@@ -0,0 +1,481 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++
++"""Transformer Engine port of the RoPE NeMo audio transformer.
++
++This module intentionally preserves the parameter layout used by the NeMo
++``transformer_encoder.TransformerEncoder`` implementation used to train the
++600M Granary encoder.  In particular, its state dict has keys such as
++``pre_encode.proj.weight`` and ``layers.0.attn.w_qkv.weight``.  That lets a
++converted NeMo archive load the encoder weights strictly without a tensor-key
++conversion step.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Literal, TypedDict
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch.utils.checkpoint import checkpoint
++
++from .nemo_transformer_encoder import StackingSubsampling
++
++
++class RotaryPositionalEncoding(nn.Module):
++    """RoPE implementation and buffer layout used by the source encoder."""
++
++    def __init__(self, d_k: int, rotary_fraction: float = 1.0, rope_base: float = 10000.0):
++        super().__init__()
++        if not 0 < rotary_fraction <= 1.0:
++            raise ValueError(f"rotary_fraction must be in (0, 1], got {rotary_fraction}")
++        d_k_rot = int(d_k * rotary_fraction)
++        if d_k_rot < 2 or d_k_rot % 2:
++            raise ValueError(
++                "Effective rotary dim (d_k * rotary_fraction) must be a positive even number, "
++                f"got {d_k_rot} from d_k={d_k} and rotary_fraction={rotary_fraction}"
++            )
++        self.d_k = d_k
++        self.d_k_rot = d_k_rot
++        self.rope_base = rope_base
++        inv_freq = 1.0 / (rope_base ** (torch.arange(0, d_k_rot, 2, dtype=torch.float32) / d_k_rot))
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++
++    @staticmethod
++    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
++        half = x.shape[-1] // 2
++        return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
++
++    def _apply_rotary(
++        self, tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
++    ) -> torch.Tensor:
++        if self.d_k_rot == tensor.shape[-1]:
++            return tensor * cos + self._rotate_half(tensor) * sin
++        rotated = tensor[..., : self.d_k_rot]
++        passthrough = tensor[..., self.d_k_rot :]
++        rotated = rotated * cos + self._rotate_half(rotated) * sin
++        return torch.cat((rotated, passthrough), dim=-1)
++
++    def extend_pe(self, length: int, device: torch.device, dtype: torch.dtype) -> None:
++        """Materialize RoPE buffers through ``length`` on the requested device."""
++        if hasattr(self, "cos") and self.cos.size(0) >= length:
++            return
++        positions = torch.arange(0, length, dtype=torch.float32, device=device)
++        freqs = torch.outer(positions, self.inv_freq.to(device=device, dtype=torch.float32))
++        emb = torch.cat((freqs, freqs), dim=-1)
++        cos, sin = emb.cos().to(dtype), emb.sin().to(dtype)
++        if hasattr(self, "cos"):
++            self.cos = cos
++            self.sin = sin
++        else:
++            self.register_buffer("cos", cos, persistent=False)
++            self.register_buffer("sin", sin, persistent=False)
++
++    def forward_packed(
++        self, query: torch.Tensor, key: torch.Tensor, cu_seqlens: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Apply RoPE to THD-style variable-length audio sequences.
++
++        ``query`` and ``key`` are laid out as ``[Ttotal, H, D]``.  The
++        cumulative sequence lengths reset positions at every audio boundary,
++        exactly matching separate dense encoder calls while avoiding padding.
++        """
++        if query.ndim != 3 or key.shape != query.shape:
++            raise ValueError(
++                "Expected packed query/key [Ttotal, H, D] with matching shapes, got "
++                f"query={tuple(query.shape)}, key={tuple(key.shape)}"
++            )
++        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.long)
++        if int(lengths.sum().item()) != query.shape[0]:
++            raise ValueError(
++                "Packed RoPE cumulative lengths do not match token count: "
++                f"{int(lengths.sum().item())} != {query.shape[0]}"
++            )
++        if query.shape[0] == 0:
++            return query, key
++
++        starts = torch.repeat_interleave(cu_seqlens[:-1].to(dtype=torch.long), lengths)
++        positions = torch.arange(query.shape[0], device=query.device) - starts
++        cos = self.cos.index_select(0, positions).view(query.shape[0], 1, self.d_k_rot)
++        sin = self.sin.index_select(0, positions).view(query.shape[0], 1, self.d_k_rot)
++        query = self._apply_rotary(query, cos.to(query.dtype), sin.to(query.dtype))
++        key = self._apply_rotary(key, cos.to(key.dtype), sin.to(key.dtype))
++        return query, key
++
++
++@dataclass(frozen=True)
++class RopeTransformerEncoderConfig:
++    """Configuration for the checkpoint-compatible RoPE audio encoder."""
++
++    n_mels: int
++    d_model: int
++    n_heads: int
++    n_layers: int
++    drop_rate: float
++    qkv_bias: bool
++    qk_norm: bool
++    ff_expansion: float
++    pre_block_norm: bool
++    subsampling_factor: int
++    rope_base: float
++    rotary_fraction: float
++    stacking_pad_mode: Literal["learned", "zeros"] = "zeros"
++    # Number of previous encoder positions visible to each causal query.
++    # None or a negative value preserves unlimited-left causal attention.
++    left_context: int | None = None
++    # Runtime-only activation checkpointing toggle. This mirrors the legacy
++    # NeMo transformer encoder so ``--recompute-audio`` has identical meaning
++    # for both checkpoint architectures.
++    recompute_layers: bool = False
++
++
++class _PackedAttentionPolicy(TypedDict):
++    sequence_ids: torch.Tensor
++    mask_type: str
++    window_size: tuple[int, int]
++
++
++@dataclass(frozen=True)
++class _PackedAttentionPolicies:
++    """Per-sequence TE mask metadata shared by every encoder layer."""
++
++    policies: list[_PackedAttentionPolicy]
++
++
++class FeedForward(nn.Module):
++    """Position-wise feed-forward network used by each audio encoder block."""
++
++    def __init__(self, config: RopeTransformerEncoderConfig):
++        super().__init__()
++        ff_hidden = int(config.ff_expansion * config.d_model)
++        self.net = nn.Sequential(
++            nn.Linear(config.d_model, ff_hidden),
++            nn.GELU(),
++            nn.Dropout(config.drop_rate),
++            nn.Linear(ff_hidden, config.d_model),
++            nn.Dropout(config.drop_rate),
++        )
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Apply the feed-forward network to packed audio tokens."""
++        return self.net(x)
++
++
++class MultiHeadAttention(nn.Module):
++    """RoPE attention with scalar and per-sequence TransformerEngine policies."""
++
++    def __init__(self, config: RopeTransformerEncoderConfig, rope: RotaryPositionalEncoding):
++        super().__init__()
++        if config.d_model % config.n_heads:
++            raise ValueError("d_model must be divisible by n_heads")
++        self.n_heads = config.n_heads
++        self.head_dim = config.d_model // config.n_heads
++        self.d_model = config.d_model
++        self.rope = rope
++        self.w_qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=config.qkv_bias)
++        self.out_proj = nn.Linear(config.d_model, config.d_model)
++        self.qk_norm = config.qk_norm
++        left_context = config.left_context
++        if left_context is not None:
++            left_context = int(left_context)
++            if left_context < 0:
++                left_context = None
++        self.causal_window_size = None if left_context is None else (left_context, 0)
++        if config.qk_norm:
++            self.q_norm = nn.LayerNorm(self.head_dim)
++            self.k_norm = nn.LayerNorm(self.head_dim)
++
++    def _packed_te_attention(self):
++        """Create TE's stateless THD attention lazily after checkpoint load."""
++        name = "_packed_te_attention_impl"
++        attention = getattr(self, name, None)
++        if attention is None:
++            try:
++                from transformer_engine.pytorch import DotProductAttention
++            except ImportError as exc:
++                raise ImportError(
++                    "Packed RoPE audio encoding requires transformer-engine. "
++                    "Set --nemo-transformer-audio-attn-impl=te in a TE container."
++                ) from exc
++            attention_kwargs = dict(
++                num_attention_heads=self.n_heads,
++                kv_channels=self.head_dim,
++                attention_dropout=0.0,
++                qkv_format="thd",
++                attn_mask_type="padding",
++                tp_size=1,
++                tp_group=None,
++                layer_number=1,
++            )
++            attention = DotProductAttention(**attention_kwargs)
++            attention.train(self.training)
++            # DotProductAttention owns no trainable encoder weights. Keep the
++            # runtime kernel object out of this module's state_dict so a
++            # checkpoint saved after the first packed forward reloads strictly
++            # before its lazy attention objects have been recreated.
++            object.__setattr__(self, name, attention)
++        return attention
++
++    def _run_packed_te_attention(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        cu_seqlens: torch.Tensor,
++        max_seqlen: int,
++        *,
++        is_causal: bool,
++        attention_policies: _PackedAttentionPolicies | None = None,
++    ) -> torch.Tensor:
++        """Run scalar or per-sequence THD attention without reordering tokens."""
++        # ``value`` is a view of the fused QKV projection.  A scalar THD call
++        # with separately allocated RoPE Q/K requires all three tensors to
++        # have a supported standalone layout; materializing V here makes that
++        # layout explicit instead of relying on TE's fallback copy.
++        value = value.contiguous()
++        window_size = (-1, -1)
++        if is_causal:
++            window_size = self.causal_window_size or (-1, 0)
++        attention_kwargs = {
++            "attn_mask_type": "padding_causal" if is_causal else "padding",
++            "window_size": window_size,
++        }
++        if attention_policies is not None:
++            attention_kwargs = {
++                "thd_attention_policies": attention_policies.policies,
++                "thd_attention_policy_dispatch": "grouped",
++            }
++        return self._packed_te_attention()(
++            query,
++            key,
++            value,
++            None,
++            qkv_format="thd",
++            cu_seqlens_q=cu_seqlens,
++            cu_seqlens_kv=cu_seqlens,
++            max_seqlen_q=max_seqlen,
++            max_seqlen_kv=max_seqlen,
++            **attention_kwargs,
++        )
++
++    def forward_packed(
++        self,
++        x: torch.Tensor,
++        cu_seqlens: torch.Tensor,
++        max_seqlen: int,
++        *,
++        is_causal: bool,
++        attention_policies: _PackedAttentionPolicies | None = None,
++    ) -> torch.Tensor:
++        """Attention over packed ``[Ttotal, D]`` audio tokens using TE THD."""
++        token_count = x.shape[0]
++        # TE's THD kernel requires individually contiguous Q/K/V tensors. A
++        # view obtained by unbinding a fused [T, 3, H, D] projection has a
++        # stride through the interleaved QKV dimension and is rejected for
++        # multi-head inputs. Slice the checkpoint-compatible fused projection
++        # weights instead, producing contiguous [T, H, D] tensors directly.
++        q_weight, k_weight, v_weight = self.w_qkv.weight.chunk(3, dim=0)
++        if self.w_qkv.bias is None:
++            q_bias = k_bias = v_bias = None
++        else:
++            q_bias, k_bias, v_bias = self.w_qkv.bias.chunk(3, dim=0)
++        query = F.linear(x, q_weight, q_bias).view(token_count, self.n_heads, self.head_dim)
++        key = F.linear(x, k_weight, k_bias).view(token_count, self.n_heads, self.head_dim)
++        value = F.linear(x, v_weight, v_bias).view(token_count, self.n_heads, self.head_dim)
++        if self.qk_norm and token_count:
++            query = self.q_norm(query).to(value.dtype)
++            key = self.k_norm(key).to(value.dtype)
++        if token_count == 0:
++            output = value.new_zeros((0, self.n_heads, self.head_dim))
++        else:
++            query, key = self.rope.forward_packed(query, key, cu_seqlens)
++            output = self._run_packed_te_attention(
++                query,
++                key,
++                value,
++                cu_seqlens,
++                max_seqlen,
++                is_causal=is_causal,
++                attention_policies=attention_policies,
++            )
++        return self.out_proj(output.reshape(token_count, self.d_model))
++
++
++class TransformerBlock(nn.Module):
++    """Pre-norm Transformer block operating on packed audio tokens."""
++
++    def __init__(self, config: RopeTransformerEncoderConfig, rope: RotaryPositionalEncoding):
++        super().__init__()
++        self.norm1 = nn.LayerNorm(config.d_model)
++        self.attn = MultiHeadAttention(config, rope=rope)
++        self.drop = nn.Dropout(config.drop_rate)
++        self.norm2 = nn.LayerNorm(config.d_model)
++        self.ffn = FeedForward(config)
++
++    def forward_packed(
++        self,
++        x: torch.Tensor,
++        cu_seqlens: torch.Tensor,
++        max_seqlen: int,
++        *,
++        is_causal: bool,
++        attention_policies: _PackedAttentionPolicies | None = None,
++    ) -> torch.Tensor:
++        """Apply attention and feed-forward residuals to packed audio tokens."""
++        x = x + self.drop(
++            self.attn.forward_packed(
++                self.norm1(x),
++                cu_seqlens,
++                max_seqlen,
++                is_causal=is_causal,
++                attention_policies=attention_policies,
++            )
++        )
++        return x + self.drop(self.ffn(self.norm2(x)))
++
++
++class RopeTransformerEncoder(nn.Module):
++    """The non-causal source encoder, with a runtime causal-mask override."""
++
++    def __init__(self, config: RopeTransformerEncoderConfig):
++        super().__init__()
++        self.config = config
++        self._feat_in = config.n_mels
++        self.d_model = config.d_model
++        self.subsampling_factor = config.subsampling_factor
++        left_context = config.left_context
++        if left_context is not None:
++            left_context = int(left_context)
++            if left_context < 0:
++                left_context = None
++        self.causal_window_size = (-1, 0) if left_context is None else (left_context, 0)
++        self.pre_encode = StackingSubsampling(
++            config.subsampling_factor,
++            config.n_mels,
++            config.d_model,
++            pad_mode=config.stacking_pad_mode,
++        )
++        self.embed_norm = nn.LayerNorm(config.d_model) if config.pre_block_norm else nn.Identity()
++        self.pos_enc = RotaryPositionalEncoding(
++            config.d_model // config.n_heads,
++            rotary_fraction=config.rotary_fraction,
++            rope_base=config.rope_base,
++        )
++        self.layers = nn.ModuleList(
++            [TransformerBlock(config, rope=self.pos_enc) for _ in range(config.n_layers)]
++        )
++        self.final_norm = nn.LayerNorm(config.d_model)
++
++    def forward(
++        self,
++        audio_signal: torch.Tensor,
++        lengths: torch.Tensor,
++        *,
++        causal_mask: bool = False,
++        thd_sequence_is_causal: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Encode a dense audio batch and return padded states and output lengths."""
++        if audio_signal.ndim != 3 or audio_signal.shape[1] != self._feat_in:
++            raise ValueError(
++                f"Expected audio_signal [batch, {self._feat_in}, time], "
++                f"got {tuple(audio_signal.shape)}"
++            )
++        x_packed, output_lengths = self.forward_packed(
++            audio_signal,
++            lengths,
++            causal_mask=causal_mask,
++            thd_sequence_is_causal=thd_sequence_is_causal,
++        )
++        batch = audio_signal.shape[0]
++        max_output_frames = (
++            audio_signal.shape[-1] + self.subsampling_factor - 1
++        ) // self.subsampling_factor
++        output = x_packed.new_zeros((batch, max_output_frames, self.d_model))
++        valid = torch.arange(max_output_frames, device=output.device).unsqueeze(
++            0
++        ) < output_lengths.unsqueeze(1)
++        output[valid] = x_packed
++        return output.transpose(1, 2), output_lengths
++
++    def forward_packed(
++        self,
++        audio_signal: torch.Tensor,
++        lengths: torch.Tensor,
++        *,
++        causal_mask: bool = False,
++        thd_sequence_is_causal: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Run the complete RoPE encoder on true packed audio sequences.
++
++        This uses Transformer Engine's THD variable-length attention so both
++        self-attention and the feed-forward stack skip audio padding.  The
++        returned token order is one contiguous run per input audio item.
++        """
++        x, output_lengths = self.pre_encode.forward_packed(
++            audio_signal, lengths.to(dtype=torch.int64)
++        )
++        output_lengths = output_lengths.to(dtype=torch.int64, device=x.device)
++        attention_policies = None
++        if thd_sequence_is_causal is not None:
++            thd_sequence_is_causal = thd_sequence_is_causal.to(device=x.device, dtype=torch.bool)
++            if thd_sequence_is_causal.ndim != 1 or (
++                thd_sequence_is_causal.numel() != output_lengths.numel()
++            ):
++                raise ValueError(
++                    "thd_sequence_is_causal must have one boolean value per input audio: "
++                    f"got shape {tuple(thd_sequence_is_causal.shape)} for "
++                    f"{output_lengths.numel()} audios"
++                )
++        if x.shape[0] == 0:
++            return x, output_lengths
++
++        packed_lengths = output_lengths
++        if thd_sequence_is_causal is not None:
++            attention_policies = _PackedAttentionPolicies(
++                policies=[
++                    {
++                        "sequence_ids": torch.nonzero(
++                            ~thd_sequence_is_causal, as_tuple=False
++                        ).flatten(),
++                        "mask_type": "padding",
++                        "window_size": (-1, -1),
++                    },
++                    {
++                        "sequence_ids": torch.nonzero(
++                            thd_sequence_is_causal, as_tuple=False
++                        ).flatten(),
++                        "mask_type": "padding_causal",
++                        "window_size": self.causal_window_size,
++                    },
++                ]
++            )
++
++        max_seqlen = int(packed_lengths.max().item()) if packed_lengths.numel() else 0
++        cu_seqlens = F.pad(packed_lengths.cumsum(0).to(dtype=torch.int32), (1, 0))
++
++        self.pos_enc.extend_pe(max_seqlen, x.device, x.dtype)
++        x = self.embed_norm(x)
++        for layer in self.layers:
++            if self.config.recompute_layers and self.training and x.requires_grad:
++                x = checkpoint(
++                    lambda hidden, layer=layer: layer.forward_packed(
++                        hidden,
++                        cu_seqlens,
++                        max_seqlen,
++                        is_causal=causal_mask,
++                        attention_policies=attention_policies,
++                    ),
++                    x,
++                    use_reentrant=False,
++                )
++            else:
++                x = layer.forward_packed(
++                    x,
++                    cu_seqlens,
++                    max_seqlen,
++                    is_causal=causal_mask,
++                    attention_policies=attention_policies,
++                )
++        x = self.final_norm(x)
++        return x, output_lengths
+diff --git a/megatron/core/models/audio/nemo_transformer_audio_model.py b/megatron/core/models/audio/nemo_transformer_audio_model.py
+index 4f22567b7c..4cfe9926c9 100644
+--- a/megatron/core/models/audio/nemo_transformer_audio_model.py
++++ b/megatron/core/models/audio/nemo_transformer_audio_model.py
+@@ -1,12 +1,13 @@
+ # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ 
+ from dataclasses import dataclass, fields
+-from typing import Any, Dict, Optional, Tuple
++from typing import Any, Dict, Literal, Optional, Tuple
+ 
+ import torch
+ 
+ from megatron.core.transformer.module import MegatronModule
+ 
++from .nemo_rope_transformer_encoder import RopeTransformerEncoder, RopeTransformerEncoderConfig
+ from .nemo_transformer_encoder import TransformerEncoder
+ from .packed_audio import PackedAudioEmbeddings
+ 
+@@ -26,6 +27,9 @@ class NemoTransformerAudioConfig:
+     nan_debug: bool = False
+     qk_norm: bool = False
+     subsampling_factor: int = 4
++    # ``None`` selects the architecture-compatible default: learned padding
++    # for legacy encoders and zero padding for the RoPE encoder.
++    stacking_pad_mode: Literal["learned", "zeros"] | None = None
+     # Attention backend: "auto" prefers transformer_engine when importable, else SDPA.
+     # Explicit values: "te" | "sdpa" | "fa". Not a structural field — checkpoints
+     # trained with one backend load into another.
+@@ -37,6 +41,35 @@ class NemoTransformerAudioConfig:
+     # original unlimited-left causal attention. Non-negative values require
+     # causal_mask=True and limit each token to that many previous positions.
+     left_context: Optional[int] = None
++    # Architecture identity for checkpoint compatibility. ``legacy`` is the
++    # original CTC-style tower; ``rope_transformer`` is the 600M non-causal
++    # encoder converted from NeMo's LLM-style AED training stack.
++    architecture: str = "legacy"
++    self_attention_model: str = "rel_pos"
++    rope_base: float = 10000.0
++    rotary_fraction: float = 1.0
++    ff_expansion: float = 4.0
++    pre_block_norm: bool = True
++
++    def __post_init__(self) -> None:
++        if self.pre_encode == "feature_stacking":
++            if self.stacking_pad_mode not in (None, "zeros"):
++                raise ValueError(
++                    "pre_encode='feature_stacking' is a compatibility alias for "
++                    "pre_encode='stacking' with stacking_pad_mode='zeros'"
++                )
++            self.pre_encode = "stacking"
++            self.stacking_pad_mode = "zeros"
++        if self.stacking_pad_mode is None:
++            self.stacking_pad_mode = (
++                "zeros" if self.architecture == "rope_transformer" else "learned"
++            )
++        if self.stacking_pad_mode not in ("learned", "zeros"):
++            raise ValueError(
++                "stacking_pad_mode must be 'learned' or 'zeros', " f"got {self.stacking_pad_mode!r}"
++            )
++        if self.architecture == "rope_transformer" and self.attn_impl == "auto":
++            self.attn_impl = "te"
+ 
+     @property
+     def output_embedding_dim(self) -> int:
+@@ -66,22 +99,75 @@ class NemoTransformerAudioModel(MegatronModule):
+ 
+     def __init__(self, config: NemoTransformerAudioConfig) -> None:
+         super().__init__(config=config)
+-        self.encoder = TransformerEncoder(
+-            n_mels=config.n_mels,
+-            d_model=config.d_model,
+-            n_heads=config.n_heads,
+-            n_layers=config.n_layers,
+-            drop_rate=config.drop_rate,
+-            qkv_bias=config.qkv_bias,
+-            causal_mask=config.causal_mask,
+-            pre_encode=config.pre_encode,
+-            nan_debug=config.nan_debug,
+-            qk_norm=config.qk_norm,
+-            subsampling_factor=config.subsampling_factor,
+-            attn_impl=config.attn_impl,
+-            recompute_layers=config.recompute_layers,
+-            left_context=config.left_context,
+-        )
++        stacking_pad_mode = config.stacking_pad_mode
++        if stacking_pad_mode is None:
++            raise ValueError("stacking_pad_mode must be resolved during config initialization")
++        if config.architecture == "rope_transformer":
++            if config.attn_impl != "te":
++                raise ValueError(
++                    "rope_transformer requires Transformer Engine attention; "
++                    f"got attn_impl={config.attn_impl!r}"
++                )
++            if config.pre_encode != "stacking":
++                raise ValueError(
++                    "rope_transformer checkpoints require pre_encode='stacking', got "
++                    f"{config.pre_encode!r}"
++                )
++            if stacking_pad_mode != "zeros":
++                raise ValueError(
++                    "rope_transformer checkpoints require stacking_pad_mode='zeros', got "
++                    f"{stacking_pad_mode!r}"
++                )
++            if config.self_attention_model != "rope":
++                raise ValueError(
++                    "rope_transformer checkpoints require self_attention_model='rope', got "
++                    f"{config.self_attention_model!r}"
++                )
++            self.encoder = RopeTransformerEncoder(
++                RopeTransformerEncoderConfig(
++                    n_mels=config.n_mels,
++                    d_model=config.d_model,
++                    n_heads=config.n_heads,
++                    n_layers=config.n_layers,
++                    drop_rate=config.drop_rate,
++                    qkv_bias=config.qkv_bias,
++                    qk_norm=config.qk_norm,
++                    ff_expansion=config.ff_expansion,
++                    pre_block_norm=config.pre_block_norm,
++                    subsampling_factor=config.subsampling_factor,
++                    stacking_pad_mode=stacking_pad_mode,
++                    rope_base=config.rope_base,
++                    rotary_fraction=config.rotary_fraction,
++                    left_context=config.left_context,
++                    recompute_layers=config.recompute_layers,
++                )
++            )
++            self.supports_dynamic_causal_mask = True
++            self.supports_packed_forward = True
++        elif config.architecture == "legacy":
++            self.encoder = TransformerEncoder(
++                n_mels=config.n_mels,
++                d_model=config.d_model,
++                n_heads=config.n_heads,
++                n_layers=config.n_layers,
++                drop_rate=config.drop_rate,
++                qkv_bias=config.qkv_bias,
++                causal_mask=config.causal_mask,
++                pre_encode=config.pre_encode,
++                nan_debug=config.nan_debug,
++                qk_norm=config.qk_norm,
++                subsampling_factor=config.subsampling_factor,
++                stacking_pad_mode=stacking_pad_mode,
++                attn_impl=config.attn_impl,
++                recompute_layers=config.recompute_layers,
++                left_context=config.left_context,
++            )
++            self.supports_dynamic_causal_mask = False
++            self.supports_packed_forward = True
++        else:
++            raise ValueError(
++                f"Unsupported NemoTransformerAudioConfig.architecture={config.architecture!r}"
++            )
+ 
+     @staticmethod
+     def _ceil_div(value: int, divisor: int) -> int:
+@@ -216,7 +302,11 @@ class NemoTransformerAudioModel(MegatronModule):
+         }
+ 
+     def forward(
+-        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
++        self,
++        input_features: torch.Tensor,
++        attention_mask: torch.Tensor | None = None,
++        causal_mask: bool | None = None,
++        thd_sequence_is_causal: torch.Tensor | None = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         """Encode mel features into ``(B, T', H)`` embeddings and a validity mask."""
+         if input_features.ndim != 3:
+@@ -238,14 +328,33 @@ class NemoTransformerAudioModel(MegatronModule):
+         audio_bct = input_features.transpose(1, 2).contiguous()
+         # Cast inputs to the encoder's parameter dtype before forward.
+         # The dataloader emits float32 mels, but under Megatron's bf16/fp16
+-        # wrapper the encoder parameters (incl. ``NGPTStackingSubsampling``'s
+-        # learnable ``pad_frame``) live in low precision; mismatched dtypes
+-        # break ``x[mask] = self.pad_frame`` (index_put requires matching
+-        # dtypes), so cast at the audio encoder boundary.
++        # wrapper the encoder parameters (including a learned stacking pad
++        # frame when configured) live in low precision, so cast at the audio
++        # encoder boundary.
+         encoder_dtype = next(self.encoder.parameters(), audio_bct).dtype
+         if audio_bct.dtype != encoder_dtype:
+             audio_bct = audio_bct.to(dtype=encoder_dtype)
+-        enc_out, lengths_out = self.encoder(audio_bct, lengths)
++        if causal_mask is not None and not self.supports_dynamic_causal_mask:
++            if bool(causal_mask) != bool(self.config.causal_mask):
++                raise ValueError(
++                    "This audio checkpoint does not support runtime causal-mask changes. "
++                    "Use a rope_transformer checkpoint for mixed causal training."
++                )
++        if self.supports_dynamic_causal_mask:
++            enc_out, lengths_out = self.encoder(
++                audio_bct,
++                lengths,
++                causal_mask=(
++                    bool(causal_mask) if causal_mask is not None else self.config.causal_mask
++                ),
++                thd_sequence_is_causal=thd_sequence_is_causal,
++            )
++        else:
++            if thd_sequence_is_causal is not None:
++                raise ValueError(
++                    "Per-audio causal masking requires a rope_transformer audio checkpoint."
++                )
++            enc_out, lengths_out = self.encoder(audio_bct, lengths)
+ 
+         enc_out = enc_out.transpose(1, 2).contiguous()
+         max_len = enc_out.shape[1]
+@@ -254,7 +363,11 @@ class NemoTransformerAudioModel(MegatronModule):
+         return enc_out, output_mask
+ 
+     def forward_packed(
+-        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
++        self,
++        input_features: torch.Tensor,
++        attention_mask: torch.Tensor | None = None,
++        causal_mask: bool | None = None,
++        thd_sequence_is_causal: torch.Tensor | None = None,
+     ) -> PackedAudioEmbeddings:
+         """Encode mel features into packed (padding-free) audio embeddings."""
+         if input_features.ndim != 3:
+@@ -278,7 +391,26 @@ class NemoTransformerAudioModel(MegatronModule):
+         if audio_bct.dtype != encoder_dtype:
+             audio_bct = audio_bct.to(dtype=encoder_dtype)
+ 
+-        enc_out, lengths_out = self.encoder(audio_bct, lengths, return_packed=True)
++        if self.supports_dynamic_causal_mask:
++            enc_out, lengths_out = self.encoder.forward_packed(
++                audio_bct,
++                lengths,
++                causal_mask=(
++                    bool(causal_mask) if causal_mask is not None else self.config.causal_mask
++                ),
++                thd_sequence_is_causal=thd_sequence_is_causal,
++            )
++        else:
++            if thd_sequence_is_causal is not None:
++                raise ValueError(
++                    "Per-audio causal masking requires a rope_transformer audio checkpoint."
++                )
++            if causal_mask is not None and bool(causal_mask) != bool(self.config.causal_mask):
++                raise ValueError(
++                    "This audio checkpoint does not support runtime causal-mask changes. "
++                    "Use a rope_transformer checkpoint for mixed causal training."
++                )
++            enc_out, lengths_out = self.encoder(audio_bct, lengths, return_packed=True)
+         return PackedAudioEmbeddings(
+             embeddings=enc_out, lengths=lengths_out.to(dtype=torch.int32, device=enc_out.device)
+         )
+diff --git a/megatron/core/models/audio/nemo_transformer_encoder.py b/megatron/core/models/audio/nemo_transformer_encoder.py
+index b0beaaf952..3b5594f023 100644
+--- a/megatron/core/models/audio/nemo_transformer_encoder.py
++++ b/megatron/core/models/audio/nemo_transformer_encoder.py
+@@ -8,7 +8,7 @@
+ 
+ import logging
+ from dataclasses import dataclass
+-from typing import Optional, Tuple
++from typing import Literal, Optional, Tuple
+ 
+ import torch
+ from torch import nn
+@@ -728,50 +728,178 @@ class DepthwiseConvSubsampling(nn.Module):
+         return x, length
+ 
+ 
+-class NGPTStackingSubsampling(torch.nn.Module):
+-    """Stacking subsampling which simply stacks consecutive frames to reduce the sampling rate
++class StackingSubsampling(torch.nn.Module):
++    """Stack consecutive audio frames and project them to the encoder dimension.
++
+     Args:
+-        subsampling_factor (int): The subsampling factor
+-        feat_in (int): size of the input features
+-        feat_out (int): size of the output features
++        subsampling_factor: Number of adjacent frames in each stack.
++        feat_in: Input feature dimension.
++        feat_out: Output encoder dimension.
++        use_bias: Whether the output projection has a bias.
++        pad_mode: How missing frames in a partial final stack are represented.
++            ``"learned"`` preserves the legacy NGPT behavior and checkpoint
++            layout; ``"zeros"`` matches NeMo's ``FeatureStacking``.
+     """
+ 
+     def __init__(
+-        self, subsampling_factor: int, feat_in: int, feat_out: int, use_bias: bool = False
++        self,
++        subsampling_factor: int,
++        feat_in: int,
++        feat_out: int,
++        use_bias: bool = False,
++        *,
++        pad_mode: Literal["learned", "zeros"] = "learned",
+     ):
+         super().__init__()
++        if pad_mode not in ("learned", "zeros"):
++            raise ValueError(
++                f"Unsupported stacking pad_mode={pad_mode!r}; expected 'learned' or 'zeros'"
++            )
+         self.subsampling_factor = subsampling_factor
+-        self.proj_out = torch.nn.Linear(subsampling_factor * feat_in, feat_out, bias=use_bias)
+-        self.pad_frame = nn.Parameter(torch.ones(feat_in, dtype=torch.float32))
++        self.pad_mode = pad_mode
++        projection = torch.nn.Linear(subsampling_factor * feat_in, feat_out, bias=use_bias)
++        self.proj_out: torch.nn.Linear | None = None
++        self.proj: torch.nn.Linear | None = None
++        if pad_mode == "learned":
++            # Preserve the legacy state-dict layout: ``proj_out`` plus a
++            # trainable padding frame.
++            self.proj_out = projection
++            self.pad_frame = nn.Parameter(torch.ones(feat_in, dtype=torch.float32))
++        else:
++            # Preserve NeMo FeatureStacking's ``proj`` key and lack of a
++            # trainable padding parameter.
++            self.proj = projection
++            self.register_parameter("pad_frame", None)
++
++    def _projection(self) -> torch.nn.Linear:
++        projection = self.proj_out if self.pad_mode == "learned" else self.proj
++        assert projection is not None
++        return projection
++
++    def _replace_zero_frames(self, x: torch.Tensor) -> torch.Tensor:
++        if self.pad_mode != "learned":
++            return x
++        assert self.pad_frame is not None
++        zero_frames = (x == 0).all(dim=-1, keepdim=True)
++        return torch.where(zero_frames, self.pad_frame.view(1, -1), x)
++
++    def _pad_partial_stack(self, x: torch.Tensor, pad_size: int) -> torch.Tensor:
++        if not pad_size:
++            return x
++        if self.pad_mode == "learned":
++            assert self.pad_frame is not None
++            padding = self.pad_frame.view(1, -1).expand(pad_size, -1)
++            return torch.cat((x, padding), dim=0)
++        return torch.nn.functional.pad(x, (0, 0, 0, pad_size))
++
++    def forward(self, x: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Stack and project a dense batch of padded audio features.
+ 
+-    def forward(self, x, length):
+-        """
+         Args:
+-            x (torch.Tensor): (B, C, T)
+-            length (torch.Tensor): (B,)
++            x: Audio features with shape ``[batch, features, time]``.
++            length: Valid input frame count for each sample.
++
+         Returns:
+-            x (torch.Tensor): (B, T', D_model)
+-            length (torch.Tensor): (B,)
++            Projected features with shape ``[batch, time', feat_out]`` and
++            the corresponding per-sample lengths.
+         """
+         x = x.transpose(1, 2)  # BxCxT -> BxTxC
+         b, t, h = x.size()
+-        pad_size = (
+-            self.subsampling_factor - (t % self.subsampling_factor)
+-        ) % self.subsampling_factor
++        pad_size = (-t) % self.subsampling_factor
+         length = torch.div(
+             length + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode='floor'
+         )
+ 
+-        # Pad and fill padding frames (all-zero) with a learnable padding 'embedding'
+-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+-        x[(x == 0).all(dim=-1)] = self.pad_frame
++        if pad_size:
++            x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
++        x = self._replace_zero_frames(x)
+ 
+         _, t, _ = x.size()
+         x = torch.reshape(x, (b, t // self.subsampling_factor, h * self.subsampling_factor))
+-        x = self.proj_out(x)
++        x = self._projection()(x)
+ 
+         return x, length
+ 
++    def forward_packed(
++        self, x: torch.Tensor, lengths: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Stack only valid frames and return contiguous per-audio token runs.
++
++        ``x`` may be a padded ``[B, F, T]`` batch or already-packed
++        ``[Ttotal, F]`` features. Each sample is padded only through its final
++        partial stack, avoiding projection work on suffix padding.
++        """
++        if x.ndim == 2:
++            features = x.shape[1]
++            lengths = lengths.to(dtype=torch.int64, device=x.device).reshape(-1)
++            if int(lengths.sum().item()) != x.shape[0]:
++                raise ValueError(
++                    f"Packed features have {x.shape[0]} frames but "
++                    f"sum(lengths)={int(lengths.sum().item())}"
++                )
++            padded_lengths = (
++                torch.div(
++                    lengths + self.subsampling_factor - 1,
++                    self.subsampling_factor,
++                    rounding_mode="floor",
++                )
++                * self.subsampling_factor
++            )
++            output_lengths = padded_lengths // self.subsampling_factor
++            if x.shape[0] == 0:
++                return x.new_zeros((0, self._projection().out_features)), output_lengths
++
++            source_starts = lengths.cumsum(0) - lengths
++            destination_starts = padded_lengths.cumsum(0) - padded_lengths
++            frame_ids = torch.arange(x.shape[0], device=x.device)
++            within_clip = frame_ids - torch.repeat_interleave(source_starts, lengths)
++            destination = torch.repeat_interleave(destination_starts, lengths) + within_clip
++            if self.pad_mode == "learned":
++                assert self.pad_frame is not None
++                canvas = (
++                    self.pad_frame.view(1, -1).expand(int(padded_lengths.sum().item()), -1).clone()
++                )
++                x = self._replace_zero_frames(x)
++            else:
++                canvas = x.new_zeros((int(padded_lengths.sum().item()), features))
++            canvas[destination] = x
++            stacked = canvas.reshape(-1, features * self.subsampling_factor)
++            return self._projection()(stacked), output_lengths
++
++        if x.ndim != 3:
++            raise ValueError(
++                f"Expected [B, F, T] or packed [Ttotal, F] audio features, got {tuple(x.shape)}"
++            )
++        batch, features, max_time = x.shape
++        if lengths.numel() != batch:
++            raise ValueError(f"Expected {batch} input lengths, got {lengths.numel()}")
++
++        x_btf = x.transpose(1, 2)
++        lengths = lengths.to(dtype=torch.int64, device=x.device)
++        output_lengths = torch.div(
++            lengths + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode="floor"
++        )
++        stacked_chunks = []
++        for index, frame_count in enumerate(lengths.tolist()):
++            if frame_count < 0 or frame_count > max_time:
++                raise ValueError(
++                    f"Invalid input length {frame_count} for audio with {max_time} frames"
++                )
++            if frame_count == 0:
++                continue
++            sample = self._replace_zero_frames(x_btf[index, :frame_count])
++            pad_size = (-frame_count) % self.subsampling_factor
++            sample = self._pad_partial_stack(sample, pad_size)
++            stacked_chunks.append(sample.reshape(-1, features * self.subsampling_factor))
++        if stacked_chunks:
++            stacked = torch.cat(stacked_chunks, dim=0)
++            return self._projection()(stacked), output_lengths
++        return x.new_zeros((0, self._projection().out_features)), output_lengths
++
++
++# Backward-compatible import name for users of the vendored legacy encoder.
++NGPTStackingSubsampling = StackingSubsampling
++
+ 
+ class TransformerEncoder(nn.Module):
+     """Audio transformer encoder: subsampling front-end followed by a transformer stack."""
+@@ -789,6 +917,7 @@ class TransformerEncoder(nn.Module):
+         nan_debug: bool = True,
+         qk_norm: bool = False,
+         subsampling_factor: int = 4,
++        stacking_pad_mode: Literal["learned", "zeros"] = "learned",
+         attn_impl: str = "auto",
+         recompute_layers: bool = False,
+         left_context: Optional[int] = None,
+@@ -805,8 +934,11 @@ class TransformerEncoder(nn.Module):
+         elif pre_encode == "depth_conv":
+             self.pre_encode = DepthwiseConvSubsampling(n_mels, d_model)
+         elif pre_encode == "stacking":
+-            self.pre_encode = NGPTStackingSubsampling(
+-                subsampling_factor=subsampling_factor, feat_in=n_mels, feat_out=d_model
++            self.pre_encode = StackingSubsampling(
++                subsampling_factor=subsampling_factor,
++                feat_in=n_mels,
++                feat_out=d_model,
++                pad_mode=stacking_pad_mode,
+             )
+         else:
+             raise ValueError(

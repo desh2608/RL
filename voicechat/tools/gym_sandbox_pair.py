@@ -130,7 +130,7 @@ def build_commands(args, env):
     # --overlap shares this allocation's existing CPUs/memory/GRES. Explicit
     # --gres=none ensures the sidecar reserves no GPUs; no new allocation exists.
     sidecar = ['srun', '--overlap', '--nodes=1', '--ntasks=1', '--ntasks-per-node=1',
-               '--nodelist=' + args.head, '--cpus-per-task=8', '--gres=none', '--mem=0',
+               '--nodelist=' + args.head, '--cpus-per-task=8', '--gres=none',
                '--cpu-bind=none', '--mpi=none', '--kill-on-bad-exit=1', '--no-container-mount-home', '--no-container-entrypoint',
                '--container-image=' + args.sandbox_image,
                '--container-mounts=' + str(run / 'scripts') + ':/nvc/scripts:ro,' + str(receipt) + ':/nvc/receipts,' + local + '/sandbox-container:/nvc-owned,' + local + '/sandbox-tmp:/tmp',
@@ -138,7 +138,7 @@ def build_commands(args, env):
                'python3', '/nvc/scripts/gym_sandbox_supervisor.py', '--receipt-dir', '/nvc/receipts',
                '--local-dir', '/nvc-owned/runtime', '--job-id', job, '--host', host, '--workers', '32']
     main = ['srun', '--overlap', '--nodes=' + str(nodes), '--ntasks=' + str(nodes), '--ntasks-per-node=1',
-            '--cpus-per-task=64', '--gpus-per-task=8', '--mem=0', '--gpu-bind=none', '--cpu-bind=none',
+            '--cpus-per-task=64', '--gpus-per-task=8', '--gpu-bind=none', '--cpu-bind=none',
             '--mpi=none', '--kill-on-bad-exit=1', '--no-container-mount-home', '--container-image=' + args.image,
             '--container-mounts=' + args.mounts, '--container-workdir=/workspace/nemo-rl',
             '--output=' + str(run / 'rank-%t-%N.log'), 'bash', str(run / 'scripts/ray_role.sh')]

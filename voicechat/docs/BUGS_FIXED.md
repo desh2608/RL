@@ -184,6 +184,49 @@ Probe: `scripts/audit/gradsync_check/`; re-run after changing the parallel layou
 - The resume job id was read from `SUBMISSIONS`, but RL run dirs record `JOB_ID`. An empty id looked like a finished
   job and triggered a second resume build. It now reads `JOB_ID` and checks the id is numeric.
 
+### B22 RoPE frontend fixed statistics fail for batched waveforms (fixed)
+- **Symptom:** real step7000 Nano35 audio preflight on IAD (job 14017681) loaded all 487 sound tensors, then failed with `shape [2, 128] is invalid for input of size 128`.
+- **Cause:** the saved frontend has one global mean/std vector per mel channel; the standalone preprocessor normalization expects batch-shaped statistics when called with multiple waveforms.
+- **Fix:** Bridge materializes each waveform separately, trims to its valid frames, then pads the resulting mel tensors. This follows native MCore `NemoAudioProcessor.materialize`; the trained statistics and encoder math stay unchanged.
+- **Check:** `test_fixed_global_normalization_materializes_per_waveform` compares a two-wave batch against individual preprocessing and verifies raw-wave and mel encoder outputs agree. GPU retry uses the actual saved checkpoint.
+
+### B23 RoPE HF checkpoint has V3 processor metadata with V2 source names (fixed)
+- **Symptom:** step7000 Nano35 HF processor preflight (IAD job14018446) fails with `processing has no attribute NemotronH_Nano_Omni_Reasoning_V3Processor`.
+- **Cause:** `preprocessor_config.json` names V3 processor/image/video classes, but the shipped Python files define `NemotronNanoVLV2*`. Model/config already carry historical aliases; the processor files do not.
+- **Fix:** Bridge's NeMo audio asset packaging adds only missing known aliases, retaining the original processor implementations and metadata. Original HF checkpoint is untouched. The learner adapter also reuses source-decoded waveforms, preserving file-path and singleton NumPy input support.
+- **Check:** `test_export_repairs_historical_processor_labels_without_replacing_code` checks aliases, idempotence, and preservation of existing classes; `test_processor_adapter_uses_decoded_singleton_waveforms` checks decoded-path/singleton equality. GPU Bridge/AutoProcessor preflight must confirm saved token counts and mel lengths. Applies to offline and online audio paths.
+
+### B24 Tau RoPE checkpoint frozen vision projector width differs from default (fixed)
+- **Symptom:** distributed HF import in IAD job14018749 fails at `vision_projection.encoder.linear_fc1.layer_norm_weight`: expected5120, checkpoint1280.
+- **Cause:** the checkpoint saves `downsample_ratio=1.0`, while Bridge hard-codes 2x pixel shuffle (ratio0.5) and a four-times wider projector input.
+- **Fix:** NeMo audio provider translation carries the saved ratio into a Bridge family configuration field. Model projector geometry and patch handling honor0.5 or1.0; existing default0.5 is preserved. HF export preserves the saved ratio. No evaluation launcher changes.
+- **Check:** `test_saved_vision_projector_geometry_preserves_frozen_weights` verifies both widths and patch handling. Full HF import must complete with the checkpoint's1280-wide frozen projector. Applies to offline/online audio training when full multimodal weights are retained.
+
+### B25 HF SoundConfig serialization loses the NeMo backend label (fixed)
+- **Symptom:** strict export after successful two-update job14019801 writes all7125 tensors, but JSON says `sound_config.model_type=parakeet` with `encoder_config.architecture=rope_transformer`. Native generation would choose the wrong encoder.
+- **Cause:** HF `PretrainedConfig.to_dict` writes the class-level model_type. Historical `SoundConfig` declares class defaultParakeet while storing the saved backend per instance. Historical bridge aliases also bypassed Omni config/export hooks.
+- **Fix:** Bridge preserves the explicit backend in provider/HF config translation and packaging, installs a per-instance SoundConfig serializer in exported assets, and routes historical NeMo labels through the Omni export hooks. The requested Tau HF wrapper has the same serializer override. Parakeet defaults remain unchanged.
+- **Check:** `test_export_and_hf_reserialization_preserve_nemo_backend` reproduces the class-default bug and checks corrected JSON plus reserialization. GPU smoke must reload exported AutoConfig, assert backendNeMo before/after `to_dict`, and verify saved projector ratio1. Applies to offline/online audio exports and generation dispatch.
+
+### B26 Gym audio sidechannel missing from learner trajectories (fixed; end-to-end validation pending)
+- **Symptom:** Gym can generate with metadata audio, but the learner receives no audio tensors for the returned audio placeholder tokens.
+- **Cause:** the Gym model server already handles `audio_data`/`audio_path`/`audio_paths`; the RL Gym postprocessor only attaches image model inputs.
+- **Fix:** decode the original metadata sidechannel with SoundFile and the same mono convention, use the Bridge processor frontend, attach packed `sound_clips`/`sound_length` on the first trainable turn, and require exact per-clip rollout placeholder counts. Text-only behavior is unchanged. Paths must be absolute and audio must already use the encoder sampling rate (16kHz for this checkpoint); pre-resample a shared input file once rather than using different engine resamplers. Relative audio roots are not accepted implicitly on the learner.
+- **Check:** eight CPU regressions in `tests/unit/models/test_nemo_gym_audio.py`; the actual offline RL smoke must additionally show audio-bearing learner batches, finite updates, and successful subsequent rollout/refit. CPU checks alone do not certify the complete training path.
+
+### B27 Native vLLM processor rejects saved vision ratio1 before audio generation (fixed; GPU retry pending)
+- **Symptom:** full17-shard model load succeeds, then an audio-only request fails in DynamicResolutionImageTiler's ratio<1 assertion.
+- **Cause:** the native model and saved frozen projector accept ratio1, while the pinned processor constructor assumes a twofold reduction even when no image is supplied.
+- **Fix:** Bridge's explicit NeMo runtime dispatch wraps that constructor: retain its setup and select unit reduction for the saved ratio1. Existing ratio0.5 delegates unchanged; unsupported ratios still fail. Model/checkpoint geometry is preserved.
+- **Check:** `test_native_tiler_preserves_unit_scale_and_default_geometry` checks token arithmetic and default behavior; full native audio generation must pass before RL submission. This does not claim image evaluation acceptance.
+
+## B28. Fresh-source learner cannot build its dataset helper
+
+- **Symptom:** Bridge learner initialization fails with `cannot open output file helpers_cpp.cpython-313-x86_64-linux-gnu.so: Read-only file system`, after the HF import succeeds.
+- **Cause:** The launcher mounts the extracted source read-only, while Bridge unconditionally invokes MCore's dataset-helper Makefile on each learner node. A fresh third-party checkout has no helper compiled for the container's Python ABI. `NVC_SKIP_MEGATRON_DATASET_HELPERS` is not consumed by this pinned Bridge initializer.
+- **Fix:** Overlay just the node-local extracted MCore `datasets` directory as writable. The original immutable run/archive and the remaining source mount are unchanged; native helper compilation and its barrier are retained.
+- **Check:** `bash -n voicechat/tools/gpu_job.sh`, frozen launcher tests, and a fresh native smoke must get past helper compilation on both learner nodes.
+
 ## Files changed relative to the upstream baseline (audit entry points)
 
 ```

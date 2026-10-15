@@ -5,7 +5,6 @@
 #SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=0
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
@@ -135,7 +134,7 @@ cleanup() {
  fi
  # A failed rank can make srun terminate other role shells before their EXIT
  # traps finish. Recover each node's Ray logs from the host-visible /tmp bind.
- srun --nodes="$NVC_EXPECTED_NODES" --ntasks="$NVC_EXPECTED_NODES" --ntasks-per-node=1 --cpus-per-task=1 --mem=0 --mpi=none \
+ srun --nodes="$NVC_EXPECTED_NODES" --ntasks="$NVC_EXPECTED_NODES" --ntasks-per-node=1 --cpus-per-task=1 --mpi=none \
   bash -c '
    set -eu
    [[ "$NVC_DEBUG_LOCAL" == "/raid/scratch/$USER/super35-draco-$SLURM_JOB_ID" ]]
@@ -185,9 +184,15 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' TERM INT
-srun --nodes="$NVC_EXPECTED_NODES" --ntasks="$NVC_EXPECTED_NODES" --ntasks-per-node=1 --cpus-per-task=8 --mem=0 --mpi=none --kill-on-bad-exit=1 \
+srun --nodes="$NVC_EXPECTED_NODES" --ntasks="$NVC_EXPECTED_NODES" --ntasks-per-node=1 --cpus-per-task=8 --mpi=none --kill-on-bad-exit=1 \
  bash -c 'set -eu; mkdir -p "$NVC_DEBUG_LOCAL/source" "$NVC_DEBUG_LOCAL/tmp" "$NVC_DEBUG_LOCAL/sandbox-tmp" "$NVC_DEBUG_LOCAL/sandbox-container"; cd "$NVC_DEBUG_RUN"; sha256sum -c source.sha256; tar -xzf source.tar.gz -C "$NVC_DEBUG_LOCAL/source"'
 mounts="/lustre:/lustre,/raid/scratch:/raid/scratch,$NVC_DEBUG_LOCAL/source:/workspace/nemo-rl:ro,$NVC_DEBUG_LOCAL/tmp:/tmp"
+# Bridge builds its Python-ABI-specific dataset helper at learner startup.
+# Permit build products only in this node-local extracted subtree; the frozen
+# run/source archive and the rest of the source mount remain read-only.
+dataset_helpers=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/datasets
+[[ -f "$NVC_DEBUG_LOCAL/source/$dataset_helpers/Makefile" ]]
+mounts+=",$NVC_DEBUG_LOCAL/source/$dataset_helpers:/workspace/nemo-rl/$dataset_helpers"
 if [[ "$NVC_INPUT_MODE" == gym ]]; then
  head=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
  python3 "$run/scripts/gym_sandbox_pair.py" --run "$run" --head "$head" \
@@ -197,7 +202,7 @@ if [[ "$NVC_INPUT_MODE" == gym ]]; then
  pair_pid=
 else
 srun --nodes="$NVC_EXPECTED_NODES" --ntasks="$NVC_EXPECTED_NODES" --ntasks-per-node=1 --cpus-per-task=64 --gpus-per-task=8 \
- --mem=0 --gpu-bind=none --cpu-bind=none --mpi=none --kill-on-bad-exit=1 \
+ --gpu-bind=none --cpu-bind=none --mpi=none --kill-on-bad-exit=1 \
  --no-container-mount-home --container-image="$image" --container-mounts="$mounts" \
  --container-workdir=/workspace/nemo-rl --output="$run/rank-%t-%N.log" \
  bash "$run/scripts/ray_role.sh"

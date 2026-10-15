@@ -579,6 +579,15 @@ class BaseVllmGenerationWorker:
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
 
+        from nemo_rl.models.generation.vllm.nemo_audio import install_nemo_audio
+
+        if install_nemo_audio(self.model_name):
+            existing_worker = vllm_kwargs.get("worker_cls", "auto")
+            rope_worker = "nemo_rl.models.generation.vllm.nemo_audio_worker.NemoAudioVllmWorker"
+            if existing_worker not in ("auto", rope_worker):
+                raise ValueError("nemo_transformer requires NemoAudioVllmWorker for model-process dispatch")
+            vllm_kwargs["worker_cls"] = rope_worker
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,

@@ -567,6 +567,8 @@ def vlm_hf_data_processor(
                 text_parts.append(image_token)
             elif content["type"] == "text":
                 text_parts.append(content["text"])
+            elif content["type"] == "audio":
+                text_parts.append(getattr(processor, "audio_token", "<so_embedding>"))
         user_message_for_tokenize = {"role": "user", "content": "\n".join(text_parts)}
     else:
         user_message_for_tokenize = user_message
@@ -591,10 +593,14 @@ def vlm_hf_data_processor(
         # float32 and only casts at the vision_model boundary; matching that
         # rounding order tightens rollout/train logprob agreement. The model
         # forward dispatches on imgs_sizes and handles the bf16 cast.
+        audio_kwargs = {}
+        if audios and "sound_length" in processor.model_input_names:
+            audio_kwargs["audio"] = [waveform for waveform, _ in audios]
         message = processor(
             text=string_formatted_dialog,
             images=images,
             return_tensors="pt",
+            **audio_kwargs,
         )
     else:
         message = processor.apply_chat_template(
@@ -640,7 +646,7 @@ def vlm_hf_data_processor(
             user_message[key] = PackedTensor(
                 message[key],
                 dim_to_pack=get_dim_to_pack_along(processor, key),
-                pad_to_max_shape=uses_placeholder and key == "pixel_values",
+                pad_to_max_shape=(uses_placeholder and key == "pixel_values") or key == "sound_clips",
             )
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value

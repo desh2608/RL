@@ -446,6 +446,9 @@ def get_tokenizer(
             tokenizer_config["name"], trust_remote_code=True, use_fast=True,
             **tokenizer_kwargs,
         )
+        from nemo_rl.models.generation.vllm.nemo_audio import wrap_nemo_audio_processor
+
+        processor = wrap_nemo_audio_processor(processor, tokenizer_config["name"])
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
