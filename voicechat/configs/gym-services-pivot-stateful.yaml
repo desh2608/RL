@@ -1,0 +1,56 @@
+{
+  "policy_model": {
+    "responses_api_models": {
+      "vllm_model": {
+        "api_key": "${policy_api_key}",
+        "base_url": "${policy_base_url}",
+        "chat_template_kwargs": {
+          "enable_thinking": true,
+          "truncate_history_thinking": false
+        },
+        "engine_data_parallel_size": 8,
+        "entrypoint": "app.py",
+        "model": "${policy_model_name}",
+        "num_workers": 16,
+        "request_prompt_and_generation_token_ids": true,
+        "return_token_id_information": true,
+        "sequential_reasoning_allowed": false,
+        "uses_reasoning_parser": true
+      }
+    }
+  },
+  "tau_pivot_stateful_agent": {
+    "responses_api_agents": {
+      "tool_simulation_agent": {
+        "datasets": [],
+        "entrypoint": "app.py",
+        "model_server": {
+          "name": "policy_model",
+          "type": "responses_api_models"
+        },
+        "resources_server": {
+          "name": "tau_pivot_stateful",
+          "type": "resources_servers"
+        }
+      }
+    }
+  },
+  "tau_pivot_stateful": {
+    "resources_servers": {
+      "tau_pivot_stateful": {
+        "entrypoint": "app.py",
+        "cache_manifest": "${pivot_stage}/CACHE_MANIFEST.json",
+        "runtime_manifest": "${pivot_stage}/RUNTIME.json",
+        "domain": "agent",
+        "description": "Frozen native boundary-state preview and binary pivot predicates; no judge",
+        "verified": false,
+        "cache_entries": 2,
+        "replicas_per_runtime": 4,
+        "worker_timeout_seconds": 300,
+        "dispatch_policy": "affinity_steal",
+        "v21_field_table": "${pivot_bundle}/verifier/FIELD_TABLE.json",
+        "v21_cache_manifest": "${pivot_stage}/V21_CACHE_MANIFEST.json"
+      }
+    }
+  }
+}
