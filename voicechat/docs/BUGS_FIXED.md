@@ -378,3 +378,26 @@ their strict authorization check. A regression reproduces the difference.
 The frozen V5 jobs used commit459a0b4a and are not re-certified by this code fix;
 their outputs remain diagnostic only. New native replay qualification is required
 before any training publication. No frozen grader or published bundle changed.
+
+
+## 2026-10-22 — G5 INBOX36 R1: commuting gold writes, target-bound K5, lenient K7
+
+The ordered trace treated confirmed writes as mistakes when another order's
+lookup came first in one gold trajectory. New mining opts into `recovery_r1`: a
+write matching any remaining gold write can be valid; native feasibility and task
+completion establish state readiness independently of its trace position. A K6
+write must be unmatched and have ungrounded arguments, with a pending public
+lookup actually supplying the intended target's missing values. K1 has no
+remaining matching write tool; K2 has the same tool/target with wrong arguments
+and a native consequence. Unproved alternatives remain holds.
+
+`G5-INBOX36-R1` is an explicit spec contract. K5 additionally binds the witness
+offer to the exact order/reservation or profile/default address, with every
+gold argument public. K7 deliberately rewards any single spoken message, or a
+call matching any remaining gold step, excluding end/transfer. This lenient
+K7 criterion does not grade spoken factual content. B0 wrong-ID lookup errors
+are marked audio-only by the miner and excluded from text pools by default.
+
+Earlier contracts and published bundles retain their behavior. New semantics
+require fresh native/HTTP qualification; caps and training selection remain
+suspended pending the user/strategist decision. No new model calls are needed.

@@ -21,11 +21,12 @@ from recipes.tau_voice_rl_pivot.consent_given import detect, is_reask
 class Boundary:
     """A native task environment and complete remaining gold action ledger."""
 
-    def __init__(self, raw: dict, frozen: Path) -> None:
+    def __init__(self, raw: dict, frozen: Path, *, recovery_r1: bool = False) -> None:
         from recipes.tau_voice_sdg.areal_gold_replay import constructor
         from recipes.tau_voice_sdg.areal_step_verifier import delta
         from tau2.data_model.tasks import InitialState, Task
 
+        self.recovery_r1 = recovery_r1
         self.domain = raw["domain_name"]
         self.policy = raw["policy"]
         task = copy.deepcopy(raw["tau_task"])
@@ -169,6 +170,13 @@ class Boundary:
         if self.tool_type(call) == "write":
             result["step_due"] = result["step_due"] and due.get("reference_write_anchor", False) if due else False
         result["write_due"] = result["step_due"] and self.tool_type(call) == "write"
+        if getattr(self, "recovery_r1", False):
+            # INBOX36: a trace position is not a prerequisite. Native execution
+            # and remaining-task completion prove readiness in the actual state.
+            result["trace_step_due"] = result["step_due"]
+            result["state_ready"] = result.get("feasible") is True and result.get("matched_gold_index") is not None
+            result["step_due"] = result["state_ready"]
+            result["write_due"] = result["state_ready"] and self.tool_type(call) == "write"
         return result
 
     def _native_check_uncached(self, call: dict) -> dict:
@@ -335,6 +343,10 @@ class Boundary:
         This is candidate generation. A proposed kind still needs pinned K4
         content controls, HTTP parity, reproduction and independent audit.
         """
+        if getattr(self, "recovery_r1", False):
+            from recipes.tau_voice_rl_pivot.areal_r1 import inspect
+
+            return inspect(self, output, prefix)
         shape, candidate = areal_v2.one_turn(output)
         missing = self.missing_lookup(output, prefix)
         if missing:
@@ -459,6 +471,13 @@ class Boundary:
         return {"status": "continue", "reason": "native_gold_write_authorized", "native": native, "consent": consent}
 
     def inspect_student(self, output: list[dict], prefix: list[dict], reference_call: dict | None) -> dict:
+        if getattr(self, "recovery_r1", False):
+            from recipes.tau_voice_rl_pivot.areal_r1 import inspect_student
+
+            return inspect_student(self, output, prefix, reference_call)
+        return self._inspect_student_legacy(output, prefix, reference_call)
+
+    def _inspect_student_legacy(self, output: list[dict], prefix: list[dict], reference_call: dict | None) -> dict:
         """Use a correct native reference turn as additional B0 evidence.
 
         A remaining alternative gold action is held rather than treated as an
@@ -467,7 +486,7 @@ class Boundary:
         held. K3 source contexts remain deferred under INBOX33.
         """
         shape, candidate = areal_v2.one_turn(output)
-        missing = self.missing_lookup(output, prefix)
+        missing = None if getattr(self, "recovery_r1", False) else self.missing_lookup(output, prefix)
         if missing:
             return missing
         if reference_call is None or shape != "call":
@@ -545,7 +564,7 @@ class Boundary:
                 for key in candidate["arguments"].keys() | reference_call["arguments"].keys()
                 if not areal_v2.typed_equal(candidate["arguments"].get(key), reference_call["arguments"].get(key))
             ]
-            if not any(
+            if not getattr(self, "recovery_r1", False) and not any(
                 key.endswith(("_id", "_ids")) or isinstance(reference_call["arguments"].get(key), (int, float, bool))
                 for key in changed
             ):
@@ -557,6 +576,16 @@ class Boundary:
         result = self.execute(shadow, candidate)
         failing = self.failed(result)
         if failing:
+            if getattr(self, "recovery_r1", False):
+                return {
+                    "status": "candidate",
+                    "error_kind": error_kind,
+                    "gold": reference_call,
+                    "native": good,
+                    "consent": consent,
+                    "witness": "structural_write_mismatch_and_native_error",
+                    "bad_native_result": result.content,
+                }
             return {
                 "status": "hold",
                 "reason": "native_write_error_K3_deferred_needs_structural_witness",

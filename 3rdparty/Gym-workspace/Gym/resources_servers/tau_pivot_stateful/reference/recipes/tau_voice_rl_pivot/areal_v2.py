@@ -117,6 +117,10 @@ def evaluate(
     gates. consent_check checks a proposed question, never grants actual consent.
     The eligibility proof and actual prior consent are fixed when mining.
     """
+    if spec.get("contract") == "G5-INBOX36-R1":
+        from recipes.tau_voice_rl_pivot.areal_r1 import evaluate
+
+        return evaluate(spec, output, native_check=native_check, consent_check=consent_check)
     kind = spec.get("error_kind")
     shape, value = one_turn(output)
     proof = spec.get("eligibility", {})

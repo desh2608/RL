@@ -191,3 +191,23 @@ question-offer witness and clean yes. Wrong/missing lookups and premature closes
 use the due read as their target. A missing reference anchor fails closed. New
 candidate states and controls must be replayed under this version before audit;
 no G5 training bundle is accepted yet.
+
+### G5 INBOX36 recovery R1 (candidate contract)
+
+New mining explicitly constructs `Boundary(..., recovery_r1=True)` and specs
+with `contract: G5-INBOX36-R1`. Earlier cached/spec versions keep their prior
+behavior. Remaining writes are matched as a set; native execution and remaining
+completion establish readiness in the actual state. A K6 write requires no exact
+remaining match, unavailable public arguments, and a public native lookup that
+supplies the intended target. K1 has no remaining matching write tool; K2 has
+matching tool/target, wrong arguments, and a native consequence.
+
+K5 additionally requires the offer to identify the exact order/reservation or
+explicitly the profile/default address, with every gold argument public. K7 is
+intentionally lenient: one nonempty spoken message or a call equal to any remaining
+gold step, with no end/transfer. It does not validate spoken factual content.
+
+B0 identifier-misrecognition K6 records carry `audio_only=true`; the default text
+pool excludes them. Keep inclusive and text counts separately. INBOX36 suspends
+kind-cap/training selection; audit candidates are not a released training bundle.
+New native/HTTP qualification and strategist audit are required before publication.
