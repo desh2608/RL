@@ -180,3 +180,17 @@ def test_k4_recomputes_given_consent_despite_stale_false_label():
     assert verifier.evaluate(boundary, message("Shall I cancel order #A1?"), consent_check=check)["reward"] == 0
     del boundary["eligibility"]["consent_context"]
     assert verifier.evaluate(boundary, message("Shall I cancel order #A1?"), consent_check=check)["reward"] == 0
+
+
+def test_k4_native_amount_cue_blocks_a_stale_missing_consent_label():
+    boundary = spec("K4")
+    boundary["eligibility"]["native_amount"] = "13.36"
+    boundary["eligibility"]["consent_context"] = [
+        {"type": "message", "role": "assistant", "content": "The $13.36 refund. Shall I proceed?"},
+        {"type": "message", "role": "user", "content": "Yes"},
+    ]
+
+    def must_not_grade(_):
+        raise AssertionError("A prior yes must stop K4 before content grading")
+
+    assert verifier.evaluate(boundary, message("Do you confirm?"), consent_check=must_not_grade)["reward"] == 0

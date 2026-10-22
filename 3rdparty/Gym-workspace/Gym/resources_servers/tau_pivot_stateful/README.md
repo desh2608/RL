@@ -138,7 +138,9 @@ There is no approved `v2-areal` bundle yet.
 
 The `desh/areal-pivot-v2` branch remains a draft, with no replacement training
 bundle. `reference/recipes/tau_voice_rl_pivot/consent_given.py` decides actual
-prior consent independently of SDG content grades. K4 rechecks the fixed public
+prior consent independently of SDG content grades. Identifying cues include public native
+tool descriptions and native posting amounts, with exact decimal boundaries.
+A posting amount is a fact, never an SDG C3 consent decision. K4 rechecks the fixed public
 context during scoring; a stale false label cannot authorize a re-ask after yes.
 K5 requires an actual question/request, not a declarative "To confirm" readback.
 

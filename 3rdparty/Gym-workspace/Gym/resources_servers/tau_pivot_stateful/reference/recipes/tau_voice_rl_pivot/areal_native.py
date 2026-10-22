@@ -8,7 +8,11 @@ writes require explicit handling; a raw mismatch is never a certificate.
 """
 
 import copy
+import json
+import re
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from recipes.tau_voice_rl_pivot import areal_v2, replay_five
 from recipes.tau_voice_rl_pivot.consent_given import detect, is_reask
@@ -17,7 +21,7 @@ from recipes.tau_voice_rl_pivot.consent_given import detect, is_reask
 class Boundary:
     """A native task environment and complete remaining gold action ledger."""
 
-    def __init__(self, raw: dict, frozen: Path):
+    def __init__(self, raw: dict, frozen: Path) -> None:
         from recipes.tau_voice_sdg.areal_gold_replay import constructor
         from recipes.tau_voice_sdg.areal_step_verifier import delta
         from tau2.data_model.tasks import InitialState, Task
@@ -56,7 +60,7 @@ class Boundary:
         self.task = task
 
     @staticmethod
-    def execute(env, call: dict):
+    def execute(env: Any, call: dict) -> Any:
         from tau2.data_model.message import ToolCall
 
         return env.get_response(
@@ -69,7 +73,7 @@ class Boundary:
         )
 
     @staticmethod
-    def failed(result) -> bool:
+    def failed(result: Any) -> bool:
         return bool(result.error or str(result.content).lower().startswith(("error:", "error ")))
 
     def tool_type(self, call: dict) -> str:
@@ -163,6 +167,26 @@ class Boundary:
     def consent_required(self, call: dict) -> bool:
         return self.tool_type(call) == "write" and (self.domain != "telecom" or call["name"] == "refuel_data")
 
+    def charge(self, call: dict, native_result: str | None) -> str | None:
+        """Compute an identifying amount from native result postings only."""
+        try:
+            result = json.loads(native_result) if native_result else None
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            return None
+        if call["name"] == "exchange_delivered_order_items":
+            value = result.get("exchange_price_difference")
+            return str(abs(value)) if value is not None else None
+        if call["name"] == "send_certificate":
+            return str(call["arguments"]["amount"])
+        before = replay_five.state_of(self.env)["agent"]
+        key = call["arguments"].get("reservation_id", call["arguments"].get("order_id"))
+        collection = "reservations" if "reservation_id" in call["arguments"] else "orders"
+        old = before.get(collection, {}).get(key, {})
+        new_payments = result.get("payment_history", [])[len(old.get("payment_history", [])) :]
+        return str(sum(abs(Decimal(str(payment["amount"]))) for payment in new_payments)) if new_payments else None
+
     def inspect(self, output: list[dict], prefix: list[dict]) -> dict:
         """Propose supported boundaries; separate holds from proved failures.
 
@@ -176,9 +200,12 @@ class Boundary:
             for gold in self.remaining():
                 if gold["requestor"] != "assistant" or self.tool_type(gold) != "write":
                     continue
-                consent = detect(prefix, gold)
-                if consent["valid_prior_consent"] and is_reask(candidate, gold):
-                    native = self.native_check(gold)
+                if not ("?" in candidate or re.search(r"(?:^|[.!]\s*)(?:please )?confirm\b", candidate, re.I)):
+                    continue
+                native = self.native_check(gold)
+                amount = self.charge(gold, native.get("native_result"))
+                consent = detect(prefix, gold, native_amount=amount)
+                if consent["valid_prior_consent"] and is_reask(candidate, gold, prefix=prefix, native_amount=amount):
                     if native["feasible"]:
                         return {
                             "status": "candidate",
@@ -205,7 +232,7 @@ class Boundary:
             # A native exception or exact gold mismatch alone is insufficient
             # for K1/K2/K3. Do not mis-certify these as missing consent.
             return {"status": "hold", "reason": "write_needs_kind_specific_error_witness", "native": native}
-        consent = detect(prefix, candidate)
+        consent = detect(prefix, candidate, native_amount=self.charge(candidate, native.get("native_result")))
         if self.consent_required(candidate) and not consent["valid_prior_consent"]:
             return {
                 "status": "candidate",
@@ -242,7 +269,7 @@ class Boundary:
         good = self.native_check(reference_call)
         if not good["feasible"]:
             return {"status": "hold", "reason": "reference_not_native_feasible", "native": good}
-        consent = detect(prefix, reference_call)
+        consent = detect(prefix, reference_call, native_amount=self.charge(reference_call, good.get("native_result")))
         authorized = not self.consent_required(reference_call) or consent["valid_prior_consent"]
         if areal_v2.typed_equal(candidate, reference_call):
             return self.inspect(output, prefix)

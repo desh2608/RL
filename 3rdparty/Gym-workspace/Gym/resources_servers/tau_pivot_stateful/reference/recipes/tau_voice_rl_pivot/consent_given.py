@@ -9,6 +9,7 @@ linguistic detector, not a native-prefix certificate or a policy checker.
 
 import json
 import re
+from decimal import Decimal
 from typing import Any
 
 
@@ -76,14 +77,80 @@ def leaves(value: Any) -> list[str]:
     return [str(value)] if isinstance(value, (str, int, float)) and not isinstance(value, bool) else []
 
 
-def offer_witness(offer: str, gold: dict) -> dict:
+def public_details(messages: list[dict], gold: dict) -> list[str]:
+    """Read identifying descriptions from public native tool results only."""
+    targets = {value for value in leaves(gold.get("arguments", {})) if value}
+    details = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, dict):
+            if any(
+                str(value.get(key, "")) in targets
+                for key in ("id", "item_id", "order_id", "reservation_id", "line_id", "user_id", "customer_id")
+            ):
+                for key in (
+                    "name",
+                    "options",
+                    "first_name",
+                    "last_name",
+                    "origin",
+                    "destination",
+                    "cabin",
+                    "date",
+                    "brand",
+                    "last_four",
+                    "passengers",
+                    "flights",
+                    "payment_history",
+                ):
+                    details.update(leaves(value.get(key)))
+            for child in value.values():
+                visit(child)
+
+    for message in messages:
+        if message.get("type") != "function_call_output":
+            continue
+        value = message.get("output")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        visit(value)
+    return sorted(details)
+
+
+def amount_details(native_amount: Any) -> list[str]:
+    """Render a native posting amount as identifying text, not a C3 verdict."""
+    if native_amount is None:
+        return []
+    amount = abs(Decimal(str(native_amount)))
+    values = [
+        str(amount.normalize()),
+        format(amount, "f"),
+        format(amount, ",.2f"),
+        "$" + format(amount, "f"),
+        format(amount, "f") + " dollars",
+    ]
+    if amount == amount.to_integral_value():
+        values += [str(int(amount)), format(int(amount), ",")]
+    if amount == 0:
+        values += ["free", "no charge", "no additional charge"]
+    return values
+
+
+def offer_witness(offer: str, gold: dict, *, identifying: list[str] | None = None) -> dict:
     """Decide whether an offer grounds the intended write, with explicit evidence."""
     family = action_family(gold["name"])
     actions = [key for key, pattern in G_ACTIONS.items() if re.search(r"\b(?:" + pattern + r")\b", offer, re.I)]
     details = [
         value
-        for value in leaves(gold.get("arguments", {}))
-        if len(value) >= 2 and re.search(r"(?<!\w)" + re.escape(value).replace("_", "[ _]") + r"(?!\w)", offer, re.I)
+        for value in [*leaves(gold.get("arguments", {})), *(identifying or [])]
+        if len(value) >= 2
+        and re.search(r"(?<!\w)(?<!\d\.)" + re.escape(value).replace("_", "[ _]") + r"(?!\w|\.\d)", offer, re.I)
     ]
     # A different explicit operation is not authorized merely by sharing an ID.
     incompatible = family not in actions and bool(
@@ -127,11 +194,11 @@ def offer_witness(offer: str, gold: dict) -> dict:
     }
 
 
-def is_reask(message: str, gold: dict) -> bool:
+def is_reask(message: str, gold: dict, *, prefix: list[dict] | None = None, native_amount: Any = None) -> bool:
     """K5 needs an actual request, not a declarative 'To confirm' readback."""
-    return offer_witness(message, gold)["eligible_offer"] and bool(
-        "?" in message or re.search(r"(?:^|[.!]\s*)(?:please )?confirm\b", message, re.I)
-    )
+    return offer_witness(
+        message, gold, identifying=[*public_details(prefix or [], gold), *amount_details(native_amount)]
+    )["eligible_offer"] and bool("?" in message or re.search(r"(?:^|[.!]\s*)(?:please )?confirm\b", message, re.I))
 
 
 def changed_request(reply: str, offer: str = "") -> bool:
@@ -153,7 +220,7 @@ def changed_request(reply: str, offer: str = "") -> bool:
     return False
 
 
-def detect(messages: list[dict], gold: dict) -> dict:
+def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> dict:
     """Find surviving consent in the current write segment.
 
     A committed identical write closes the segment; a different write in a
@@ -162,6 +229,7 @@ def detect(messages: list[dict], gold: dict) -> dict:
     not. The next *caller* turn must affirm the immediately preceding spoken
     offer; intervening tool results do not manufacture an affirmative.
     """
+    identifying = [*public_details(messages, gold), *amount_details(native_amount)]
     witness = None
     pending = None
     attempts = []
@@ -179,7 +247,7 @@ def detect(messages: list[dict], gold: dict) -> dict:
             resets.append({"index": index, "reason": "intervening_write"})
         role = message.get("role")
         if role == "assistant" and text(message):
-            candidate = offer_witness(text(message), gold)
+            candidate = offer_witness(text(message), gold, identifying=identifying)
             pending = {"offer_index": index, "offer": text(message), **candidate}
         elif role == "user":
             reply = text(message)

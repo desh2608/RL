@@ -55,7 +55,7 @@ class ConsentContent:
         native_result: str,
         checker_root: Path,
         checker_files: dict,
-    ):
+    ) -> None:
         if domain not in {"airline", "retail", "telecom"}:
             raise ValueError("Unsupported consent domain")
         self.domain = domain

@@ -112,7 +112,7 @@ def evaluate(
     target = spec.get("gold")
     consent = None
     if isinstance(context, list) and isinstance(target, dict) and isinstance(target.get("name"), str):
-        consent = detect(context, target)["valid_prior_consent"]
+        consent = detect(context, target, native_amount=proof.get("native_amount"))["valid_prior_consent"]
     # Recompute from the fixed public boundary. A stale miner boolean cannot
     # override an actual confirmation and yes, even with perfect content gates.
     consent_agrees = consent is not None and consent is proof.get("valid_prior_consent")

@@ -117,3 +117,18 @@ def test_k5_requires_an_actual_reask():
     assert is_reask("Shall I update ABC123?", G_GOLD)
     assert is_reask("Please confirm the change to ABC123.", G_GOLD)
     assert not is_reask("To confirm: ABC123 will change to business class.", G_GOLD)
+
+
+def test_native_amount_or_public_item_name_identifies_the_write():
+    offer = [msg("assistant", "The $13.36 refund to your card. Shall I proceed?"), msg("user", "Yes")]
+    assert not detect(offer, G_GOLD)["valid_prior_consent"]
+    assert detect(offer, G_GOLD, native_amount="13.36")["valid_prior_consent"]
+    assert not detect(offer, G_GOLD, native_amount="19.36")["valid_prior_consent"]
+    assert not detect(offer, G_GOLD, native_amount="13")["valid_prior_consent"]
+    assert detect([msg("assistant", "$5. Confirm?"), msg("user", "Yes")], G_GOLD, native_amount="5")[
+        "valid_prior_consent"
+    ]
+    gold = {"name": "exchange_delivered_order_items", "arguments": {"item_ids": ["12345"]}}
+    prefix = [{"type": "function_call_output", "output": '{"items":[{"item_id":"12345","name":"Coffee Maker"}]}'}]
+    prefix += [msg("assistant", "The Coffee Maker. Confirm?"), msg("user", "Yes")]
+    assert detect(prefix, gold)["valid_prior_consent"]
