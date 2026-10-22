@@ -161,6 +161,14 @@ def offer_witness(offer: str, gold: dict, *, identifying: list[str] | None = Non
             re.I,
         )
     )
+    # Flight and baggage writes share a reservation ID and the broad update
+    # family. An offer for one must not authorize an unoffered add-on write.
+    bags = bool(re.search(r"\b(?:bags?|baggage|luggage)\b", offer, re.I))
+    flights = bool(re.search(r"\b(?:flights?|cabin|economy|business|departure|outbound|upgrade)\b|\bchang(?:e|ing) to\b", offer, re.I))
+    if gold["name"] == "update_reservation_baggages" and flights and not bags:
+        incompatible = True
+    if gold["name"] == "update_reservation_flights" and bags and not flights:
+        incompatible = True
     non_write_question = bool(
         re.search(
             r"\b(?:may|shall|can|could|should) (?:I|we) (?:explain|list|show|search|check|ask|verify)\b[^?]*\?",

@@ -143,3 +143,16 @@ def test_native_amount_or_public_item_name_identifies_the_write():
 def test_fable_turn48_audit(case):
     actual = detect(case["messages"], case["gold"], native_amount=case["native_amount"])
     assert actual["valid_prior_consent"] == case["expected"], actual
+
+
+def test_addon_has_its_own_consent_scope():
+    flight = {"name": "update_reservation_flights", "arguments": {"reservation_id": "ABC123"}}
+    bags = {"name": "update_reservation_baggages", "arguments": {"reservation_id": "ABC123", "total_baggages": 2}}
+    prefix = [
+        msg("assistant", "May I change the flight on ABC123?"),
+        msg("user", "Yes, and please add the checked bags."),
+    ]
+    assert detect(prefix, flight)["valid_prior_consent"]
+    assert not detect(prefix, bags)["valid_prior_consent"]
+    prefix += [msg("assistant", "Shall I add two checked bags to ABC123?"), msg("user", "Yes, please.")]
+    assert detect(prefix, bags)["valid_prior_consent"]
