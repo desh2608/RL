@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Consent given is independent of detailed SDG readback quality."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -132,3 +133,13 @@ def test_native_amount_or_public_item_name_identifies_the_write():
     prefix = [{"type": "function_call_output", "output": '{"items":[{"item_id":"12345","name":"Coffee Maker"}]}'}]
     prefix += [msg("assistant", "The Coffee Maker. Confirm?"), msg("user", "Yes")]
     assert detect(prefix, gold)["valid_prior_consent"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    json.loads((Path(__file__).parent / "consent_audit_turn48.json").read_text()),
+    ids=lambda c: f"{c['audit_side']}-{c['audit_index']}",
+)
+def test_fable_turn48_audit(case):
+    actual = detect(case["messages"], case["gold"], native_amount=case["native_amount"])
+    assert actual["valid_prior_consent"] == case["expected"], actual

@@ -274,3 +274,25 @@ a confirmed batch does not erase permission for the remaining members.
 This fix does not complete G5 certification. The draft K3 lexical refusal scorer
 still fails adversarial cases, and ambiguous or mismatched native sources remain
 held. No G5 training bundle has been published.
+
+
+## 2026-10-22 — G5 INBOX33: affirmative restatements and source traces
+
+The independent detector missed 16 of Fable's 30 not-given cases because it
+read restated action verbs as changed requests and required an interrogative
+offer. It now recognizes grounded yes/no offers and an explicit go-ahead after
+stated write details. A separate add-on does not erase assent for the original
+write. All 60 Fable-labelled audit cases are checked as regression fixtures.
+
+Choice, reason and payment answers do not provide new consent. Information-only
+answers after a prior assent have an explicit uncertainty hold: they cannot
+produce a K4-positive re-ask, even if a stale miner supplies a false boolean.
+This protects the consent hard gate while the remaining segment ambiguity is
+independently audited. The v3.2 content graders are unchanged.
+
+K3 is deferred, and its versioned evaluator always returns zero. Native mining
+preserves these sources as holds. Native reference replacement witnesses for
+K1/K2, wrong-ID lookup errors for K6, and executable continuation for K7 are
+candidates pending full controls/audit. B0 uses the T20 prompt; caller rewrites
+are recorded, while any tool-call argument or result byte difference is held.
+No replacement G5 training bundle is yet accepted or published.

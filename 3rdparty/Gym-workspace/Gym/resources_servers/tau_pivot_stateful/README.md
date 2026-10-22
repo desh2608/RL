@@ -163,3 +163,15 @@ battery found five false accepts in the draft lexical scorer. Full mining,
 K1/K2/K3/K6/K7 native/control coverage, balanced selection, per-kind signal,
 and the final bundle remain pending. Pilot and hard-gate receipts in the worklog
 are narrower than these acceptance gates.
+
+### G5 INBOX33 checkpoint (turn49)
+
+The independent consent detector now has all 60 Fable turn48 labels as tests.
+It supports affirmative action restatements, detail-grounded offers, explicit
+caller go-ahead and separately scoped add-ons. Information answers after earlier
+assent carry an uncertainty hold; they cannot earn a K4-positive re-ask. The
+pinned content graders remain unchanged. K3 is deferred and always scores zero.
+
+Full native mining is a separate frozen CPU job, not an accepted dataset. B0
+prompts use T20 caller text; a tool-call or result byte difference remains a
+source hold. Original v1 data and the shared verifier branch are unchanged.

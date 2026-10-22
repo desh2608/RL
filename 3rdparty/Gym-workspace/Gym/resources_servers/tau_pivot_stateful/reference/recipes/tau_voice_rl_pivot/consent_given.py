@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""G5 INBOX31 consent eligibility, independent of SDG content grading.
+"""G5 INBOX33 consent eligibility, independent of SDG content grading.
 
 Consumes public Responses messages only. A witness identifies the offer, its
 next caller response, and its action/detail grounding. This is a deterministic
@@ -23,7 +23,7 @@ G_ACTIONS = {
 }
 G_OFFER = re.compile(
     r"\b(?:shall|may|can|could|should|would)\s+(?:I|we)\b|"
-    r"\b(?:do|would) you (?:like|want|agree|approve|confirm)|"
+    r"\b(?:do|would) you (?:like|want|agree|approve|confirm)|\bwant (?:me to|to)|"
     r"\b(?:please confirm|can you confirm|confirm\s*\?|proceed\s*\?|okay\s*\?|ok\s*\?|"
     r"is (?:that|this|everything) (?:correct|right|okay|ok)|does (?:that|this) (?:sound|look)|"
     r"go ahead\s*\?|confirm\b|are you (?:okay|ok|ready)|would that work|do you (?:confirm|authorize))",
@@ -31,7 +31,7 @@ G_OFFER = re.compile(
 )
 G_AFFIRM = re.compile(
     r"^\s*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|correct|confirmed|absolutely|affirmative|"
-    r"sounds good|that's (?:right|correct|fine)|that is (?:right|correct|fine)|"
+    r"sounds good|that works|that sounds (?:good|right)|confirm|that['’]s (?:right|correct|fine)|that is (?:right|correct|fine)|"
     r"please (?:do|proceed|go ahead)|go ahead|proceed|I (?:confirm|agree|approve))\b",
     re.I,
 )
@@ -176,7 +176,7 @@ def offer_witness(offer: str, gold: dict, *, identifying: list[str] | None = Non
             target_mismatch = True
     grounded = family in actions or bool(details)
     return {
-        "is_offer": bool(G_OFFER.search(offer)),
+        "is_offer": bool(G_OFFER.search(offer)) or ("?" in offer and grounded and not G_CHOICE.search(offer)),
         "choice": bool(G_CHOICE.search(offer)),
         "action_family": family,
         "matched_actions": actions,
@@ -185,7 +185,7 @@ def offer_witness(offer: str, gold: dict, *, identifying: list[str] | None = Non
         "grounded": grounded,
         "non_write_question": non_write_question,
         "target_mismatch": target_mismatch,
-        "eligible_offer": bool(G_OFFER.search(offer))
+        "eligible_offer": (bool(G_OFFER.search(offer)) or ("?" in offer and grounded))
         and grounded
         and not incompatible
         and not G_CHOICE.search(offer)
@@ -201,21 +201,39 @@ def is_reask(message: str, gold: dict, *, prefix: list[dict] | None = None, nati
     )["eligible_offer"] and bool("?" in message or re.search(r"(?:^|[.!]\s*)(?:please )?confirm\b", message, re.I))
 
 
-def changed_request(reply: str, offer: str = "") -> bool:
-    """Ignore assent restatements; retain new dates/items/amounts as changes."""
-    if not G_CHANGE.search(reply):
+def assent_clause(reply: str) -> str:
+    """The affirmative clause may follow an emotional preamble; additions are separate."""
+    parts = re.split(r"(?<=[.!?])\s+", reply)
+    for part in parts:
+        if G_AFFIRM.search(part) or re.search(r"\b(?:yes|please go ahead|please proceed)\b", part, re.I):
+            return re.split(r"\band\s+(?:also|please add)|\bAlso\b", part, maxsplit=1, flags=re.I)[0]
+    return parts[0] if parts else reply
+
+
+def explicit_instruction(reply: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:please\s+)?(?:go ahead|proceed|make that change)\b|\bplease\s+(?:switch|cancel|change|update|add|modify|exchange|return)\b",
+            reply,
+            re.I,
+        )
+    )
+
+
+def changed_request(reply: str, offer: str = "", gold: dict | None = None) -> bool:
+    """Restated verbs are assent; a correction or new target is not."""
+    clause = assent_clause(reply)
+    if not G_CHANGE.search(clause):
         return False
-    # Restating the offered operation is assent. New quantities, identifiers,
-    # subjects or an additional operation are changes, even after "yes".
-    if re.search(r"\b(?:also|another|now|new|instead|different)\b", reply, re.I):
+    if re.search(r"\b(?:another|instead|different|other card|make it|change the date)\b", clause, re.I):
         return True
-    salient = re.findall(r"\b(?:\w*\d\w*|bags?|dates?|cabins?|passengers?|items?|payment|address|card)\b", reply, re.I)
-    if any(not re.search(r"\b" + re.escape(word) + r"\b", offer, re.I) for word in salient):
-        return True
-    for pattern in G_ACTIONS.values():
-        if re.search(r"\b(?:" + pattern + r")\b", reply, re.I) and not re.search(
-            r"\b(?:" + pattern + r")\b", offer, re.I
-        ):
+    # Only concrete new values contradict an offer. Generic action/card nouns
+    # are restatements, and native target IDs may be repeated after 'that one'.
+    allowed = offer + " " + " ".join(leaves((gold or {}).get("arguments", {})))
+    normalize = lambda value: re.sub(r"\W|_", "", value).lower()
+    allowed = normalize(allowed)
+    for token in re.findall(r"\b[A-Za-z_]*\d[A-Za-z_\d:.-]*\b", clause):
+        if normalize(token) not in allowed:
             return True
     return False
 
@@ -231,6 +249,7 @@ def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> di
     """
     identifying = [*public_details(messages, gold), *amount_details(native_amount)]
     witness = None
+    uncertain = None
     pending = None
     attempts = []
     resets = []
@@ -243,7 +262,7 @@ def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> di
             except ValueError:
                 arguments = None
         if message.get("type") == "function_call" and name == gold["name"] and arguments == gold.get("arguments"):
-            witness = pending = None
+            witness = pending = uncertain = None
             resets.append({"index": index, "reason": "intervening_write"})
         role = message.get("role")
         if role == "assistant" and text(message):
@@ -251,17 +270,56 @@ def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> di
             pending = {"offer_index": index, "offer": text(message), **candidate}
         elif role == "user":
             reply = text(message)
-            affirmative = (
-                bool(G_AFFIRM.search(reply))
-                and not G_VETO.search(reply)
-                and not changed_request(reply, pending["offer"] if pending else "")
+            clause = assent_clause(reply)
+            offer = pending["offer"] if pending else ""
+            changed = changed_request(reply, offer, gold)
+            reason_reply = bool(re.search(r"\breason\b", offer, re.I)) and bool(
+                re.fullmatch(r"(?:both (?:are )?)?no longer needed[.!]?", reply.strip(), re.I)
+            )
+            veto = bool(G_VETO.search(clause)) and not reason_reply
+            instruction = explicit_instruction(clause)
+            affirmative = (bool(G_AFFIRM.search(clause)) or instruction) and not veto and not changed
+            # Details stated in a proposal followed by explicit go-ahead suffice.
+            # A plain choice/payment/reason answer never supplies permission.
+            contextual = bool(
+                pending
+                and pending["grounded"]
+                and not pending["incompatible_action"]
+                and not pending["target_mismatch"]
+                and not pending["non_write_question"]
+            )
+            proposal = bool(
+                re.search(
+                    r"\b(?:would cost|new total|refund amount|costs? .*more|adding .*cost|before I|once I)\b",
+                    offer,
+                    re.I,
+                )
+            )
+            direct = contextual and (instruction or proposal)
+            # An unresolved choice invalidates earlier assent; an explicit
+            # instruction after making that choice is itself a new go-ahead.
+            choice_answer = bool(
+                pending
+                and (pending["choice"] or re.search(r"\b(?:reason for|need a reason|what.*reason)\b", offer, re.I))
+                and not instruction
             )
             if pending is not None:
                 attempt = {**pending, "reply_index": index, "reply": reply, "clean_affirmative": affirmative}
                 attempts.append(attempt)
-                if pending["eligible_offer"] and affirmative:
+                if (pending["eligible_offer"] or direct) and affirmative and not choice_answer:
                     witness = attempt
-            if G_VETO.search(reply) or changed_request(reply, pending["offer"] if pending else ""):
+                    uncertain = None
+            reason_answer = bool(re.search(r"\b(?:reason for|need a reason|what.*reason)\b", offer, re.I))
+            choice_resets = choice_answer and (reason_answer or not witness or not witness["eligible_offer"])
+            if choice_resets and witness is not None and not veto and not changed:
+                uncertain = {
+                    "prior_witness": witness,
+                    "reply_index": index,
+                    "reason": "information_answer_after_prior_assent_requires_audit",
+                }
+            if veto or changed:
+                uncertain = None
+            if veto or changed or choice_resets:
                 if witness is not None:
                     resets.append({"index": index, "reason": "caller_change_or_withdrawal", "text": reply})
                 witness = None
@@ -269,7 +327,8 @@ def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> di
     return {
         "valid_prior_consent": witness is not None,
         "witness": witness,
+        "uncertain_prior_consent": uncertain,
         "attempts": attempts,
         "resets": resets,
-        "detector_contract": "G5-INBOX31",
+        "detector_contract": "G5-INBOX33",
     }

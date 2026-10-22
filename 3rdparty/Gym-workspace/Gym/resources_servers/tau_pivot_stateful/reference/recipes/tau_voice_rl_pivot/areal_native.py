@@ -58,6 +58,7 @@ class Boundary:
         self.criteria = task["evaluation_criteria"]
         self.initial_db_sha256 = source["db_sha256"]
         self.task = task
+        self._native_cache = {}
 
     @staticmethod
     def execute(env: Any, call: dict) -> Any:
@@ -87,6 +88,13 @@ class Boundary:
         return [g for g in self.gold if not g["done"]]
 
     def native_check(self, call: dict) -> dict:
+        """Reuse immutable feasibility results only within one replay boundary."""
+        key = json.dumps(call, sort_keys=True)
+        if key not in self._native_cache:
+            self._native_cache[key] = self._native_check_uncached(call)
+        return copy.deepcopy(self._native_cache[key])
+
+    def _native_check_uncached(self, call: dict) -> dict:
         """Execute on a copy and prove the remaining task can still complete."""
         from recipes.tau_voice_sdg.areal_step_verifier import delta
 
@@ -145,6 +153,7 @@ class Boundary:
 
     def replay_call(self, call: dict, recorded: str) -> dict:
         """Commit a recorded prefix call only after exact native result parity."""
+        self._native_cache.clear()
         result = self.execute(self.env, call)
         if result.content != recorded:
             raise ValueError("Recorded tool result differs from native replay: " + call["name"])
@@ -219,6 +228,16 @@ class Boundary:
         kind = self.tool_type(candidate)
         if candidate["name"] in areal_v2.G_CLOSE_TOOLS:
             remaining = [g for g in self.remaining() if g["requestor"] == "assistant"]
+            targets = []
+            for gold in remaining:
+                if self.tool_type(gold) != "write":
+                    continue
+                good = self.native_check(gold)
+                given = detect(prefix, gold, native_amount=self.charge(gold, good.get("native_result")))
+                if good["feasible"] and given["valid_prior_consent"]:
+                    targets.append(gold)
+            if len(targets) == 1:
+                return self.inspect_student(output, prefix, {key: targets[0][key] for key in ("name", "arguments")})
             return {
                 "status": "hold" if remaining else "continue",
                 "reason": "K7_needs_current_request_continuation_witness" if remaining else "no_gold_remaining",
@@ -229,11 +248,32 @@ class Boundary:
             return {"status": "hold", "reason": "unknown_tool_type"}
         native = self.native_check(candidate)
         if not native["feasible"]:
+            # A surviving confirmation identifies a current requested write.
+            # Only one such executable target is allowed; multiple possibilities
+            # and policy-error outputs remain holds rather than guessed labels.
+            targets = []
+            for gold in self.remaining():
+                if gold["requestor"] != "assistant" or self.tool_type(gold) != "write":
+                    continue
+                feasible = self.native_check(gold)
+                given = detect(prefix, gold, native_amount=self.charge(gold, feasible.get("native_result")))
+                if feasible["feasible"] and given["valid_prior_consent"]:
+                    targets.append(gold)
+            if len(targets) == 1:
+                target = {key: targets[0][key] for key in ("name", "arguments")}
+                return self.inspect_student(output, prefix, target)
             # A native exception or exact gold mismatch alone is insufficient
             # for K1/K2/K3. Do not mis-certify these as missing consent.
             return {"status": "hold", "reason": "write_needs_kind_specific_error_witness", "native": native}
         consent = detect(prefix, candidate, native_amount=self.charge(candidate, native.get("native_result")))
         if self.consent_required(candidate) and not consent["valid_prior_consent"]:
+            if consent.get("uncertain_prior_consent"):
+                return {
+                    "status": "hold",
+                    "reason": "prior_assent_then_information_answer_requires_audit",
+                    "consent": consent,
+                    "native": native,
+                }
             return {
                 "status": "candidate",
                 "error_kind": "K4",
@@ -250,7 +290,7 @@ class Boundary:
         A remaining alternative gold action is held rather than treated as an
         error. Only native effects that differ from completing the intended
         reference step support K1/K2; inconsequential argument differences stay
-        held. K3 remains blocked by its separate adversarial gate.
+        held. K3 source contexts remain deferred under INBOX33.
         """
         shape, candidate = areal_v2.one_turn(output)
         if reference_call is None or shape != "call":
@@ -290,6 +330,33 @@ class Boundary:
                     "witness": "executable_current_reference_continues",
                 }
             return {"status": "hold", "reason": "reference_write_needs_consent"}
+        if self.tool_type(reference_call) in {"read", "auth"} and self.tool_type(candidate) in {"read", "auth"}:
+            # A non-reference or differently ordered read is ordinarily valid.
+            # Admit only a same-tool wrong identifier, a visible correct ID,
+            # and an actual native lookup error. No commuting-read inference.
+            if candidate["name"] == reference_call["name"]:
+                changed_ids = [
+                    key
+                    for key, value in reference_call["arguments"].items()
+                    if key.endswith("_id") and not areal_v2.typed_equal(value, candidate["arguments"].get(key))
+                ]
+                caller_text = " ".join(str(m.get("content", "")) for m in prefix if m.get("role") == "user")
+                grounded = changed_ids and all(
+                    str(reference_call["arguments"][key]) in caller_text for key in changed_ids
+                )
+                bad = self.execute(copy.deepcopy(self.env), candidate)
+                if grounded and self.failed(bad):
+                    return {
+                        "status": "candidate",
+                        "error_kind": "K6",
+                        "gold": reference_call,
+                        "native": good,
+                        "consent": consent,
+                        "bad_native_result": bad.content,
+                        "witness": "caller_identifier_and_native_lookup_error",
+                        "changed_id_fields": changed_ids,
+                    }
+            return {"status": "hold", "reason": "alternative_read_without_error_witness"}
         if not authorized or self.tool_type(reference_call) != "write" or self.tool_type(candidate) != "write":
             return {"status": "hold", "reason": "read_alternative_or_unauthorized_reference"}
         # S1: open-string-only changes (for example cancellation reasons) are
@@ -312,6 +379,13 @@ class Boundary:
         shadow = copy.deepcopy(self.env)
         result = self.execute(shadow, candidate)
         failing = self.failed(result)
+        if failing:
+            return {
+                "status": "hold",
+                "reason": "native_write_error_K3_deferred_needs_structural_witness",
+                "bad_native_result": result.content,
+                "gold": reference_call,
+            }
         for gold in self.remaining():
             if gold is target:
                 continue

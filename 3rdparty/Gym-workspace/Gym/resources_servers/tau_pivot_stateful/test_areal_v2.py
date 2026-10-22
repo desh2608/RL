@@ -100,9 +100,9 @@ def test_k4_hard_gate_cannot_be_overridden_by_question_checker():
     )
 
 
-def test_k3_policy_grounding_no_calls_and_no_completion():
+def test_k3_deferred_never_rewards_lexical_refusals():
     boundary = spec("K3")
-    assert verifier.evaluate(boundary, message("I cannot modify basic economy reservations."))["reward"] == 1
+    assert verifier.evaluate(boundary, message("I cannot modify basic economy reservations."))["reward"] == 0
     for negative in [
         message("I have updated the basic economy reservation."),
         message("I cannot modify basic economy, but I have cancelled your reservation."),
@@ -194,3 +194,18 @@ def test_k4_native_amount_cue_blocks_a_stale_missing_consent_label():
         raise AssertionError("A prior yes must stop K4 before content grading")
 
     assert verifier.evaluate(boundary, message("Do you confirm?"), consent_check=must_not_grade)["reward"] == 0
+
+
+def test_information_answer_after_assent_cannot_reward_reasking():
+    boundary = spec("K4")
+    boundary["eligibility"]["consent_context"] = [
+        {"type": "message", "role": "assistant", "content": "May I cancel order #A1?"},
+        {"type": "message", "role": "user", "content": "Yes, please cancel."},
+        {"type": "message", "role": "assistant", "content": "What is the reason for cancelling?"},
+        {"type": "message", "role": "user", "content": "No longer needed."},
+    ]
+
+    def must_not_grade(_):
+        raise AssertionError("Ambiguous consent cannot create a K4-positive message")
+
+    assert verifier.evaluate(boundary, message("May I cancel order #A1?"), consent_check=must_not_grade)["reward"] == 0
