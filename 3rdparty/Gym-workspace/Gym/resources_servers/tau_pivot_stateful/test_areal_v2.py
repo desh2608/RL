@@ -281,3 +281,23 @@ def test_private_gold_lookup_arguments_do_not_become_targets():
     result = verifier.evaluate(boundary, call("find_user_id_by_name_zip", {"zip": "60614"}), native_check=forbidden)
     assert result["reward"] == 0
     assert result["predicates"]["public_read_arguments"] is False
+
+
+@pytest.mark.parametrize("kind", ["K1", "K2", "K5", "K7"])
+def test_changed_reply_cannot_authorize_the_old_gold_write(kind):
+    boundary = spec(kind)
+    boundary["gold"] = {
+        "name": "update_reservation_flights",
+        "arguments": {"reservation_id": "ABC123", "date": "2024-05-18"},
+    }
+    boundary["eligibility"]["consent_context"] = [
+        {"type": "message", "role": "assistant", "content": "Shall I change ABC123 to May 18, 2024?"},
+        {"type": "message", "role": "user", "content": "Yes, change it to May 20."},
+    ]
+    result = verifier.evaluate(
+        boundary,
+        call(boundary["gold"]["name"], boundary["gold"]["arguments"]),
+        native_check=lambda _: {"feasible": True, "step_due": True},
+    )
+    assert result["reward"] == 0
+    assert result["predicates"]["write_authorized"] is False

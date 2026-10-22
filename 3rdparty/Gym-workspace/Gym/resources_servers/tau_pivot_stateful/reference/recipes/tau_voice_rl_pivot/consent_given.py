@@ -501,6 +501,66 @@ def segment_assent(messages: list[dict], gold: dict, *, native_amount: Any = Non
     return {**segment, "assents": assents, "ignored": ignored}
 
 
+G_K5_AFFIRMATIVE = re.compile(
+    r"\s*(?:(?:yes|yeah|yep|yup|sure|ok(?:ay)?|absolutely|affirmative|confirmed|correct|"
+    r"please|proceed|go ahead|do (?:it|that)|sounds good|that works|"
+    r"that(?:['’]s| is| sounds) (?:right|good|fine|correct)|I (?:confirm|agree|approve)|"
+    r"with (?:it|that|the (?:change|update|booking|cancellation|return|exchange|upgrade))|"
+    r"thank you|thanks)\s*[,!.;:-]?\s*)+",
+    re.I,
+)
+
+
+def precise_write_witness(messages: list[dict], witness: dict | None) -> bool:
+    """A conservative permission certificate; broad K4 vetoes remain separate."""
+    if not witness or not witness["clean_affirmative"] or not G_K5_AFFIRMATIVE.fullmatch(witness["reply"]):
+        return False
+    last_user = max((i for i, message in enumerate(messages) if message.get("role") == "user"), default=-1)
+    if last_user != witness["reply_index"] or re.search(r"\bor\b", witness["offer"], re.I):
+        return False
+    family = witness["action_family"]
+    if witness["matched_actions"] and family not in witness["matched_actions"]:
+        return False
+    noun = re.search(
+        r"\bwith the (change|update|booking|cancellation|return|exchange|upgrade)\b", witness["reply"], re.I
+    )
+    noun_families = {
+        "change": "update",
+        "update": "update",
+        "upgrade": "update",
+        "booking": "book",
+        "cancellation": "cancel",
+        "return": "return",
+        "exchange": "exchange",
+    }
+    if noun and noun_families[noun.group(1).lower()] != family:
+        return False
+    permission = bool(witness["matched_actions"]) or bool(
+        re.search(
+            r"\b(?:shall|may|can|could|should|would) (?:I|we) (?:proceed|go ahead|do (?:it|that))\b|"
+            r"\b(?:proceed|go ahead)\s*\?",
+            witness["offer"],
+            re.I,
+        )
+    )
+    if "?" in witness["offer"]:
+        return witness["eligible_offer"] and permission
+    return (
+        witness["grounded"]
+        and not witness["incompatible_action"]
+        and not witness["target_mismatch"]
+        and not witness["non_write_question"]
+        and explicit_instruction(witness["reply"])
+    )
+
+
+def precise_k5_witness(messages: list[dict], witness: dict | None) -> bool:
+    """K5 additionally excludes permission given after a declarative proposal."""
+    return bool(
+        witness and witness["eligible_offer"] and "?" in witness["offer"] and precise_write_witness(messages, witness)
+    )
+
+
 def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> dict:
     """Keep turn49 positive witnesses; add the asymmetric INBOX34 K4 veto.
 
@@ -525,21 +585,14 @@ def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> di
         label = "hold"
     else:
         label = "K4_candidate"
-    k5 = bool(
-        result["valid_prior_consent"]
-        and label == "given"
-        and witness
-        and witness["eligible_offer"]
-        and "?" in witness["offer"]
-        and witness["clean_affirmative"]
-        and "?" not in witness["reply"]
-    )
+    authorized = bool(result["valid_prior_consent"] and label == "given" and precise_write_witness(messages, witness))
+    k5 = bool(authorized and precise_k5_witness(messages, witness))
     return {
         **result,
         "detector_contract": "G5-INBOX35",
         "write_segment": guard,
         "consent_label": label,
         "k4_eligible": label == "K4_candidate" and not relevant,
-        "authorized_prior_consent": result["valid_prior_consent"] and label == "given",
+        "authorized_prior_consent": authorized,
         "k5_eligible": k5,
     }

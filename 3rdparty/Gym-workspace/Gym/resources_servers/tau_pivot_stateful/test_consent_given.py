@@ -285,3 +285,29 @@ def test_negation_of_plan_change_does_not_hide_refuel_assent():
 )
 def test_inbox35_k5_requires_question_offer(offer, reply, expected):
     assert detect([msg("assistant", offer), msg("user", reply)], G_GOLD)["k5_eligible"] is expected
+
+
+def test_k5_never_uses_numeric_substring_to_accept_a_changed_date():
+    gold = {"name": "update_reservation_flights", "arguments": {"reservation_id": "ABC123", "date": "2024-05-18"}}
+    prefix = [msg("assistant", "Shall I change ABC123 to May 18, 2024?"), msg("user", "Yes, change it to May 20.")]
+    assert not detect(prefix, gold)["k5_eligible"]
+
+
+def test_k5_does_not_traverse_a_later_caller_change():
+    prefix = [
+        msg("assistant", "Shall I update ABC123?"),
+        msg("user", "Yes, please proceed."),
+        msg("assistant", "Let me check that."),
+        msg("user", "Move it to May 20."),
+    ]
+    assert not detect(prefix, G_GOLD)["k5_eligible"]
+
+
+def test_identity_question_is_not_k5_write_permission():
+    prefix = [msg("assistant", "Is reservation ABC123 correct?"), msg("user", "Yes")]
+    assert not detect(prefix, G_GOLD)["k5_eligible"]
+
+
+def test_canonical_affirmative_cannot_switch_the_action_noun():
+    prefix = [msg("assistant", "Shall I update ABC123?"), msg("user", "Yes, proceed with the cancellation.")]
+    assert not detect(prefix, G_GOLD)["authorized_prior_consent"]

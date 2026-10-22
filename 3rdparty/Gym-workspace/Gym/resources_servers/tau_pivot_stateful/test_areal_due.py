@@ -211,4 +211,4 @@ def test_weak_go_ahead_reask_stops_prefix_without_creating_k5():
     ]
     result = value.inspect([{"type": "message", "role": "assistant", "content": "Shall I cancel order #A1?"}], prefix)
     assert result["status"] == "hold"
-    assert result["reason"] == "K5_precision_excludes_go_ahead_only"
+    assert result["reason"] == "K5_precision_witness_not_certifiable"

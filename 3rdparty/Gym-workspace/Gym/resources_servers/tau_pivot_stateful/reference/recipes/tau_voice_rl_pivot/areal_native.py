@@ -361,7 +361,7 @@ class Boundary:
                 ):
                     return {
                         "status": "hold",
-                        "reason": "K5_precision_excludes_go_ahead_only",
+                        "reason": "K5_precision_witness_not_certifiable",
                         "consent": consent,
                         "native": native,
                     }

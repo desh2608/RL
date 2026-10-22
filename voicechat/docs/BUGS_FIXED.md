@@ -353,3 +353,15 @@ actual tool/result prefixes are quarantined for strategist review, never forced
 with case-specific scoring exceptions.
 A re-ask after only a weak go-ahead stops prefix certification as a hold; it is
 not silently traversed as a verified turn merely because K5 excludes it.
+
+K5 uses a closed vocabulary of clean affirmative replies and requires that the
+witness reply is the last caller turn. Detailed affirmatives still block K4,
+but are held for K5. This prevents an old numeric-substring heuristic from
+accepting “May20” because “2024” occurred in the offered date. Mere identity
+validation without a write action or explicit proceed question is not K5
+permission. The conservative restriction trades recall for certifiable precision.
+The same conservative permission certificate guards every write-positive kind,
+so a changed reply cannot authorize the old gold write in K1/K2/K7 either.
+Broader yes/restatement detection is retained only for the asymmetric K4 veto.
+This deliberately holds some valid detailed permissions rather than risk an
+incorrect write target; natural counts must report the resulting loss of recall.
