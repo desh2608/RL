@@ -132,3 +132,32 @@ a genuine error. The online SDG rejection label is never an eligibility proof.
 The draft has mutation tests; full native mining, HTTP control parity and the
 strategist's per-kind audit remain required before any v2 training publication.
 There is no approved `v2-areal` bundle yet.
+
+
+### G5 INBOX31 execution checkpoint (turn47)
+
+The `desh/areal-pivot-v2` branch remains a draft, with no replacement training
+bundle. `reference/recipes/tau_voice_rl_pivot/consent_given.py` decides actual
+prior consent independently of SDG content grades. K4 rechecks the fixed public
+context during scoring; a stale false label cannot authorize a re-ask after yes.
+K5 requires an actual question/request, not a declarative "To confirm" readback.
+
+`areal_native.Boundary` retains all task actions, checks the source DB hash,
+replays native tool results exactly, and proposes boundaries independently of
+online rejection reasons. It holds unsupported actions and alternatives. The
+seeded B0 pilot additionally requires raw/T20 caller/action/result identity;
+matching task ID and seed alone is insufficient.
+
+`pinned_consent.ConsentContent` grades proposed K4 messages using the approved
+whole closure in INBOX31. The question's hypothetical yes is used only for
+content grading. Checker files are supplied as node-local paths plus exact SHA
+pins; they must be staged with any eventual bundle. Original bytes are retained.
+Telecom uses its frozen C3 content rule and separately reports C1/C6 native
+preconditions. An old template containing "modify or exchange" fails retail's
+choice check; controls now name only the applicable action.
+
+K3 is **not eligible for production certification**: the turn47 adversarial
+battery found five false accepts in the draft lexical scorer. Full mining,
+K1/K2/K3/K6/K7 native/control coverage, balanced selection, per-kind signal,
+and the final bundle remain pending. Pilot and hard-gate receipts in the worklog
+are narrower than these acceptance gates.

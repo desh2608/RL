@@ -258,3 +258,19 @@ in `resources_servers/tau_pivot_stateful/test_areal_v2.py` in the vendored Gym.
 This guard is a development change. A version-pinned relaxed checker, independent
 native first-divergence replay, all HTTP controls and a strategist audit are
 still required for the replacement data. `final-20261018` remains unchanged.
+
+
+## 2026-10-22 — G5: separate prior consent from content grading
+
+The draft G5 evaluator trusted an eligibility boolean for K4. A stale false
+label could therefore reward a consent question even when the public context
+already contained a valid confirmation and yes. The evaluator now recomputes
+consent with the independent INBOX31 detector; missing or contradictory context
+fails closed. The 43-case kind/consent battery includes this stale-label attack,
+negation, changed requests, choices, different actions and declarative readbacks.
+A committed write closes permission for that write, while a different member of
+a confirmed batch does not erase permission for the remaining members.
+
+This fix does not complete G5 certification. The draft K3 lexical refusal scorer
+still fails adversarial cases, and ambiguous or mismatched native sources remain
+held. No G5 training bundle has been published.

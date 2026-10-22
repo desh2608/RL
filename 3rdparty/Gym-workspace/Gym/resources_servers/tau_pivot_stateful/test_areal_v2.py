@@ -29,6 +29,12 @@ def spec(kind):
             "proven": True,
             "gold_tool_type": "read" if kind == "K6" else "write",
             "valid_prior_consent": kind not in {"K3", "K4"},
+            "consent_context": []
+            if kind in {"K3", "K4"}
+            else [
+                {"type": "message", "role": "assistant", "content": "Shall I cancel order #A1?"},
+                {"type": "message", "role": "user", "content": "Yes"},
+            ],
             "policy_quote": "Basic economy cannot be modified.",
             "policy_predicate": "basic_economy_modification",
             "policy_required_tokens": ["basic economy"],
@@ -165,3 +171,12 @@ def test_cached_proof_must_bind_to_the_loaded_state_and_version(monkeypatch):
     boundary["verifier_version"] = "areal-v2:another-version"
     with pytest.raises(ValueError, match="specification version"):
         native_runtime.verify(Path("/unused"), item, ref, output)
+
+
+def test_k4_recomputes_given_consent_despite_stale_false_label():
+    boundary = spec("K4")
+    boundary["eligibility"]["consent_context"] = spec("K5")["eligibility"]["consent_context"]
+    check = lambda _: {"C1": True, "C2": True, "C3": True, "C4": True}
+    assert verifier.evaluate(boundary, message("Shall I cancel order #A1?"), consent_check=check)["reward"] == 0
+    del boundary["eligibility"]["consent_context"]
+    assert verifier.evaluate(boundary, message("Shall I cancel order #A1?"), consent_check=check)["reward"] == 0

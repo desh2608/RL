@@ -12,6 +12,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from recipes.tau_voice_rl_pivot.consent_given import detect
+
 
 G_TOOL_KINDS = frozenset({"K1", "K2", "K5", "K6", "K7"})
 G_CLOSE_TOOLS = frozenset({"end_call", "transfer_to_human_agents", "transfer_to_human_agent"})
@@ -106,6 +108,14 @@ def evaluate(
         "single_turn": shape != "invalid",
     }
     native = None
+    context = proof.get("consent_context")
+    target = spec.get("gold")
+    consent = None
+    if isinstance(context, list) and isinstance(target, dict) and isinstance(target.get("name"), str):
+        consent = detect(context, target)["valid_prior_consent"]
+    # Recompute from the fixed public boundary. A stale miner boolean cannot
+    # override an actual confirmation and yes, even with perfect content gates.
+    consent_agrees = consent is not None and consent is proof.get("valid_prior_consent")
     if kind in G_TOOL_KINDS:
         target = spec.get("gold")
         predicates["gold_call"] = shape == "call" and bool(target) and typed_equal(value, target)
@@ -114,15 +124,19 @@ def evaluate(
         predicates["valid_consent"] = kind != "K5" or proof.get("valid_prior_consent") is True
         predicates["write_authorized"] = proof.get("gold_tool_type") in {"read", "auth"} or (
             proof.get("gold_tool_type") == "write"
-            and (proof.get("valid_prior_consent") is True or proof.get("consent_required") is False)
+            and ((consent_agrees and consent is True) or proof.get("consent_required") is False)
         )
         if predicates["gold_call"] and native_check is not None:
             native = native_check(value)
         predicates["native_feasible"] = bool(native and native.get("feasible") is True)
     elif kind == "K4":
-        predicates["no_valid_prior_consent"] = proof.get("valid_prior_consent") is False
+        predicates["no_valid_prior_consent"] = consent_agrees and consent is False
         predicates["message_only"] = shape == "message"
-        checked = consent_check(value) if shape == "message" and consent_check is not None else {}
+        checked = (
+            consent_check(value)
+            if predicates["no_valid_prior_consent"] and shape == "message" and consent_check is not None
+            else {}
+        )
         predicates["relaxed_consent_content"] = all(checked.get(f"C{i}") is True for i in range(1, 5))
         predicates["checker_pinned"] = bool(spec.get("consent_checker_sha256"))
     elif kind == "K3":
