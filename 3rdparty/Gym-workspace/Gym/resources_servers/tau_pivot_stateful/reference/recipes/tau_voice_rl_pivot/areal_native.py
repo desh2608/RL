@@ -252,6 +252,7 @@ class Boundary:
                     equivalent_auth.append(gold["gold_index"])
         return {
             "name": call["name"],
+            "requestor": call.get("requestor", "assistant"),
             "gold_auth_result_equivalence": equivalent_auth,
             "result_sha256": replay_five.digest(recorded),
             "native_error": self.failed(result),
@@ -353,6 +354,17 @@ class Boundary:
                 native = self.native_check(gold)
                 amount = self.charge(gold, native.get("native_result"))
                 consent = detect(prefix, gold, native_amount=amount)
+                if (
+                    consent["authorized_prior_consent"]
+                    and not consent["k5_eligible"]
+                    and is_reask(candidate, gold, prefix=prefix, native_amount=amount)
+                ):
+                    return {
+                        "status": "hold",
+                        "reason": "K5_precision_excludes_go_ahead_only",
+                        "consent": consent,
+                        "native": native,
+                    }
                 if (
                     consent["k5_eligible"]
                     and native["write_due"]

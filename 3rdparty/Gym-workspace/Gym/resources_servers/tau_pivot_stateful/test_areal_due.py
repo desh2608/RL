@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,8 +177,6 @@ def test_premature_close_before_lookup_is_k7():
 
 @pytest.mark.parametrize("same_identity", [True, False])
 def test_alternative_native_auth_discharges_only_same_identity(same_identity):
-    from types import SimpleNamespace
-
     value = boundary()
     value.gold = [
         {
@@ -200,3 +199,16 @@ def test_alternative_native_auth_discharges_only_same_identity(same_identity):
     )
     assert value.gold[0]["done"] is same_identity
     assert result["gold_auth_result_equivalence"] == ([0] if same_identity else [])
+
+
+def test_weak_go_ahead_reask_stops_prefix_without_creating_k5():
+    value = boundary()
+    value.native_check = lambda call: {"feasible": True, "write_due": True}
+    value.charge = lambda call, result: None
+    prefix = [
+        {"type": "message", "role": "assistant", "content": "Order #A1 cancellation would refund $20."},
+        {"type": "message", "role": "user", "content": "Please proceed."},
+    ]
+    result = value.inspect([{"type": "message", "role": "assistant", "content": "Shall I cancel order #A1?"}], prefix)
+    assert result["status"] == "hold"
+    assert result["reason"] == "K5_precision_excludes_go_ahead_only"

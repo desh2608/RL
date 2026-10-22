@@ -351,3 +351,5 @@ authentication methods discharge an outstanding auth step only when native
 execution returns the exact same user identity. Audited labels contradicted by
 actual tool/result prefixes are quarantined for strategist review, never forced
 with case-specific scoring exceptions.
+A re-ask after only a weak go-ahead stops prefix certification as a hold; it is
+not silently traversed as a verified turn merely because K5 excludes it.
