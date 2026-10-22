@@ -355,7 +355,7 @@ class Boundary:
                 amount = self.charge(gold, native.get("native_result"))
                 consent = detect(prefix, gold, native_amount=amount)
                 if (
-                    consent["authorized_prior_consent"]
+                    consent["valid_prior_consent"]
                     and not consent["k5_eligible"]
                     and is_reask(candidate, gold, prefix=prefix, native_amount=amount)
                 ):

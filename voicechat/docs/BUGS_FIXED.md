@@ -365,3 +365,16 @@ so a changed reply cannot authorize the old gold write in K1/K2/K7 either.
 Broader yes/restatement detection is retained only for the asymmetric K4 veto.
 This deliberately holds some valid detailed permissions rather than risk an
 incorrect write target; natural counts must report the resulting loss of recall.
+
+## 2026-10-22 — G5 detailed affirmative could traverse an uncertifiable re-ask
+
+The weak-reask prefix guard checked the strict write authorization flag. A
+detailed affirmative such as “Yes, please cancel order #A1” has broad consent
+but fails the closed-vocabulary permission certificate. A subsequent re-ask
+therefore returned `continue` instead of stopping the prefix as a hold.
+
+The guard now uses the broad consent witness, while K5 and write rewards retain
+their strict authorization check. A regression reproduces the difference.
+The frozen V5 jobs used commit459a0b4a and are not re-certified by this code fix;
+their outputs remain diagnostic only. New native replay qualification is required
+before any training publication. No frozen grader or published bundle changed.

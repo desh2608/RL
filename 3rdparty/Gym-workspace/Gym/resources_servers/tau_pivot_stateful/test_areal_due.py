@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent / "reference"))
 
 from recipes.tau_voice_rl_pivot import areal_v2
 from recipes.tau_voice_rl_pivot.areal_native import Boundary
+from recipes.tau_voice_rl_pivot.consent_given import detect
 from recipes.tau_voice_rl_pivot.pinned_consent import ConsentContent
 
 
@@ -209,6 +210,23 @@ def test_weak_go_ahead_reask_stops_prefix_without_creating_k5():
         {"type": "message", "role": "assistant", "content": "Order #A1 cancellation would refund $20."},
         {"type": "message", "role": "user", "content": "Please proceed."},
     ]
+    result = value.inspect([{"type": "message", "role": "assistant", "content": "Shall I cancel order #A1?"}], prefix)
+    assert result["status"] == "hold"
+    assert result["reason"] == "K5_precision_witness_not_certifiable"
+
+
+def test_detailed_uncertifiable_affirmative_reask_stops_prefix():
+    value = boundary()
+    value.native_check = lambda call: {"feasible": True, "write_due": True}
+    value.charge = lambda call, result: None
+    prefix = [
+        {"type": "message", "role": "assistant", "content": "Shall I cancel order #A1 and refund $20?"},
+        {"type": "message", "role": "user", "content": "Yes, please cancel order #A1."},
+    ]
+    consent = detect(prefix, value.gold[0])
+    assert consent["valid_prior_consent"]
+    assert not consent["authorized_prior_consent"]
+    assert not consent["k5_eligible"]
     result = value.inspect([{"type": "message", "role": "assistant", "content": "Shall I cancel order #A1?"}], prefix)
     assert result["status"] == "hold"
     assert result["reason"] == "K5_precision_witness_not_certifiable"
