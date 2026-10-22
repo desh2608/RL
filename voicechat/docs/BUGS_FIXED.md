@@ -239,3 +239,22 @@ nemo_rl/utils/{length_penalty,training_guardrails}.py, nemo_rl/data/full_pass.py
 3rdparty/Gym-workspace/Gym: rollout_collection.py, vllm_model/app.py (B14, B15), openai_model/app.py (multiple base_url),
   tau2/app.py, single_step_tool_use_with_argument_comparison/* (parallel batch verification), math_with_judge/app.py
 ```
+
+
+## Pivot certification: SDG gate rejection is not an error label (G5 draft)
+
+The October 22 audit found that the old AReaL pivot collection could reward a
+consent re-ask after the caller had already agreed. It selected the first SDG
+online-gate rejection and reused the older detailed read-back gates, rather
+than independently proving a first agent error under the approved consent rules.
+
+The new `areal-v2:` evaluator adds a hard K4 eligibility check: the mined proof
+must explicitly establish that valid prior consent is absent. A true or unknown
+consent status gives reward zero. K5 instead requires a typed gold write and
+rejects another consent question. Other write-kind positives must also carry
+prior authorization or proof that consent is inapplicable. Mutation checks are
+in `resources_servers/tau_pivot_stateful/test_areal_v2.py` in the vendored Gym.
+
+This guard is a development change. A version-pinned relaxed checker, independent
+native first-divergence replay, all HTTP controls and a strategist audit are
+still required for the replacement data. `final-20261018` remains unchanged.

@@ -1,0 +1,146 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""G5 kind evaluator. Eligibility requires independently replayed boundary evidence.
+
+An online SDG rejection is never eligibility evidence. This module deliberately
+requires callbacks for native feasibility and the version-pinned consent check;
+it cannot certify a record from a reference-action mismatch alone.
+"""
+
+import json
+import re
+from collections.abc import Callable
+from typing import Any
+
+
+G_TOOL_KINDS = frozenset({"K1", "K2", "K5", "K6", "K7"})
+G_CLOSE_TOOLS = frozenset({"end_call", "transfer_to_human_agents", "transfer_to_human_agent"})
+G_COMPLETION = re.compile(
+    r"\b(?:I(?:'ve| have)|we(?:'ve| have))\s+(?:successfully\s+)?"
+    r"(?:cancelled|canceled|changed|updated|modified|booked|returned|refunded|exchanged|processed|sent|"
+    r"voided|removed|deleted|credited|debited|issued|rebooked|completed|confirmed)\b|"
+    r"\b(?:has been|have been|is(?: now)?|are(?: now)?|was|were)\s+"
+    r"(?:successfully\s+)?(?:cancelled|canceled|changed|updated|modified|booked|refunded|processed|sent|"
+    r"voided|removed|deleted|credited|debited|issued|rebooked|completed|confirmed)\b|"
+    r"\b(?:done|all set|completed|successfully processed)\b",
+    re.I,
+)
+G_REFUSAL = re.compile(r"\b(?:cannot|can't|unable|not allowed|not eligible|ineligible|may not|must not)\b", re.I)
+
+
+def typed_equal(actual: Any, gold: Any) -> bool:
+    """Object order is irrelevant; list order and scalar types are significant.
+
+    Booleans never equal numeric 0/1. JSON integer and float representations of
+    the same finite number are equivalent; strings never coerce to numbers.
+    """
+    if isinstance(gold, bool) or isinstance(actual, bool):
+        return type(actual) is type(gold) and actual == gold
+    if isinstance(gold, (int, float)) and isinstance(actual, (int, float)):
+        return actual == gold and abs(actual) != float("inf")
+    if type(actual) is not type(gold):
+        return False
+    if isinstance(gold, dict):
+        return actual.keys() == gold.keys() and all(typed_equal(actual[k], v) for k, v in gold.items())
+    if isinstance(gold, list):
+        return len(actual) == len(gold) and all(typed_equal(a, b) for a, b in zip(actual, gold))
+    return actual == gold
+
+
+def one_turn(output: list[dict]) -> tuple[str, dict | str | None]:
+    """Accept exactly one assistant message or one typed function call."""
+    if not isinstance(output, list):
+        return "invalid", None
+    if any(not isinstance(x, dict) for x in output):
+        return "invalid", None
+    items = [x for x in output if x.get("type") != "reasoning"]
+    if len(items) != 1:
+        return "invalid", None
+    item = items[0]
+    if item.get("type") == "function_call":
+        args = item.get("arguments")
+        try:
+            args = json.loads(args) if isinstance(args, str) else args
+        except (ValueError, TypeError):
+            return "invalid", None
+        if not isinstance(args, dict) or not isinstance(item.get("name"), str):
+            return "invalid", None
+        return "call", {"name": item["name"], "arguments": args}
+    if item.get("type") == "message" and item.get("role") == "assistant":
+        content = item.get("content")
+        if isinstance(content, list):
+            if any(not isinstance(x, dict) or x.get("type") not in {"output_text", "text"} for x in content):
+                return "invalid", None
+            if any(not isinstance(x.get("text", ""), str) for x in content):
+                return "invalid", None
+            content = "".join(x.get("text", "") for x in content)
+        if (
+            isinstance(content, str)
+            and content.strip()
+            and not re.search(r"<\s*(?:tool_call|function)\b", content, re.I)
+        ):
+            return "message", content
+    return "invalid", None
+
+
+def evaluate(
+    spec: dict,
+    output: list[dict],
+    *,
+    native_check: Callable[[dict], dict] | None = None,
+    consent_check: Callable[[str], dict] | None = None,
+) -> dict:
+    """Evaluate one turn against a pinned, replay-certified G5 boundary.
+
+    native_check reports feasibility/state transitions without old online consent
+    gates. consent_check checks a proposed question, never grants actual consent.
+    The eligibility proof and actual prior consent are fixed when mining.
+    """
+    kind = spec.get("error_kind")
+    shape, value = one_turn(output)
+    proof = spec.get("eligibility", {})
+    predicates = {
+        "version": str(spec.get("verifier_version", "")).startswith("areal-v2:"),
+        "boundary_verified": proof.get("prefix_replayed") is True and bool(proof.get("state_hash_at_boundary")),
+        "kind_witness": proof.get("kind") == kind and proof.get("proven") is True,
+        "single_turn": shape != "invalid",
+    }
+    native = None
+    if kind in G_TOOL_KINDS:
+        target = spec.get("gold")
+        predicates["gold_call"] = shape == "call" and bool(target) and typed_equal(value, target)
+        predicates["not_close"] = shape == "call" and value["name"] not in G_CLOSE_TOOLS
+        predicates["correct_kind"] = kind != "K6" or proof.get("gold_tool_type") in {"read", "auth"}
+        predicates["valid_consent"] = kind != "K5" or proof.get("valid_prior_consent") is True
+        predicates["write_authorized"] = proof.get("gold_tool_type") in {"read", "auth"} or (
+            proof.get("gold_tool_type") == "write"
+            and (proof.get("valid_prior_consent") is True or proof.get("consent_required") is False)
+        )
+        if predicates["gold_call"] and native_check is not None:
+            native = native_check(value)
+        predicates["native_feasible"] = bool(native and native.get("feasible") is True)
+    elif kind == "K4":
+        predicates["no_valid_prior_consent"] = proof.get("valid_prior_consent") is False
+        predicates["message_only"] = shape == "message"
+        checked = consent_check(value) if shape == "message" and consent_check is not None else {}
+        predicates["relaxed_consent_content"] = all(checked.get(f"C{i}") is True for i in range(1, 5))
+        predicates["checker_pinned"] = bool(spec.get("consent_checker_sha256"))
+    elif kind == "K3":
+        # K3 intentionally supports only grounded refusals. Alternative messages
+        # that cannot be proved by this lexical check stay outside certification.
+        predicates["policy_witness"] = bool(proof.get("policy_quote") and proof.get("policy_predicate"))
+        predicates["message_only"] = shape == "message"
+        required = proof.get("policy_required_tokens") or []
+        predicates["policy_grounding"] = (
+            shape == "message"
+            and bool(required)
+            and all(re.search(r"\b" + re.escape(token) + r"\b", value, re.I) for token in required)
+        )
+        predicates["explicit_refusal"] = shape == "message" and bool(G_REFUSAL.search(value))
+        predicates["no_completion_claim"] = shape == "message" and not G_COMPLETION.search(value)
+        # No tool execution occurs on a message path. The input state remains
+        # unchanged by construction, rather than trusting model-provided hashes.
+        predicates["state_unchanged"] = shape == "message"
+    else:
+        predicates["known_kind"] = False
+    return {"reward": int(all(predicates.values())), "predicates": predicates, "native": native}

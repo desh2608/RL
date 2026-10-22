@@ -21,6 +21,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "reference"))
+from recipes.tau_voice_rl_pivot import areal_v2
 from recipes.tau_voice_rl_pivot import pivot_verify as reference
 from recipes.tau_voice_rl_pivot import replay_five as replay
 
@@ -160,6 +161,13 @@ def verify(root, item, ref, output):
     for key in ["record_id", "dataset", "verifier_version", "expected_turn_kind"]:
         if entry[key] != ref[key]:
             raise ValueError("Verification reference mismatch: " + key)
+    if ref["verifier_version"].startswith("areal-v2:"):
+        proof = entry["verification"].get("eligibility", {})
+        if proof.get("state_hash_at_boundary") != entry["state_hash_at_boundary"]:
+            raise ValueError("G5 eligibility proof belongs to a different boundary")
+        if entry["verification"].get("verifier_version") != ref["verifier_version"]:
+            raise ValueError("G5 specification version differs from verification reference")
+        return areal_v2.evaluate(entry["verification"], output, **callbacks)
     return reference.evaluate(entry["verification"], output, **callbacks)
 
 

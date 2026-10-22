@@ -112,3 +112,23 @@ the reward; zero judge/model calls and no training are needed for verification.
 - Private pickle snapshots are trusted pinned artifacts; do not load arbitrary
   untrusted cache files. Native state and reference-ledger matching measure a
   local one-turn condition, not full-dialogue completion or semantic perfection.
+
+
+## G5 development branch (not a certified dataset)
+
+`desh/areal-pivot-v2` adds the `areal-v2:` evaluator namespace. Existing v1 and
+AfterQuery v2.1 routes retain their original evaluators. The new namespace
+requires replay-certified eligibility evidence, a boundary-state hash, a native
+feasibility callback, and (for K4) a separately pinned relaxed consent callback.
+It cannot consume the old consent cache callbacks as new eligibility evidence.
+
+The evaluator implements typed gold-tool controls for K1/K2/K5/K6/K7, a hard
+valid-prior-consent exclusion for K4, and a conservative grounded-refusal check
+for K3. K3 alternatives and K7 continuation without an executable gold step
+remain unsupported. K2 mining must exclude open-string-only differences under
+S1; exact typed matching in the evaluator is not evidence that a mismatch is
+a genuine error. The online SDG rejection label is never an eligibility proof.
+
+The draft has mutation tests; full native mining, HTTP control parity and the
+strategist's per-kind audit remain required before any v2 training publication.
+There is no approved `v2-areal` bundle yet.
