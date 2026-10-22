@@ -175,3 +175,11 @@ pinned content graders remain unchanged. K3 is deferred and always scores zero.
 Full native mining is a separate frozen CPU job, not an accepted dataset. B0
 prompts use T20 caller text; a tool-call or result byte difference remains a
 source hold. Original v1 data and the shared verifier branch are unchanged.
+
+
+G5 draft INBOX34: K4 requires no caller assent in the write segment. The
+independent detector emits `consent_label`, `k4_eligible`, and the indexed
+`write_segment` assent/ignored evidence. `valid_prior_consent` retains the
+turn49 witness result; `authorized_prior_consent` additionally excludes
+question/hold cases. Newly recovered census-given cases block K4 without
+automatically creating K5 positives. No replacement G5 bundle is certified.

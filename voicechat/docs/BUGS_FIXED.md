@@ -296,3 +296,24 @@ K1/K2, wrong-ID lookup errors for K6, and executable continuation for K7 are
 candidates pending full controls/audit. B0 uses the T20 prompt; caller rewrites
 are recorded, while any tool-call argument or result byte difference is held.
 No replacement G5 training bundle is yet accepted or published.
+
+
+## 2026-10-22 — G5 INBOX34: asymmetric segment assent veto
+
+The second audit found nine clear confirmations among thirty not-given cases,
+including affirmative restatements and go-aheads after declarative details. K4
+now additionally requires no caller assent anywhere in the current write segment.
+Clarifications and payment/reason answers do not erase earlier assent. A caller
+question in the affirmative reply is held until a later clean assent. Explicit
+negations and clearly different named targets/items are ignored with evidence.
+
+`consent_label` is the broader census classification (given/hold/K4_candidate).
+`authorized_prior_consent` still requires the turn49 positive witness and a
+given classification: a newly recognized K4 veto alone cannot create a K5 or
+write-positive reward. The original `valid_prior_consent` field is retained as
+the turn49 detector result for provenance. The evaluator recomputes eligibility
+from the public prefix, so a stale false miner label cannot override the veto.
+
+The frozen turn49 SDG/B0 jobs remain candidate inventories under INBOX33; their
+labels must be updated under INBOX34 before controls/audit/certification. Content
+checker bytes and the old published bundle remain unchanged.

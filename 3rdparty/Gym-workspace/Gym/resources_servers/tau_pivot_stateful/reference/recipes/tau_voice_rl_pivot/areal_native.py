@@ -214,7 +214,9 @@ class Boundary:
                 native = self.native_check(gold)
                 amount = self.charge(gold, native.get("native_result"))
                 consent = detect(prefix, gold, native_amount=amount)
-                if consent["valid_prior_consent"] and is_reask(candidate, gold, prefix=prefix, native_amount=amount):
+                if consent["authorized_prior_consent"] and is_reask(
+                    candidate, gold, prefix=prefix, native_amount=amount
+                ):
                     if native["feasible"]:
                         return {
                             "status": "candidate",
@@ -234,7 +236,7 @@ class Boundary:
                     continue
                 good = self.native_check(gold)
                 given = detect(prefix, gold, native_amount=self.charge(gold, good.get("native_result")))
-                if good["feasible"] and given["valid_prior_consent"]:
+                if good["feasible"] and given["authorized_prior_consent"]:
                     targets.append(gold)
             if len(targets) == 1:
                 return self.inspect_student(output, prefix, {key: targets[0][key] for key in ("name", "arguments")})
@@ -257,7 +259,7 @@ class Boundary:
                     continue
                 feasible = self.native_check(gold)
                 given = detect(prefix, gold, native_amount=self.charge(gold, feasible.get("native_result")))
-                if feasible["feasible"] and given["valid_prior_consent"]:
+                if feasible["feasible"] and given["authorized_prior_consent"]:
                     targets.append(gold)
             if len(targets) == 1:
                 target = {key: targets[0][key] for key in ("name", "arguments")}
@@ -266,11 +268,11 @@ class Boundary:
             # for K1/K2/K3. Do not mis-certify these as missing consent.
             return {"status": "hold", "reason": "write_needs_kind_specific_error_witness", "native": native}
         consent = detect(prefix, candidate, native_amount=self.charge(candidate, native.get("native_result")))
-        if self.consent_required(candidate) and not consent["valid_prior_consent"]:
-            if consent.get("uncertain_prior_consent"):
+        if self.consent_required(candidate) and not consent["authorized_prior_consent"]:
+            if not consent["k4_eligible"]:
                 return {
                     "status": "hold",
-                    "reason": "prior_assent_then_information_answer_requires_audit",
+                    "reason": "INBOX34_segment_assent_or_uncertainty_blocks_K4",
                     "consent": consent,
                     "native": native,
                 }
@@ -310,7 +312,7 @@ class Boundary:
         if not good["feasible"]:
             return {"status": "hold", "reason": "reference_not_native_feasible", "native": good}
         consent = detect(prefix, reference_call, native_amount=self.charge(reference_call, good.get("native_result")))
-        authorized = not self.consent_required(reference_call) or consent["valid_prior_consent"]
+        authorized = not self.consent_required(reference_call) or consent["authorized_prior_consent"]
         if areal_v2.typed_equal(candidate, reference_call):
             return self.inspect(output, prefix)
         if any(

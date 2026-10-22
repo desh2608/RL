@@ -112,9 +112,11 @@ def evaluate(
     target = spec.get("gold")
     consent = None
     uncertainty = None
+    k4_eligible = False
     if isinstance(context, list) and isinstance(target, dict) and isinstance(target.get("name"), str):
         result = detect(context, target, native_amount=proof.get("native_amount"))
-        consent = result["valid_prior_consent"]
+        consent = result["authorized_prior_consent"]
+        k4_eligible = result["k4_eligible"]
         uncertainty = result.get("uncertain_prior_consent")
     # Recompute from the fixed public boundary. A stale miner boolean cannot
     # override an actual confirmation and yes, even with perfect content gates.
@@ -133,7 +135,10 @@ def evaluate(
             native = native_check(value)
         predicates["native_feasible"] = bool(native and native.get("feasible") is True)
     elif kind == "K4":
-        predicates["no_valid_prior_consent"] = consent_agrees and consent is False and uncertainty is None
+        predicates["no_valid_prior_consent"] = (
+            consent_agrees and consent is False and uncertainty is None and k4_eligible
+        )
+        predicates["no_segment_assent"] = k4_eligible
         predicates["message_only"] = shape == "message"
         checked = (
             consent_check(value)

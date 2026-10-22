@@ -209,3 +209,20 @@ def test_information_answer_after_assent_cannot_reward_reasking():
         raise AssertionError("Ambiguous consent cannot create a K4-positive message")
 
     assert verifier.evaluate(boundary, message("May I cancel order #A1?"), consent_check=must_not_grade)["reward"] == 0
+
+
+@pytest.mark.parametrize("reply", ["I'll take it.", "Fine.", "Yes. What is the fare difference?"])
+def test_inbox34_assent_blocks_stale_k4_before_content_grader(reply):
+    boundary = spec("K4")
+    boundary["eligibility"]["consent_context"] = [
+        {"type": "message", "role": "user", "content": "Cancel order #A1."},
+        {"type": "message", "role": "assistant", "content": "Order #A1, refund $20."},
+        {"type": "message", "role": "user", "content": reply},
+    ]
+    called = []
+    result = verifier.evaluate(
+        boundary, message("Shall I cancel order #A1?"), consent_check=lambda question: called.append(question)
+    )
+    assert result["reward"] == 0
+    assert result["predicates"]["no_segment_assent"] is False
+    assert not called
