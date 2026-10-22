@@ -272,3 +272,16 @@ def test_negation_of_plan_change_does_not_hide_refuel_assent():
     result = detect(prefix, gold)
     assert not result["k4_eligible"]
     assert result["consent_label"] == "given"
+
+
+@pytest.mark.parametrize(
+    "offer,reply,expected",
+    [
+        ("Shall I update ABC123?", "Yes, please proceed.", True),
+        ("Business on ABC123 would cost $50 more.", "Please proceed.", False),
+        ("Shall I update ABC123?", "Yes. What is the fee?", False),
+        ("Shall I update ABC123?", "Yes, but use another card instead.", False),
+    ],
+)
+def test_inbox35_k5_requires_question_offer(offer, reply, expected):
+    assert detect([msg("assistant", offer), msg("user", reply)], G_GOLD)["k5_eligible"] is expected

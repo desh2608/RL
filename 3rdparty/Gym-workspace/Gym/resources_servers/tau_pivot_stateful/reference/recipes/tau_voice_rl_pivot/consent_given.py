@@ -525,11 +525,21 @@ def detect(messages: list[dict], gold: dict, *, native_amount: Any = None) -> di
         label = "hold"
     else:
         label = "K4_candidate"
+    k5 = bool(
+        result["valid_prior_consent"]
+        and label == "given"
+        and witness
+        and witness["eligible_offer"]
+        and "?" in witness["offer"]
+        and witness["clean_affirmative"]
+        and "?" not in witness["reply"]
+    )
     return {
         **result,
-        "detector_contract": "G5-INBOX34",
+        "detector_contract": "G5-INBOX35",
         "write_segment": guard,
         "consent_label": label,
         "k4_eligible": label == "K4_candidate" and not relevant,
         "authorized_prior_consent": result["valid_prior_consent"] and label == "given",
+        "k5_eligible": k5,
     }

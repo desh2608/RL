@@ -10,7 +10,9 @@ and their import statements remain byte-identical.
 import hashlib
 import importlib.util
 import json
+import os
 import sys
+import tempfile
 import types
 from contextlib import contextmanager
 from pathlib import Path
@@ -63,8 +65,27 @@ class ConsentContent:
         self.initial_db = initial_db
         self.history = history
         self.native_result = native_result
-        self.checker_root = checker_root
         self.checker_files = checker_files
+        self.checker_sources = {name: (checker_root / name).read_bytes() for name in checker_files}
+        for name, data in self.checker_sources.items():
+            if hashlib.sha256(data).hexdigest() != checker_files[name]:
+                raise ValueError("Consent checker bytes changed: " + name)
+
+    def local_checker_root(self) -> Path:
+        """Materialize the pinned bytes locally after transport to another node."""
+        digest = hashlib.sha256(json.dumps(self.checker_files, sort_keys=True).encode()).hexdigest()
+        root = Path(tempfile.gettempdir()) / "tau-pivot-content-checkers" / digest
+        root.mkdir(parents=True, exist_ok=True)
+        for name, data in self.checker_sources.items():
+            path = root / name
+            if not path.exists():
+                with tempfile.NamedTemporaryFile(dir=root, delete=False) as stream:
+                    stream.write(data)
+                    temporary = stream.name
+                os.replace(temporary, path)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != self.checker_files[name]:
+                raise ValueError("Staged consent checker bytes changed: " + name)
+        return root
 
     def __call__(self, question: str) -> dict:
         # This hypothetical yes assesses question contents only. It is never
@@ -85,7 +106,7 @@ class ConsentContent:
             },
             {"role": "tool", "tool_call_id": "k4-content-only", "content": self.native_result},
         ]
-        with isolated_policy(self.checker_root, self.checker_files) as policy:
+        with isolated_policy(self.local_checker_root(), self.checker_files) as policy:
             checked = policy.checks(
                 messages, {"domain_name": self.domain, "customer_scenario": {}, "policy": ""}, self.initial_db
             )["writes"][-1]

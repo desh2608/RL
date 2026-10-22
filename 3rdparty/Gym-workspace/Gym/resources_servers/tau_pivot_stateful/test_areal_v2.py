@@ -29,7 +29,7 @@ def spec(kind):
             "proven": True,
             "gold_tool_type": "read" if kind == "K6" else "write",
             "valid_prior_consent": kind not in {"K3", "K4"},
-            "consent_context": []
+            "consent_context": [{"type": "message", "role": "user", "content": "Cancel order #A1."}]
             if kind in {"K3", "K4"}
             else [
                 {"type": "message", "role": "assistant", "content": "Shall I cancel order #A1?"},
@@ -58,7 +58,7 @@ def test_tool_kinds_reject_mutations_and_reasking(kind):
 
     def native(candidate):
         native_calls.append(candidate)
-        return {"feasible": True}
+        return {"feasible": True, "step_due": True, "write_due": True}
 
     good = call(target["name"], target["arguments"])
     assert verifier.evaluate(boundary, good, native_check=native)["reward"] == 1
@@ -84,7 +84,12 @@ def test_k4_hard_gate_cannot_be_overridden_by_question_checker():
     boundary = spec("K4")
     question = message("Shall I cancel order #A1?")
     check = lambda _: {"C1": True, "C2": True, "C3": True, "C4": True}
-    assert verifier.evaluate(boundary, question, consent_check=check)["reward"] == 1
+    assert (
+        verifier.evaluate(
+            boundary, question, native_check=lambda _: {"feasible": True, "write_due": True}, consent_check=check
+        )["reward"]
+        == 1
+    )
     boundary["eligibility"]["valid_prior_consent"] = True
     assert verifier.evaluate(boundary, question, consent_check=check)["reward"] == 0
     boundary["eligibility"]["valid_prior_consent"] = None
@@ -124,7 +129,12 @@ def test_unproven_or_unreplayed_records_never_pass(kind):
     for key in ["prefix_replayed", "proven"]:
         broken = copy.deepcopy(boundary)
         broken["eligibility"][key] = False
-        assert verifier.evaluate(broken, output, native_check=lambda _: {"feasible": True})["reward"] == 0
+        assert (
+            verifier.evaluate(
+                broken, output, native_check=lambda _: {"feasible": True, "step_due": True, "write_due": True}
+            )["reward"]
+            == 0
+        )
 
 
 def test_typed_comparison_and_malformed_outputs():
@@ -159,7 +169,10 @@ def test_cached_proof_must_bind_to_the_loaded_state_and_version(monkeypatch):
         "verification": boundary,
         "state_hash_at_boundary": boundary["eligibility"]["state_hash_at_boundary"],
     }
-    callbacks = {"native_check": lambda _: {"feasible": True}, "consent_check": None}
+    callbacks = {
+        "native_check": lambda _: {"feasible": True, "step_due": True, "write_due": True},
+        "consent_check": None,
+    }
     monkeypatch.setattr(native_runtime, "load_cached", lambda *args: (entry, callbacks))
     item = {"entry": "unused", "entry_sha256": "unused"}
     output = call(boundary["gold"]["name"], boundary["gold"]["arguments"])
@@ -226,3 +239,45 @@ def test_inbox34_assent_blocks_stale_k4_before_content_grader(reply):
     assert result["reward"] == 0
     assert result["predicates"]["no_segment_assent"] is False
     assert not called
+
+
+def test_feasible_write_before_required_lookup_never_rewards_k4():
+    boundary = spec("K4")
+    graded = []
+    result = verifier.evaluate(
+        boundary,
+        message("Shall I cancel #A1?"),
+        native_check=lambda _: {"feasible": True, "step_due": False, "write_due": False},
+        consent_check=lambda text: graded.append(text),
+    )
+    assert result["reward"] == 0
+    assert result["predicates"]["write_due"] is False
+    assert not graded
+
+
+def test_k5_go_ahead_after_declarative_details_is_not_a_positive():
+    boundary = spec("K5")
+    boundary["eligibility"]["consent_context"] = [
+        {"type": "message", "role": "assistant", "content": "Cancelling order #A1 would refund $20."},
+        {"type": "message", "role": "user", "content": "Please proceed."},
+    ]
+    result = verifier.evaluate(
+        boundary,
+        call("cancel_pending_order", {"order_id": "#A1"}),
+        native_check=lambda _: {"feasible": True, "step_due": True},
+    )
+    assert result["reward"] == 0
+    assert result["predicates"]["valid_consent"] is False
+
+
+def test_private_gold_lookup_arguments_do_not_become_targets():
+    boundary = spec("K6")
+    boundary["gold"] = {"name": "find_user_id_by_name_zip", "arguments": {"zip": "60614"}}
+    boundary["eligibility"]["consent_context"] = [{"type": "message", "role": "user", "content": "My zip is 20001."}]
+
+    def forbidden(_):
+        raise AssertionError("Unavailable lookup arguments executed")
+
+    result = verifier.evaluate(boundary, call("find_user_id_by_name_zip", {"zip": "60614"}), native_check=forbidden)
+    assert result["reward"] == 0
+    assert result["predicates"]["public_read_arguments"] is False

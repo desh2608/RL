@@ -54,11 +54,74 @@ class Boundary:
                     "delta": delta(before, replay_five.state_of(shadow)),
                 }
             )
+        self.supplement_reference_reads(raw["result"]["trajectory"]["messages"])
         self.expected_state = replay_five.state_of(shadow)
         self.criteria = task["evaluation_criteria"]
         self.initial_db_sha256 = source["db_sha256"]
         self.task = task
         self._native_cache = {}
+
+    def supplement_reference_reads(self, messages: list[dict]) -> None:
+        """Retain ordered reference reads omitted from write-only task criteria.
+
+        Only read/auth calls preceding an exact task-gold write are inserted.
+        They carry explicit reference-trace provenance. Prefix execution still
+        requires byte-exact native result parity; feasibility/completion still
+        executes native tools and checks the task's final state/assertions.
+        No SDG online verdict supplies evidence of correctness.
+        """
+        pending = []
+        attached = {}
+        anchored = set()
+        known = {(g["name"], json.dumps(g["arguments"], sort_keys=True)) for g in self.gold}
+        for index, message in enumerate(messages):
+            if message.get("type") != "tool_call" or message.get("source") != "agent":
+                continue
+            arguments = message["arguments"]
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            call = {"name": message["tool_name"], "arguments": arguments}
+            key = (call["name"], json.dumps(arguments, sort_keys=True))
+            if self.tool_type(call) in {"read", "auth"} and key not in known:
+                pending.append(
+                    {
+                        **call,
+                        "requestor": "assistant",
+                        "done": False,
+                        "delta": [],
+                        "ledger_source": "recorded_reference_read",
+                        "reference_index": index,
+                    }
+                )
+                known.add(key)
+            if self.tool_type(call) == "write":
+                match = next(
+                    (
+                        g
+                        for g in self.gold
+                        if g["requestor"] == "assistant"
+                        and areal_v2.typed_equal({k: g[k] for k in ("name", "arguments")}, call)
+                    ),
+                    None,
+                )
+                if match is not None:
+                    anchored.add(match["gold_index"])
+                    attached.setdefault(match["gold_index"], []).extend(pending)
+                    pending = []
+        ordered = []
+        for gold in self.gold:
+            ordered.extend(attached.get(gold["gold_index"], []))
+            ordered.append(
+                {
+                    **gold,
+                    "evaluation_gold_index": gold["gold_index"],
+                    "ledger_source": "task_gold",
+                    "reference_write_anchor": gold["gold_index"] in anchored,
+                }
+            )
+        for index, gold in enumerate(ordered):
+            gold["gold_index"] = index
+        self.gold = ordered
 
     @staticmethod
     def execute(env: Any, call: dict) -> Any:
@@ -92,7 +155,21 @@ class Boundary:
         key = json.dumps(call, sort_keys=True)
         if key not in self._native_cache:
             self._native_cache[key] = self._native_check_uncached(call)
-        return copy.deepcopy(self._native_cache[key])
+        result = copy.deepcopy(self._native_cache[key])
+        remaining = self.remaining()
+        due = remaining[0] if remaining else None
+        result["next_remaining_gold"] = copy.deepcopy(due)
+        result["step_due"] = bool(
+            due
+            and due["requestor"] == call.get("requestor", "assistant")
+            and areal_v2.typed_equal(
+                {k: due[k] for k in ("name", "arguments")}, {k: call[k] for k in ("name", "arguments")}
+            )
+        )
+        if self.tool_type(call) == "write":
+            result["step_due"] = result["step_due"] and due.get("reference_write_anchor", False) if due else False
+        result["write_due"] = result["step_due"] and self.tool_type(call) == "write"
+        return result
 
     def _native_check_uncached(self, call: dict) -> dict:
         """Execute on a copy and prove the remaining task can still complete."""
@@ -164,8 +241,18 @@ class Boundary:
                 if not self.failed(result):
                     gold["done"] = True
                 break
+        equivalent_auth = []
+        if not self.failed(result) and self.tool_type(call) == "auth":
+            for gold in self.remaining():
+                if self.tool_type(gold) != "auth":
+                    continue
+                expected = self.execute(copy.deepcopy(self.env), gold)
+                if not self.failed(expected) and expected.content == result.content:
+                    gold["done"] = True
+                    equivalent_auth.append(gold["gold_index"])
         return {
             "name": call["name"],
+            "gold_auth_result_equivalence": equivalent_auth,
             "result_sha256": replay_five.digest(recorded),
             "native_error": self.failed(result),
         }
@@ -196,6 +283,51 @@ class Boundary:
         new_payments = result.get("payment_history", [])[len(old.get("payment_history", [])) :]
         return str(sum(abs(Decimal(str(payment["amount"]))) for payment in new_payments)) if new_payments else None
 
+    def required_lookup(self) -> dict | None:
+        """Native ledger's next outstanding assistant read/auth, never a later read."""
+        remaining = self.remaining()
+        if remaining and remaining[0]["requestor"] == "assistant" and self.tool_type(remaining[0]) in {"read", "auth"}:
+            return {key: remaining[0][key] for key in ("name", "arguments")}
+        return None
+
+    def missing_lookup(self, output: list[dict], prefix: list[dict]) -> dict | None:
+        """A recorded write attempt or explicit completion claim before a due lookup."""
+        lookup = self.required_lookup()
+        if not lookup:
+            return None
+        shape, value = areal_v2.one_turn(output)
+        attempted = shape == "call" and self.tool_type(value) == "write"
+        if shape == "invalid" and isinstance(output, list):
+            for message in output:
+                candidate_shape, call = areal_v2.one_turn([message])
+                if candidate_shape == "call" and self.tool_type(call) == "write":
+                    attempted = True
+        claim = shape == "message" and bool(
+            re.search(
+                r"\bI (?:have |already )?(?:cancelled|canceled|updated|changed|booked|returned|exchanged|refunded)\b|"
+                r"\b(?:order|reservation|booking|address|payment) (?:has been|is now) "
+                r"(?:cancelled|canceled|updated|changed|booked|returned|exchanged|refunded)\b",
+                value,
+                re.I,
+            )
+        )
+        if not (attempted or claim):
+            return None
+        if not areal_v2.lookup_arguments_public(prefix, lookup):
+            return {"status": "hold", "reason": "required_lookup_arguments_not_public", "gold": lookup}
+        native = self.native_check(lookup)
+        if not native["feasible"] or not native["step_due"]:
+            return {"status": "hold", "reason": "required_lookup_not_native_feasible", "native": native}
+        return {
+            "status": "candidate",
+            "error_kind": "K6",
+            "gold": lookup,
+            "native": native,
+            "consent": detect(prefix, lookup),
+            "witness": "write_or_claim_before_next_native_lookup",
+            "failing_shape": shape,
+        }
+
     def inspect(self, output: list[dict], prefix: list[dict]) -> dict:
         """Propose supported boundaries; separate holds from proved failures.
 
@@ -203,19 +335,28 @@ class Boundary:
         content controls, HTTP parity, reproduction and independent audit.
         """
         shape, candidate = areal_v2.one_turn(output)
+        missing = self.missing_lookup(output, prefix)
+        if missing:
+            return missing
         if shape == "invalid":
             return {"status": "hold", "reason": "unsupported_turn_shape"}
         if shape == "message":
             for gold in self.remaining():
-                if gold["requestor"] != "assistant" or self.tool_type(gold) != "write":
+                if (
+                    gold is not self.remaining()[0]
+                    or gold["requestor"] != "assistant"
+                    or self.tool_type(gold) != "write"
+                ):
                     continue
                 if not ("?" in candidate or re.search(r"(?:^|[.!]\s*)(?:please )?confirm\b", candidate, re.I)):
                     continue
                 native = self.native_check(gold)
                 amount = self.charge(gold, native.get("native_result"))
                 consent = detect(prefix, gold, native_amount=amount)
-                if consent["authorized_prior_consent"] and is_reask(
-                    candidate, gold, prefix=prefix, native_amount=amount
+                if (
+                    consent["k5_eligible"]
+                    and native["write_due"]
+                    and is_reask(candidate, gold, prefix=prefix, native_amount=amount)
                 ):
                     if native["feasible"]:
                         return {
@@ -229,6 +370,18 @@ class Boundary:
             return {"status": "continue", "reason": "speech_facts_outside_K1_K7"}
         kind = self.tool_type(candidate)
         if candidate["name"] in areal_v2.G_CLOSE_TOOLS:
+            lookup = self.required_lookup()
+            if lookup:
+                good = self.native_check(lookup)
+                if good["feasible"] and good["step_due"] and areal_v2.lookup_arguments_public(prefix, lookup):
+                    return {
+                        "status": "candidate",
+                        "error_kind": "K7",
+                        "gold": lookup,
+                        "native": good,
+                        "consent": detect(prefix, lookup),
+                        "witness": "premature_close_before_required_lookup",
+                    }
             remaining = [g for g in self.remaining() if g["requestor"] == "assistant"]
             targets = []
             for gold in remaining:
@@ -245,6 +398,9 @@ class Boundary:
                 "reason": "K7_needs_current_request_continuation_witness" if remaining else "no_gold_remaining",
             }
         if kind in {"read", "auth"}:
+            lookup = self.required_lookup()
+            if lookup and not areal_v2.typed_equal(candidate, lookup):
+                return self.inspect_student(output, prefix, lookup)
             return {"status": "continue", "reason": "read_alternatives_not_classified_as_errors"}
         if kind != "write":
             return {"status": "hold", "reason": "unknown_tool_type"}
@@ -268,6 +424,8 @@ class Boundary:
             # for K1/K2/K3. Do not mis-certify these as missing consent.
             return {"status": "hold", "reason": "write_needs_kind_specific_error_witness", "native": native}
         consent = detect(prefix, candidate, native_amount=self.charge(candidate, native.get("native_result")))
+        if not native["write_due"]:
+            return {"status": "hold", "reason": "write_not_next_remaining_gold", "native": native, "consent": consent}
         if self.consent_required(candidate) and not consent["authorized_prior_consent"]:
             if not consent["k4_eligible"]:
                 return {
@@ -276,6 +434,8 @@ class Boundary:
                     "consent": consent,
                     "native": native,
                 }
+            if not areal_v2.lookup_arguments_public(prefix, candidate):
+                return {"status": "hold", "reason": "write_arguments_not_public", "native": native, "consent": consent}
             return {
                 "status": "candidate",
                 "error_kind": "K4",
@@ -295,6 +455,9 @@ class Boundary:
         held. K3 source contexts remain deferred under INBOX33.
         """
         shape, candidate = areal_v2.one_turn(output)
+        missing = self.missing_lookup(output, prefix)
+        if missing:
+            return missing
         if reference_call is None or shape != "call":
             return self.inspect(output, prefix)
         target = next(
@@ -309,8 +472,8 @@ class Boundary:
         if target is None:
             return {"status": "hold", "reason": "reference_call_not_in_remaining_gold"}
         good = self.native_check(reference_call)
-        if not good["feasible"]:
-            return {"status": "hold", "reason": "reference_not_native_feasible", "native": good}
+        if not good["feasible"] or not good["step_due"]:
+            return {"status": "hold", "reason": "reference_not_native_feasible_or_not_due", "native": good}
         consent = detect(prefix, reference_call, native_amount=self.charge(reference_call, good.get("native_result")))
         authorized = not self.consent_required(reference_call) or consent["authorized_prior_consent"]
         if areal_v2.typed_equal(candidate, reference_call):

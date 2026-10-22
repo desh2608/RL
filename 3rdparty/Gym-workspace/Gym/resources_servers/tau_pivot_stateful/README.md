@@ -183,3 +183,11 @@ independent detector emits `consent_label`, `k4_eligible`, and the indexed
 turn49 witness result; `authorized_prior_consent` additionally excludes
 question/hold cases. Newly recovered census-given cases block K4 without
 automatically creating K5 positives. No replacement G5 bundle is certified.
+
+G5 INBOX35 draft: native callbacks expose the next ordered remaining step.
+Reference read/auth calls absent from task evaluation criteria retain explicit
+`recorded_reference_read` provenance. K4 requires `write_due`; K5 also needs a
+question-offer witness and clean yes. Wrong/missing lookups and premature closes
+use the due read as their target. A missing reference anchor fails closed. New
+candidate states and controls must be replayed under this version before audit;
+no G5 training bundle is accepted yet.

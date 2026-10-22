@@ -85,6 +85,25 @@ def one_turn(output: list[dict]) -> tuple[str, dict | str | None]:
     return "invalid", None
 
 
+def lookup_arguments_public(context: list[dict] | None, call: dict) -> bool:
+    """Do not reward a gold lookup whose literal arguments are unavailable."""
+    if not isinstance(context, list):
+        return False
+    visible = json.dumps(context, ensure_ascii=False)
+
+    def values(value):
+        if isinstance(value, dict):
+            return [leaf for child in value.values() for leaf in values(child)]
+        if isinstance(value, list):
+            return [leaf for child in value for leaf in values(child)]
+        return [str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)]
+
+    return all(
+        re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", visible, re.I)
+        for value in values(call.get("arguments", {}))
+    )
+
+
 def evaluate(
     spec: dict,
     output: list[dict],
@@ -113,10 +132,12 @@ def evaluate(
     consent = None
     uncertainty = None
     k4_eligible = False
+    k5_eligible = False
     if isinstance(context, list) and isinstance(target, dict) and isinstance(target.get("name"), str):
         result = detect(context, target, native_amount=proof.get("native_amount"))
         consent = result["authorized_prior_consent"]
         k4_eligible = result["k4_eligible"]
+        k5_eligible = result["k5_eligible"]
         uncertainty = result.get("uncertain_prior_consent")
     # Recompute from the fixed public boundary. A stale miner boolean cannot
     # override an actual confirmation and yes, even with perfect content gates.
@@ -126,23 +147,36 @@ def evaluate(
         predicates["gold_call"] = shape == "call" and bool(target) and typed_equal(value, target)
         predicates["not_close"] = shape == "call" and value["name"] not in G_CLOSE_TOOLS
         predicates["correct_kind"] = kind != "K6" or proof.get("gold_tool_type") in {"read", "auth"}
-        predicates["valid_consent"] = kind != "K5" or proof.get("valid_prior_consent") is True
+        predicates["public_read_arguments"] = proof.get("gold_tool_type") not in {
+            "read",
+            "auth",
+        } or lookup_arguments_public(context, target)
+        predicates["valid_consent"] = kind != "K5" or (proof.get("valid_prior_consent") is True and k5_eligible)
         predicates["write_authorized"] = proof.get("gold_tool_type") in {"read", "auth"} or (
             proof.get("gold_tool_type") == "write"
             and ((consent_agrees and consent is True) or proof.get("consent_required") is False)
         )
-        if predicates["gold_call"] and native_check is not None:
+        if predicates["gold_call"] and predicates["public_read_arguments"] and native_check is not None:
             native = native_check(value)
         predicates["native_feasible"] = bool(native and native.get("feasible") is True)
+        predicates["native_step_due"] = bool(native and native.get("step_due") is True)
     elif kind == "K4":
         predicates["no_valid_prior_consent"] = (
             consent_agrees and consent is False and uncertainty is None and k4_eligible
         )
         predicates["no_segment_assent"] = k4_eligible
+        predicates["public_write_arguments"] = isinstance(target, dict) and lookup_arguments_public(context, target)
         predicates["message_only"] = shape == "message"
+        if predicates["no_valid_prior_consent"] and isinstance(target, dict) and native_check is not None:
+            native = native_check(target)
+        predicates["write_due"] = bool(native and native.get("feasible") is True and native.get("write_due") is True)
         checked = (
             consent_check(value)
-            if predicates["no_valid_prior_consent"] and shape == "message" and consent_check is not None
+            if predicates["no_valid_prior_consent"]
+            and predicates["write_due"]
+            and predicates["public_write_arguments"]
+            and shape == "message"
+            and consent_check is not None
             else {}
         )
         predicates["relaxed_consent_content"] = all(checked.get(f"C{i}") is True for i in range(1, 5))

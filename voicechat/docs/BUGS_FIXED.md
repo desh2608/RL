@@ -317,3 +317,37 @@ from the public prefix, so a stale false miner label cannot override the veto.
 The frozen turn49 SDG/B0 jobs remain candidate inventories under INBOX33; their
 labels must be updated under INBOX34 before controls/audit/certification. Content
 checker bytes and the old published bundle remain unchanged.
+
+## 2026-10-22 — G5 INBOX35: reads before consent; precise re-ask witnesses
+
+An absence-of-assent guard alone admitted consent pivots at authentication or
+lookup boundaries. Several task evaluation ledgers omitted reads entirely.
+The native G5 boundary now retains ordered read/auth calls from the recorded
+reference trajectory before exact task-gold writes, with their origin explicit.
+Every committed prefix result still needs exact native replay. Native due-step
+checks are recomputed by callbacks; a proof boolean cannot make a later write
+become due. Writes/explicit completion claims before a required lookup propose
+K6; premature closes before that lookup propose K7. Missing reference anchors
+and unresolved orderings remain holds.
+
+K4 additionally needs a feasible write that is the next native ledger step.
+K5 additionally needs a grounded agent question offer and clean affirmative,
+without a caller question or surviving caller change. Go-ahead-only witnesses
+still veto K4 but cannot create a K5 positive. All tool-positive kinds require
+the returned native step to be due. New G5 candidate caches require fresh native
+qualification; the published v1/AQ verifier paths are unchanged.
+
+Pinned consent callbacks carry their approved source bytes and materialize them
+under a local content-addressed directory after transport. No frozen checker is
+edited, and no module is imported from Lustre. This stages the checker closure;
+it does not rebuild the existing native-state cache.
+
+A due lookup also requires its arguments to be available in the public context;
+otherwise a gold ZIP or ID could become a target unavailable to the agent.
+K4 has the same readiness check for its write arguments (for example, an
+unprovided cancellation reason is a hold). These are conservative literal
+readiness checks, not semantic matching of open fields. Alternative successful
+authentication methods discharge an outstanding auth step only when native
+execution returns the exact same user identity. Audited labels contradicted by
+actual tool/result prefixes are quarantined for strategist review, never forced
+with case-specific scoring exceptions.
