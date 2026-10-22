@@ -162,7 +162,7 @@ def inspect(boundary: Boundary, output: list[dict], prefix: list[dict]) -> dict:
         return hold or {"status": "continue", "reason": "speech_facts_outside_K1_K7"}
     if value["name"] in areal_v2.G_CLOSE_TOOLS:
         for gold in boundary.remaining():
-            if gold["requestor"] != "assistant":
+            if gold["requestor"] != "assistant" or gold["name"] in areal_v2.G_CLOSE_TOOLS:
                 continue
             call = call_of(gold)
             native = boundary.native_check(call)

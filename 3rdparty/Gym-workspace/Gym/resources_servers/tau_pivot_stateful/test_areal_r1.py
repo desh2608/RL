@@ -147,6 +147,17 @@ def test_k7_accepts_spoken_explanation_and_any_remaining_gold():
     assert areal_v2.evaluate(stale, msg("Explanation"))["reward"] == 0
 
 
+def test_k7_remaining_gold_close_is_always_negative_and_not_a_continuation():
+    b = boundary()
+    b.gold = [dict(**call("end_call"), done=False, requestor="assistant", gold_index=0)]
+    assert b.inspect(output(call("end_call")), [])["status"] == "hold"
+    s = k7_spec()
+    s["eligibility"]["ordered_ledger"].append(
+        dict(**call("transfer_to_human_agents"), done=False, requestor="assistant")
+    )
+    assert areal_v2.evaluate(s, output(call("transfer_to_human_agents")))["reward"] == 0
+
+
 def test_structural_wrong_write_tool_can_recover_k1():
     b = boundary()
     b.env = {}

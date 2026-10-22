@@ -401,3 +401,9 @@ are marked audio-only by the miner and excluded from text pools by default.
 Earlier contracts and published bundles retain their behavior. New semantics
 require fresh native/HTTP qualification; caps and training selection remain
 suspended pending the user/strategist decision. No new model calls are needed.
+
+The initial R1 preflight stopped before full launch: a control wrongly expected
+a remaining gold transfer to score1. The explicit no-transfer rule correctly
+returned0. Controls now treat gold close actions as negative, and a remaining
+close action alone cannot witness an in-scope K7 continuation. Both behaviors
+have a regression; the failed preflight remains preserved.
