@@ -407,3 +407,20 @@ a remaining gold transfer to score1. The explicit no-transfer rule correctly
 returned0. Controls now treat gold close actions as negative, and a remaining
 close action alone cannot witness an in-scope K7 continuation. Both behaviors
 have a regression; the failed preflight remains preserved.
+
+## 2026-10-23 — G5 INBOX37 R2: bind positives to the confirmed write
+
+R1 could reward a task-gold write when the caller confirmed a different action
+or different values. `G5-INBOX37-R2` recomputes the latest confirmation against
+public tool entities, the offered action, discussion target and explicit speech
+values. Unresolved or conflicting offers hold as `upstream_offer_divergence`.
+K4 requires the latest discussion target. K7 accepts a spoken continuation or a
+remaining gold read; a gold write additionally needs this confirmation and
+native feasibility. Spoken factual content remains ungraded. The parser is
+conservative and deterministic, not a general language entailment model.
+
+The R1 audit snapshots supply regression cases, including four payment/item
+mismatches, five airline mismatches, an order-target mismatch and unconfirmed
+K7 writes. Two same-flight K1 examples remain positive. Older contracts retain
+their behavior. R2 reuses SHA-bound R1 boundary payloads on their pinned runtime;
+no new prefix replay, checker modification, model call or training is required.
