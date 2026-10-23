@@ -431,3 +431,19 @@ ambiguous public identities. These IDs now bind to the latest public discussion
 or tool selection; an omitted telecom identity needs a unique public identity.
 The first CPU package remains diagnostic and is superseded by an isolated v2
 package; no source-prefix replay or legacy cache rebuild is required.
+
+## 2026-10-23 — G5 INBOX38: K7 speech must continue, K5 may need missing information
+
+R2 accepted any single spoken K7 message, including a spoken promise to transfer
+or close. The opt-in `G5-INBOX38-R21` contract rejects the specified hand-off and
+closing phrases; remaining gold reads keep their R2 behavior. K5 additionally
+holds a failing question requesting a required gold argument omitted from the
+confirmed offer, rather than treating it as redundant consent. The audited
+refund-method case is covered alongside seven retained genuine K5 examples.
+
+The new logic is a monotone post-filter shared by live evaluation and cached
+result recounting. Earlier contracts retain their behavior. Recounting can reuse
+all R2 native scores, payloads and state hashes without replay. A new failing-turn
+witness is required for R21 K5 specs. Spoken factual content remains ungraded;
+parameter and phrase recognition is deterministic and literal. No bundle or
+mix selection follows until the user's decision.
