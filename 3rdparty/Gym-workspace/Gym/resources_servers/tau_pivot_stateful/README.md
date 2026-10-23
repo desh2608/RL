@@ -211,3 +211,44 @@ B0 identifier-misrecognition K6 records carry `audio_only=true`; the default tex
 pool excludes them. Keep inclusive and text counts separately. INBOX36 suspends
 kind-cap/training selection; audit candidates are not a released training bundle.
 New native/HTTP qualification and strategist audit are required before publication.
+
+### Released AReaL v2 pool (2026-10-23)
+
+The `v2-areal-pool-20261023` bundle supplies all 1,848 eligible text pivots and
+270 optional audio-only pivots. `MANIFEST.jsonl` labels K1/K2/K4/K5/K6/K7 and
+marks the default diversity subset; no category mixture is selected. K3 remains
+excluded. Read the bundle's verbatim `CATEGORIES.md` for reward definitions and
+limitations. R2.1 specs opt in with `contract: G5-INBOX38-R21`; v1 semantics and
+the frozen content-checker bytes remain unchanged.
+
+On an allocated CPU node, stage the shipped code, runtimes and cached boundary
+payloads onto local disk. No model, judge, state replay or GPU is required:
+
+```bash
+BUNDLE=/absolute/path/to/v2-areal-pool-20261023
+STAGE=/tmp/pivot-v2-stage
+python3 "$BUNDLE/verifier/stage.py" --bundle "$BUNDLE" --stage "$STAGE"
+python3 "$BUNDLE/verifier/launch.py" --stage "$STAGE" \
+  --serve --out /absolute/path/to/fresh-control-receipts
+# Alternatively, keep the resources server available for policy clients:
+python3 "$BUNDLE/verifier/launch.py" --stage "$STAGE" \
+  --serve-only --port 8000
+```
+
+The all-runtime stage requires at least 160 GiB free local disk. For a smaller
+control check, repeat `--runtime-key KEY` when staging; keys are listed in
+`verifier/STAGING.json`. The generated `services.json`, `RUNTIME.json` and
+`CACHE_MANIFEST.json` refer only to that local stage. Bindings, code and payload
+hashes are checked before use. Use the trusted supplied snapshots only; they
+contain executable Python serialization.
+
+`POST /verify` takes `responses_create_params` and `verification_ref` from the
+selected Gym sample plus the generated OpenAI Responses `response`. It returns
+`reward` and `diagnostics`. The reference selects the cached state and kind;
+private gold actions, evidence and controls belong in `records.jsonl`, not the
+policy prompt. K4 uses the frozen content grader; K1/K2/K5 require the confirmed
+write, K6 the missing native lookup/auth, and K7 a nonclosing message or an
+allowed remaining step. K7 spoken factual correctness is not graded. The bundle
+check runs every named control, including multiple positives, through this HTTP
+path using the published public prompt. Check its final matched/expected counts
+and diagnostics rather than accepting a partial progress line.
