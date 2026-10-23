@@ -424,3 +424,10 @@ mismatches, five airline mismatches, an order-target mismatch and unconfirmed
 K7 writes. Two same-flight K1 examples remain positive. Older contracts retain
 their behavior. R2 reuses SHA-bound R1 boundary payloads on their pinned runtime;
 no new prefix replay, checker modification, model call or training is required.
+
+R2's first executor package bound order/reservation targets but omitted line,
+customer and user IDs. Two regressions expose cross-line authorization and
+ambiguous public identities. These IDs now bind to the latest public discussion
+or tool selection; an omitted telecom identity needs a unique public identity.
+The first CPU package remains diagnostic and is superseded by an isolated v2
+package; no source-prefix replay or legacy cache rebuild is required.

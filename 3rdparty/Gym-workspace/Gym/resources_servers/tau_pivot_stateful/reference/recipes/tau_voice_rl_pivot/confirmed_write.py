@@ -70,7 +70,10 @@ def target_ids(text: str, key: str, known: set[str]) -> set[str]:
 
 def discussion_target(prefix: list[dict], gold: dict) -> dict:
     """Latest caller answer/agent question takes precedence over older targets."""
-    key = next((k for k in ("order_id", "reservation_id") if k in gold["arguments"]), None)
+    key = next(
+        (k for k in ("order_id", "reservation_id", "line_id", "customer_id", "user_id") if k in gold["arguments"]),
+        None,
+    )
     if gold["name"] in {"modify_user_address", "modify_pending_order_address"}:
         for m in reversed(prefix):
             if m.get("type") != "message" or m.get("role") != "assistant":
@@ -89,7 +92,8 @@ def discussion_target(prefix: list[dict], gold: dict) -> dict:
                 return {"ok": False, "scope": "different_write_under_discussion", "tools": sorted(methods)}
     if key is None:
         return {"ok": True, "scope": "no_order_or_reservation_target"}
-    known = known_ids(prefix, key) | {str(gold["arguments"][key])}
+    public_ids = known_ids(prefix, key)
+    known = public_ids | {str(gold["arguments"][key])}
     for index in range(len(prefix) - 1, -1, -1):
         m = prefix[index]
         if m.get("type") == "message":
@@ -106,6 +110,8 @@ def discussion_target(prefix: list[dict], gold: dict) -> dict:
             continue
         if ids:
             return {"ok": str(gold["arguments"][key]) in ids, "key": key, "targets": sorted(ids), "index": index}
+    if key in {"line_id", "customer_id", "user_id"} and public_ids == {str(gold["arguments"][key])}:
+        return {"ok": True, "key": key, "targets": sorted(public_ids), "scope": "unique_public_identity"}
     return {"ok": False, "key": key, "targets": [], "reason": "discussion_target_unresolved"}
 
 

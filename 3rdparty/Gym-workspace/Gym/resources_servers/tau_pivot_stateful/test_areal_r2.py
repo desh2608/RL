@@ -122,3 +122,28 @@ def test_explicit_old_to_new_flight_only_binds_new_value():
     )
     assert not conflicts(prefix, "Change flight from OLD123 to NEW456 on May 20.", gold)
     assert conflicts(prefix, "Change flight to OLD123 on May 20.", gold)
+
+
+def test_telecom_write_cannot_use_a_different_confirmed_line():
+    gold = dict(name="refuel_data", arguments=dict(line_id="L1855", gb_amount=2))
+    prefix = [
+        dict(type="function_call_output", output=json.dumps([dict(line_id="L1855"), dict(line_id="L9999")])),
+        dict(type="message", role="assistant", content="Shall I add 2 GB of data to line L9999?"),
+        dict(type="message", role="user", content="Yes"),
+    ]
+    r = confirmed_write(prefix, gold)
+    assert not r["ok"] and r["detail"] == "confirmed_target_mismatch"
+    prefix[-2]["content"] = "Shall I add 2 GB of data to line L1855?"
+    assert confirmed_write(prefix, gold)["ok"]
+
+
+def test_unresolved_line_identity_is_a_hold_but_unique_public_identity_can_bind():
+    gold = dict(name="refuel_data", arguments=dict(line_id="L1855", gb_amount=2))
+    prefix = [
+        dict(type="function_call_output", output=json.dumps([dict(line_id="L1855"), dict(line_id="L9999")])),
+        dict(type="message", role="assistant", content="Shall I add 2 GB of data?"),
+        dict(type="message", role="user", content="Yes"),
+    ]
+    assert not confirmed_write(prefix, gold)["ok"]
+    prefix[0]["output"] = json.dumps([dict(line_id="L1855")])
+    assert confirmed_write(prefix, gold)["ok"]
