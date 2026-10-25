@@ -45,6 +45,14 @@ class SchemaProjectionTest(unittest.TestCase):
         value = {"name": "change", "arguments": '{"open_map":{"custom":1}}'}
         self.assertEqual(schema_compare.call(value, self.tools), value)
 
+    def test_parsed_json_string_gold_keeps_required_leaves(self):
+        tools = [{"name": "add_vehicle", "parameters": {"type": "object", "properties": {"vehicle": {"type": "string"}}}}]
+        gold = {"name": "add_vehicle", "arguments": {"vehicle": {"VIN": "123", "garaging_address": "Charlotte"}}}
+        candidate = {"name": "add_vehicle", "arguments": {"vehicle": '{"VIN":"123"}'}}
+        self.assertEqual(schema_compare.call(gold, tools), gold)
+        self.assertEqual(schema_compare.call(candidate, tools), candidate)
+        self.assertNotEqual(schema_compare.call(gold, tools), schema_compare.call(candidate, tools))
+
     def test_unknown_tools_and_malformed_arguments_remain_invalid(self):
         for value in [{"name": "unknown", "arguments": {"extra": 1}}, {"name": "change", "arguments": "bad JSON"}]:
             self.assertEqual(schema_compare.call(value, self.tools), value)

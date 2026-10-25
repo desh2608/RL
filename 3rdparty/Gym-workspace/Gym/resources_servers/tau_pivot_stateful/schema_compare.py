@@ -42,6 +42,12 @@ def project(value: object, schema: dict, root: dict) -> object:
     """Drop undeclared object keys while preserving the supplied typed values."""
     schema = resolve(schema, root)
     if isinstance(value, dict):
+        # AfterQuery stores parsed JSON-in-string gold leaves as dictionaries.
+        # A scalar schema declares no object keys to prune inside that value.
+        # Its pinned evaluator owns canonicalization and required string leaves.
+        scalar_type = schema.get("type")
+        if isinstance(scalar_type, str) and scalar_type not in ("object", "array"):
+            return copy.deepcopy(value)
         properties = schema.get("properties")
         if properties is not None:
             return {key: project(child, properties[key], root) for key, child in value.items() if key in properties}
