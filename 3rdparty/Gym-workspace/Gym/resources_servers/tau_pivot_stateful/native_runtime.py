@@ -18,6 +18,8 @@ import types
 from functools import lru_cache
 from pathlib import Path
 
+from resources_servers.tau_pivot_stateful import schema_compare
+
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "reference"))
@@ -152,6 +154,10 @@ def load_cached(root, entry_name, entry_sha):
     blob = Path(root) / entry["payload"]
     assert sha(blob) == entry["payload_sha256"] and replay.digest(entry["state"]) == entry["state_hash_at_boundary"]
     del entry["state"]  # Already hash-verified; callbacks own the required boundary.
+    if entry.get("schema_contract") not in (None, schema_compare.CONTRACT):
+        raise ValueError("Unknown schema comparison contract")
+    if entry.get("schema_contract") == schema_compare.CONTRACT:
+        entry["schema_verification"] = schema_compare.tree(entry["verification"], entry["schema_tools"])
     callbacks = cloudpickle.loads(blob.read_bytes())
     return entry, callbacks
 
@@ -161,14 +167,17 @@ def verify(root, item, ref, output):
     for key in ["record_id", "dataset", "verifier_version", "expected_turn_kind"]:
         if entry[key] != ref[key]:
             raise ValueError("Verification reference mismatch: " + key)
+    verification = entry.get("schema_verification", entry["verification"])
+    if entry.get("schema_contract") == schema_compare.CONTRACT:
+        output = schema_compare.tree(output, entry["schema_tools"])
     if ref["verifier_version"].startswith("areal-v2:"):
         proof = entry["verification"].get("eligibility", {})
         if proof.get("state_hash_at_boundary") != entry["state_hash_at_boundary"]:
             raise ValueError("G5 eligibility proof belongs to a different boundary")
         if entry["verification"].get("verifier_version") != ref["verifier_version"]:
             raise ValueError("G5 specification version differs from verification reference")
-        return areal_v2.evaluate(entry["verification"], output, **callbacks)
-    return reference.evaluate(entry["verification"], output, **callbacks)
+        return areal_v2.evaluate(verification, output, **callbacks)
+    return reference.evaluate(verification, output, **callbacks)
 
 
 def main():

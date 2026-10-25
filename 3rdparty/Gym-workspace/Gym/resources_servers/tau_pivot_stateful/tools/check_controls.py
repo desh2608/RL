@@ -88,6 +88,9 @@ def main():
     p.add_argument("--url")
     p.add_argument("--version", choices=["v2", "v3"])
     p.add_argument("--max-records", type=int)
+    p.add_argument(
+        "--baseline-rewards", action="store_true", help="Measure baseline rewards without imposing new expectations"
+    )
     p.add_argument("--serve", action="store_true")
     p.add_argument("--serve-only", action="store_true")
     p.add_argument("--port", type=int, default=0)
@@ -156,6 +159,7 @@ def main():
                     and not data.get("diagnostics", {}).get("error")
                     and data.get("reward") == expected
                 )
+                healthy = reply.status == 200 and not data.get("diagnostics", {}).get("error")
                 return dict(
                     record_id=ident,
                     kind=records[ident]["kind"],
@@ -164,6 +168,7 @@ def main():
                     reward=data.get("reward"),
                     http_status=reply.status,
                     matched=ok,
+                    healthy=healthy,
                     diagnostics=data.get("diagnostics", {}),
                     request_sha256=hashlib.sha256(
                         json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
@@ -186,7 +191,9 @@ def main():
                 if len(results) % 100 == 0:
                     print(json.dumps(dict(done=len(results), matched=sum(x["matched"] for x in results))), flush=True)
         report = dict(
-            status="PASS" if all(x["matched"] for x in results) else "FAIL",
+            status="PASS"
+            if all(x.get("healthy") if a.baseline_rewards else x["matched"] for x in results)
+            else "FAIL",
             records=len(records),
             expected=len(tasks),
             matched=sum(x["matched"] for x in results),
@@ -194,6 +201,7 @@ def main():
             runtime_keys=meta["keys"],
             code_commit=meta["code_commit"],
             model_calls=0,
+            baseline_rewards=a.baseline_rewards,
         )
         (a.out / "PARITY.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({k: v for k, v in report.items() if k != "failures"}), flush=True)

@@ -255,14 +255,14 @@ and diagnostics rather than accepting a partial progress line.
 
 ## Combined v2 + Stage A v3 pool
 
-`desh/pivot-v3-combined` is based on `desh/areal-pivot-v2@103d5600`.
+`desh/pivot-v3` is based on `desh/areal-pivot-v2@103d5600`.
 It adds a pinned static-entry dispatcher for G6 error-kind/refusal predicates and
 per-wave AfterQuery v2.1 field tables. Existing v2 cache entries, callbacks,
 R21/consent code, native archives, and worker dispatch are unchanged. Every
 record uses the same `tau_pivot_stateful_agent` and resources-server `/verify`
 route; version and category are dataset metadata, not separate endpoints.
 
-The companion `v3-combined-pool-20261025` bundle includes all source inventory,
+The companion `v3-pool-20261025` bundle includes all source inventory,
 explicit eligibility/default flags, combined limits, scenario caps, a generated
 categories document, and deterministic 30/35/40% capacity witnesses. Use
 `text/default/sample.jsonl` for the authorized default view; `text/all/` retains
@@ -272,7 +272,7 @@ extras and duplicate audit records with their exclusion reasons. Optional
 Stage the shipped code/cache/runtimes onto node-local disk:
 
 ```bash
-BUNDLE=/path/to/v3-combined-pool-20261025
+BUNDLE=/path/to/v3-pool-20261025
 STAGE=/tmp/pivot-combined
 python3 "$BUNDLE/verifier/stage.py" --bundle "$BUNDLE" --stage "$STAGE"
 python3 "$BUNDLE/verifier/launch.py" --stage "$STAGE" --serve-only --port 8000
@@ -299,3 +299,27 @@ eligibility holds and the limits of each deterministic verifier.
 
 The combined branch is prepared locally only. Publication and training require
 separate authorization.
+
+
+### INBOX62 schema comparison and corrected pool
+
+The v3 bundle projects generated calls and reference call witnesses onto the
+fields declared by the public tool schema, at every object/array depth. Local
+`$ref` and structured union branches are resolved; a structured branch takes
+precedence over a generic dictionary fallback. Declared values and their types,
+array order and encoded string contents are preserved. A genuinely open map
+without named properties stays open. Frozen native checkers and the v2.1
+AfterQuery evaluator are unchanged. `schema_contract` and `schema_tools` in a
+pinned cache entry enable this adapter; old entries retain their old behavior.
+
+The rebuilt pool also holds upgrade-path refusals, caller-confirmation conflicts,
+schema-equivalent failing turns, and grounded passenger writes. Successful read
+turns are checked against later writes in their original cached rollout; a later
+write with different arguments is not counted as the same deferred write.
+Repair suffixes with an invalid injected positive are held. Neutral injected
+filler remains documented context. Per-record decisions and before/after counts
+ship in `audit62/`; none of these membership checks calls a model.
+
+`check_controls.py --baseline-rewards` records healthy original-v2 server rewards
+without requiring them to satisfy new-v3 control expectations. The final report
+must list each difference; a healthy baseline run is not proof of reward parity.

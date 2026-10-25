@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "reference"))
 from recipes.tau_voice_rl_pivot import g6_error_kinds, g6_structural
 
-from resources_servers.tau_pivot_stateful import afterquery_v21
+from resources_servers.tau_pivot_stateful import afterquery_v21, schema_compare
 
 
 @lru_cache(maxsize=8)
@@ -24,6 +24,12 @@ def load_entry(path: str, expected: str) -> dict:
     entry = json.loads(data)
     if entry.get("mode") != "combined_static":
         raise ValueError("Static entry mode differs")
+    if entry.get("schema_contract") not in (None, schema_compare.CONTRACT):
+        raise ValueError("Unknown schema comparison contract")
+    if entry.get("schema_contract") == schema_compare.CONTRACT:
+        entry["verification"] = schema_compare.tree(entry["verification"], entry["schema_tools"])
+        if "v2_state" in entry:
+            entry["v2_state"] = schema_compare.tree(entry["v2_state"], entry["schema_tools"])
     return entry
 
 
@@ -41,6 +47,8 @@ def verify(item: dict, ref: dict, output: list[dict]) -> dict:
         if entry[key] != ref[key]:
             raise ValueError("Combined verification reference mismatch: " + key)
     spec = entry["verification"]
+    if entry.get("schema_contract") == schema_compare.CONTRACT:
+        output = schema_compare.tree(output, entry["schema_tools"])
     evaluator = entry["evaluator"]
     if evaluator == "g6_error_kinds":
         if spec.get("contract") != g6_error_kinds.G_CONTRACT:
