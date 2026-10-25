@@ -15,6 +15,7 @@ import resource
 import socket
 import sys
 import types
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
@@ -159,7 +160,36 @@ def load_cached(root, entry_name, entry_sha):
     if entry.get("schema_contract") == schema_compare.CONTRACT:
         entry["schema_verification"] = schema_compare.tree(entry["verification"], entry["schema_tools"])
     callbacks = cloudpickle.loads(blob.read_bytes())
+    if entry.get("schema_contract") == schema_compare.CONTRACT and callbacks.get("native_check") is not None:
+        callbacks["native_check"] = schema_native_check(
+            callbacks["native_check"], entry["verification"], entry["schema_tools"]
+        )
     return entry, callbacks
+
+
+def schema_native_check(check: Callable[[dict], dict], spec: dict, tools: list[dict]) -> Callable[[dict], dict]:
+    """Use the certified native witness for an equal declared-field action.
+
+    Native closures retain their original full ledger representation. Restoring
+    its ignored fields preserves that proof without changing declared candidate
+    values or any native checker. Nonmatching actions get no reference substitution.
+    """
+    witnesses = [spec.get("gold")] + spec.get("eligibility", {}).get("r2_remaining_steps", [])
+    references = [
+        {key: witness[key] for key in ("name", "arguments")}
+        for witness in witnesses
+        if isinstance(witness, dict) and "name" in witness and "arguments" in witness
+    ]
+    projected = [(schema_compare.call(reference, tools), reference) for reference in references]
+
+    def native(candidate: dict) -> dict:
+        for normalized, reference in projected:
+            if areal_v2.typed_equal(candidate, normalized):
+                result = check(copy.deepcopy(reference))
+                return {**result, "schema_reference_projection": True}
+        return check(candidate)
+
+    return native
 
 
 def verify(root, item, ref, output):

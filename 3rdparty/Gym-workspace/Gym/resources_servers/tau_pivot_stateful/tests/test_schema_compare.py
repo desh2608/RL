@@ -5,6 +5,7 @@
 import unittest
 
 from resources_servers.tau_pivot_stateful import schema_compare
+from resources_servers.tau_pivot_stateful.native_runtime import schema_native_check
 
 
 class SchemaProjectionTest(unittest.TestCase):
@@ -47,6 +48,22 @@ class SchemaProjectionTest(unittest.TestCase):
     def test_unknown_tools_and_malformed_arguments_remain_invalid(self):
         for value in [{"name": "unknown", "arguments": {"extra": 1}}, {"name": "change", "arguments": "bad JSON"}]:
             self.assertEqual(schema_compare.call(value, self.tools), value)
+
+    def test_frozen_native_ledger_accepts_only_schema_equal_reference(self):
+        gold = {"name": "change", "arguments": {"flights": [{"number": "AB1", "origin": "BOS"}]}}
+        seen = []
+
+        def frozen(candidate):
+            seen.append(candidate)
+            return {"feasible": candidate == gold}
+
+        check = schema_native_check(frozen, {"gold": gold}, self.tools)
+        correct = schema_compare.call(gold, self.tools)
+        self.assertTrue(check(correct)["feasible"])
+        self.assertEqual(seen[-1], gold)
+        wrong = {"name": "change", "arguments": {"flights": [{"number": "WRONG"}]}}
+        self.assertFalse(check(wrong)["feasible"])
+        self.assertEqual(seen[-1], wrong)
 
 
 if __name__ == "__main__":
