@@ -252,3 +252,50 @@ allowed remaining step. K7 spoken factual correctness is not graded. The bundle
 check runs every named control, including multiple positives, through this HTTP
 path using the published public prompt. Check its final matched/expected counts
 and diagnostics rather than accepting a partial progress line.
+
+## Combined v2 + Stage A v3 pool
+
+`desh/pivot-v3-combined` is based on `desh/areal-pivot-v2@103d5600`.
+It adds a pinned static-entry dispatcher for G6 error-kind/refusal predicates and
+per-wave AfterQuery v2.1 field tables. Existing v2 cache entries, callbacks,
+R21/consent code, native archives, and worker dispatch are unchanged. Every
+record uses the same `tau_pivot_stateful_agent` and resources-server `/verify`
+route; version and category are dataset metadata, not separate endpoints.
+
+The companion `v3-combined-pool-20261025` bundle includes all source inventory,
+explicit eligibility/default flags, combined limits, scenario caps, a generated
+categories document, and deterministic 30/35/40% capacity witnesses. Use
+`text/default/sample.jsonl` for the authorized default view; `text/all/` retains
+extras and duplicate audit records with their exclusion reasons. Optional
+`audio_only/` records are excluded from the text default pool.
+
+Stage the shipped code/cache/runtimes onto node-local disk:
+
+```bash
+BUNDLE=/path/to/v3-combined-pool-20261025
+STAGE=/tmp/pivot-combined
+python3 "$BUNDLE/verifier/stage.py" --bundle "$BUNDLE" --stage "$STAGE"
+python3 "$BUNDLE/verifier/launch.py" --stage "$STAGE" --serve-only --port 8000
+```
+
+The stage must not already exist. Full staging requires 160 GiB free; a subset
+can repeat `--runtime-key KEY` (16 GiB free). `combined-static` stages its pinned
+frontend interpreter without a native worker for those records. All Python
+imports and callback payloads are local; shared storage is read only for pinned
+input assets. No model, user simulator, or judge is called by these commands.
+
+POST `/verify` with the original public `responses_create_params`, the four-field
+`verification_ref`, and a generated OpenAI Responses `response`. No gold action,
+private state, or control witness belongs in the policy input. Reference or
+entry/table hash mismatches fail closed.
+
+`verifier/check_controls.py` sends every stored positive/negative control through
+real HTTP. `verifier/baseline_stage.py` creates a fresh process configuration for
+v2 parity against the bundled original 103d5600 code using identical v2 inputs,
+entries, payloads and native archives. `PARITY.json`, `V2_PARITY.json`, and their
+per-call logs record failures and reward differences; new rewards never silently
+replace the v2 reference. The bundle README and generated CATEGORIES.md describe
+eligibility holds and the limits of each deterministic verifier.
+
+The combined branch is prepared locally only. Publication and training require
+separate authorization.

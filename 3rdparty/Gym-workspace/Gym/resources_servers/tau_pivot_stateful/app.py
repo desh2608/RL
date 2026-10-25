@@ -21,7 +21,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
-from resources_servers.tau_pivot_stateful import afterquery_v21
+from resources_servers.tau_pivot_stateful import afterquery_v21, combined_static
 
 
 class VerificationRef(BaseModel):
@@ -140,6 +140,9 @@ class Engine:
         return owner
 
     def verify(self, ref, output):
+        item = self.index.get(ref["record_id"])
+        if item is not None and item.get("mode") == "combined_static":
+            return combined_static.verify(item, ref, output)
         if ref.get("verifier_version", "").startswith("afterquery-v2.1:"):
             return self.verify_v21(self.v21_index[ref["record_id"]], ref, output)
         item = self.index[ref["record_id"]]
