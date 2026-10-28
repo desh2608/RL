@@ -1,0 +1,14 @@
+{
+  "source_seal": "e1e6e19eebdbced4d4a68ec8d2205301b03b5b7cbbbe66dcc41dfcc50a0b28a6",
+  "contract": "INBOX69+71",
+  "files": {
+    "holds70.py": "19917adccda3e0d939cd116151d806a77ba5699ff938930438547ffdef1866a3",
+    "select_pool.py": "51432bfef2fda8dcc59f783f8e78ede93c7c40042d78388764680584de61a515",
+    "test_select_pool.py": "5f653fdee8a662dcc81ca97f39f878213bf756b3c83ce652000b0e77ef660664",
+    "test_battery71.py": "953a0e5e1c28c6767b6b130d06fc84b0da83a451037b1df98a08833ec6ba13b1",
+    "v3_reference.py": "57fe35afdf71b6b9a835f70e36e46b1ebe8758b81df23970843d6a07b621cc3f",
+    "audit59.py": "e5be28baa826fe331d0092e4a9a7cdfeef957f603a0d0d8cf84c379284b03024",
+    "audit62_pinned.py": "17b71710efef6724a5455bd48e5aab70b0e2fa430ce046b024dc1f78a026daad",
+    "schema_compare.py": "070a324a1c04491d2de90c0affa852b6d13fe526d2de92306fe01c2bc6f500f3"
+  }
+}
