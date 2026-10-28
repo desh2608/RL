@@ -323,3 +323,15 @@ ship in `audit62/`; none of these membership checks calls a model.
 `check_controls.py --baseline-rewards` records healthy original-v2 server rewards
 without requiring them to satisfy new-v3 control expectations. The final report
 must list each difference; a healthy baseline run is not proof of reward parity.
+
+## v4 combined pool
+
+Branch `desh/pivot-v4` descends from `desh/pivot-v3@0f1adc18`. Its evaluator,
+public API, frozen reference modules and schema comparison are unchanged.
+`v4-combined-pool-20261028` combines the complete v3 candidate inventory with
+B3@8000 v4 candidates; source holds remain authoritative. The bundle records
+`policy_model`, `source_version` and original record IDs. Exact deduplication
+and joint limits prefer v4, then v3, then v2; audio-only membership and public
+requests are retained outside the default text pool. See the bundle README,
+DEDUPE, LIMIT_DROPS, capacity files, reproduction and real HTTP control/parity
+receipts before use. This branch is not publication approval or training approval.
